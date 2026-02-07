@@ -247,6 +247,9 @@ func TestConcurrentOptimization(t *testing.T) {
 		candidates, _ := rib.GetCandidates(sid)
 		var best *types.RouteKVValue
 		for _, c := range candidates {
+			if c.OriginNode == "LocalNode" {
+				continue
+			}
 			candidate := c
 			if best == nil || candidate.BaseCost < best.BaseCost {
 				best = &candidate
