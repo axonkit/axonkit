@@ -59,10 +59,11 @@ type RIB struct {
 	downstreamCallbacksMu sync.RWMutex
 
 	// Dynamic Consumer
-	consumer     jetstream.Consumer
-	consumeCtx   jetstream.ConsumeContext
-	activeFilter []string
-	filterMu     sync.Mutex
+	consumer         jetstream.Consumer
+	consumeCtx       jetstream.ConsumeContext
+	activeFilter     []string
+	filterMu         sync.Mutex
+	consumerUpdateCh chan struct{} // Signal to update consumer filter
 }
 
 func NewRIB(js jetstream.JetStream, local types.NodeInfo) (*RIB, error) {
@@ -92,6 +93,7 @@ func NewRIB(js jetstream.JetStream, local types.NodeInfo) (*RIB, error) {
 		subscribers:         make(map[types.StreamID][]func(types.RouteKVValue)),
 		downstreamCallbacks: make(map[types.StreamID]func(types.NodeID, bool)),
 		activeFilter:        []string{}, // Start empty
+		consumerUpdateCh:    make(chan struct{}, 1),
 	}
 
 	heap.Init(&r.pq)
@@ -134,7 +136,10 @@ func NewRIB(js jetstream.JetStream, local types.NodeInfo) (*RIB, error) {
 	// But we need to handle "WatchDownstream".
 	// If WatchDownstream is called, we probably need full watch.
 
-	// Let's implement the update logic.
+	// Implementation Note:
+	// We use an Event-Driven Dynamic Watcher (manageConsumer).
+	// It only watches streams that are explicitly subscribed or have active downstream watchers.
+	// This assumes that we only care about downstream dependencies for streams we are already participating in.
 	go r.manageConsumer()
 
 	return r, nil
@@ -307,10 +312,41 @@ func (r *RIB) handleMsg(msg jetstream.Msg) {
 	}
 }
 
-// manageConsumer is a placeholder if we needed a loop, but we use event-driven update
+// manageConsumer manages the dynamic consumer lifecycle
 func (r *RIB) manageConsumer() {
-	// Initial update
+	// Initial update (debounce a bit to let initial subscriptions happen)
+	time.Sleep(10 * time.Millisecond)
 	r.updateConsumerFilter()
+
+	for {
+		select {
+		case <-r.stopCh:
+			return
+		case <-r.consumerUpdateCh:
+			// Debounce: Wait a bit to accumulate more updates
+			time.Sleep(10 * time.Millisecond)
+
+			// Drain remaining signals
+		drain:
+			for {
+				select {
+				case <-r.consumerUpdateCh:
+					continue
+				default:
+					break drain
+				}
+			}
+
+			// Check if we are stopped before updating
+			select {
+			case <-r.stopCh:
+				return
+			default:
+			}
+
+			r.updateConsumerFilter()
+		}
+	}
 }
 
 // SubscribeUpdates registers a callback to receive updates for a stream
@@ -319,16 +355,22 @@ func (r *RIB) SubscribeUpdates(streamID types.StreamID, cb func(types.RouteKVVal
 	r.subscribers[streamID] = append(r.subscribers[streamID], cb)
 	r.subscribersMu.Unlock()
 
-	// Trigger Filter Update
-	go r.updateConsumerFilter()
+	// Trigger Filter Update (Non-blocking)
+	select {
+	case r.consumerUpdateCh <- struct{}{}:
+	default:
+	}
 
 	return func() {
 		r.subscribersMu.Lock()
 		defer r.subscribersMu.Unlock()
 		delete(r.subscribers, streamID)
 
-		// Trigger Filter Update
-		go r.updateConsumerFilter()
+		// Trigger Filter Update (Non-blocking)
+		select {
+		case r.consumerUpdateCh <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -338,8 +380,11 @@ func (r *RIB) WatchDownstream(streamID types.StreamID, cb func(downstreamNode ty
 	r.downstreamCallbacks[streamID] = cb
 	r.downstreamCallbacksMu.Unlock()
 
-	// Trigger Filter Update
-	go r.updateConsumerFilter()
+	// Trigger Filter Update (Non-blocking)
+	select {
+	case r.consumerUpdateCh <- struct{}{}:
+	default:
+	}
 }
 
 // globalWatcherLoop is removed/replaced by dynamic consumer
