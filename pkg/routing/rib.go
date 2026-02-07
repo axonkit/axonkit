@@ -20,8 +20,6 @@ const (
 	RibBucketName = "RIB"
 	RIBTTL        = 10 * time.Second
 	RefreshRate   = 3 * time.Second
-	WorkerCount   = 5
-	QueueSize     = 100
 )
 
 // adEntry represents a stream being advertised
@@ -43,12 +41,9 @@ type RIB struct {
 	pq       ds.PriorityQueue[*adEntry]
 	entryMap map[types.StreamID]*ds.Item[*adEntry]
 
-	// Channels for coordinator
+	// Channels for keepalive loop
 	signalCh chan struct{} // signal when new item added
-	stopCh   chan struct{} // stop coordinator
-
-	// Worker pool
-	jobCh chan *adEntry
+	stopCh   chan struct{} // stop loop
 
 	// Global Watcher
 	subscribers   map[types.StreamID][]func(types.RouteKVValue)
@@ -89,7 +84,6 @@ func NewRIB(js jetstream.JetStream, local types.NodeInfo) (*RIB, error) {
 		entryMap:            make(map[types.StreamID]*ds.Item[*adEntry]),
 		signalCh:            make(chan struct{}, 1),
 		stopCh:              make(chan struct{}),
-		jobCh:               make(chan *adEntry, QueueSize),
 		subscribers:         make(map[types.StreamID][]func(types.RouteKVValue)),
 		downstreamCallbacks: make(map[types.StreamID]func(types.NodeID, bool)),
 		activeFilter:        []string{}, // Start empty
@@ -98,11 +92,8 @@ func NewRIB(js jetstream.JetStream, local types.NodeInfo) (*RIB, error) {
 
 	heap.Init(&r.pq)
 
-	// Start coordinator and workers
-	go r.coordinator()
-	for i := 0; i < WorkerCount; i++ {
-		go r.worker(i)
-	}
+	// Start keepalive scheduler
+	go r.keepAliveLoop()
 
 	// Start Dynamic Watcher (initially idle)
 	// We will start it when first subscription happens or if we want to watch something default
@@ -402,16 +393,16 @@ func (r *RIB) StartAdvertise(streamID types.StreamID, baseCost int, pathVector [
 		return nil
 	}
 
-	// Initial advertise immediately (blocking or async? let's do sync for first time to catch errors)
-	if err := r.advertiseOnce(streamID, baseCost, pathVector, rttToOrigin); err != nil {
-		return err
-	}
-
 	val := &adEntry{
 		StreamID:    streamID,
 		BaseCost:    baseCost,
 		PathVector:  pathVector,
 		RttToOrigin: rttToOrigin,
+	}
+
+	// Initial advertise immediately (blocking or async? let's do sync for first time to catch errors)
+	if err := r.advertiseOnce(val); err != nil {
+		return err
 	}
 
 	priority := time.Now().Add(RefreshRate).UnixNano()
@@ -423,7 +414,7 @@ func (r *RIB) StartAdvertise(streamID types.StreamID, baseCost int, pathVector [
 	r.entryMap[streamID] = item
 	heap.Push(&r.pq, item)
 
-	// Signal coordinator if this is the new earliest item (or just always signal)
+	// Signal keepAliveLoop if this is the new earliest item (or just always signal)
 	select {
 	case r.signalCh <- struct{}{}:
 	default:
@@ -448,8 +439,8 @@ func (r *RIB) StopAdvertise(streamID types.StreamID) error {
 	return r.Unadvertise(streamID)
 }
 
-// coordinator manages the priority queue
-func (r *RIB) coordinator() {
+// keepAliveLoop manages the priority queue to schedule re-advertisements
+func (r *RIB) keepAliveLoop() {
 	timer := time.NewTimer(1 * time.Hour) // Long idle time
 	defer timer.Stop()
 
@@ -497,14 +488,12 @@ func (r *RIB) coordinator() {
 			now := time.Now().UnixNano()
 			if item, wait := r.pq.PeekAndShift(now); item != nil {
 				// Process item
-				// Dispatch
-				// NON-BLOCKING send to avoid deadlock if workers are slow/stuck
-				select {
-				case r.jobCh <- item.Value:
-					// Scheduled
-				default:
-					log.Printf("[RIB] Worker queue full, skipping update for %s", item.Value.StreamID)
-				}
+				// Dispatch directly in goroutine since NATS is fast
+				go func(val *adEntry) {
+					if err := r.advertiseOnce(val); err != nil {
+						log.Printf("[RIB] Advertise failed for %s: %v", val.StreamID, err)
+					}
+				}(item.Value)
 
 				// Re-add to queue with new time
 				item.Priority = time.Now().Add(RefreshRate).UnixNano()
@@ -518,22 +507,9 @@ func (r *RIB) coordinator() {
 	}
 }
 
-func (r *RIB) worker(id int) {
-	for {
-		select {
-		case <-r.stopCh:
-			return
-		case item := <-r.jobCh:
-			if err := r.advertiseOnce(item.StreamID, item.BaseCost, item.PathVector, item.RttToOrigin); err != nil {
-				log.Printf("[RIB-Worker-%d] Advertise failed for %s: %v", id, item.StreamID, err)
-			}
-		}
-	}
-}
-
 // Close cleans up resources and stops advertising all streams
 func (r *RIB) Close() {
-	// Stop coordinator and workers
+	// Stop keepAliveLoop
 	close(r.stopCh)
 
 	// Stop Dynamic Consumer
@@ -558,17 +534,17 @@ func (r *RIB) Close() {
 }
 
 // advertiseOnce writes to KV once
-func (r *RIB) advertiseOnce(streamID types.StreamID, baseCost int, pathVector []types.NodeID, rttToOrigin int64) error {
-	key := fmt.Sprintf("route.%s.%s.%s.%s", streamID, r.local.Region, r.local.Cluster, r.local.ID)
+func (r *RIB) advertiseOnce(entry *adEntry) error {
+	key := fmt.Sprintf("route.%s.%s.%s.%s", entry.StreamID, r.local.Region, r.local.Cluster, r.local.ID)
 
 	val := types.RouteKVValue{
-		StreamID:      streamID,
+		StreamID:      entry.StreamID,
 		OriginNode:    r.local.ID,
 		OriginRegion:  r.local.Region,
 		OriginCluster: r.local.Cluster,
-		BaseCost:      baseCost,
-		PathVector:    pathVector,
-		RttToOrigin:   rttToOrigin,
+		BaseCost:      entry.BaseCost,
+		PathVector:    entry.PathVector,
+		RttToOrigin:   entry.RttToOrigin,
 		ExpireAt:      time.Now().Add(RIBTTL),
 	}
 
