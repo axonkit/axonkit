@@ -44,5 +44,7 @@ type FIBEntry struct {
 	RefCount        int             // Local user references
 	DownstreamNodes map[NodeID]bool // Set of downstream nodes depending on us
 
-	TeardownTimer *time.Timer // Timer for idle timeout (linger)
+	TeardownTimer     *time.Timer // Timer for idle timeout (linger)
+	OptimizationTimer *time.Timer // Timer for periodic path optimization
+	FindPathFunc      func() (*RouteKVValue, error)
 }

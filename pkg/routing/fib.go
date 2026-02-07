@@ -24,14 +24,22 @@ type FIB struct {
 	// watchers map[types.StreamID]jetstream.KeyWatcher // Old
 	watchers   map[types.StreamID]func() // New: cancel func
 	watchersMu sync.Mutex
+
+	// Route Optimization Config
+	EnableRouteOptimization bool
+	OptimizationInterval    time.Duration
+	OptimizationThreshold   int // Cost improvement threshold to trigger switch
 }
 
 func NewFIB(rib *RIB, localNodeID types.NodeID) *FIB {
 	return &FIB{
-		entries:     make(map[types.StreamID]*types.FIBEntry),
-		rib:         rib,
-		localNodeID: localNodeID,
-		watchers:    make(map[types.StreamID]func()),
+		entries:                 make(map[types.StreamID]*types.FIBEntry),
+		rib:                     rib,
+		localNodeID:             localNodeID,
+		watchers:                make(map[types.StreamID]func()),
+		EnableRouteOptimization: false,           // Default disabled, enable via feature flag
+		OptimizationInterval:    5 * time.Minute, // Slow convergence
+		OptimizationThreshold:   10,              // Hysteresis
 	}
 }
 
@@ -80,6 +88,7 @@ func (f *FIB) Subscribe(streamID types.StreamID, findPath func() (*types.RouteKV
 		State:           "connected",
 		RefCount:        1,
 		DownstreamNodes: make(map[types.NodeID]bool),
+		FindPathFunc:    findPath,
 	}
 	f.entries[streamID] = entry
 
@@ -97,7 +106,12 @@ func (f *FIB) Subscribe(streamID types.StreamID, findPath func() (*types.RouteKV
 	// 5. Start Watching for Upstream Teardown AND Downstream Dependency
 	f.monitorUpstream(streamID, route.OriginNode, findPath)
 
-	// 6. Register Downstream Watcher
+	// 6. Schedule Periodic Optimization
+	if f.EnableRouteOptimization {
+		f.scheduleOptimization(entry)
+	}
+
+	// 7. Register Downstream Watcher
 	f.rib.WatchDownstream(streamID, func(nodeID types.NodeID, isAdd bool) {
 		f.handleDownstreamChange(streamID, nodeID, isAdd)
 	})
@@ -273,6 +287,11 @@ func (f *FIB) Unsubscribe(streamID types.StreamID) {
 	log.Printf("[FIB] Stream %s ref-- -> %d", streamID, entry.RefCount)
 
 	if entry.RefCount <= 0 && len(entry.DownstreamNodes) == 0 {
+		// Stop Optimization if we are tearing down (or lingering)
+		if entry.OptimizationTimer != nil {
+			entry.OptimizationTimer.Stop()
+			entry.OptimizationTimer = nil
+		}
 		f.scheduleTeardown(streamID)
 	}
 }
@@ -325,6 +344,11 @@ func (f *FIB) cancelTeardown(entry *types.FIBEntry) {
 		entry.TeardownTimer = nil
 		entry.State = "connected"
 		log.Printf("[FIB] Stream %s linger cancelled (reused)", entry.StreamID)
+
+		// Restart Optimization Timer if enabled
+		if f.EnableRouteOptimization {
+			f.scheduleOptimization(entry)
+		}
 	}
 }
 
@@ -335,10 +359,14 @@ func (f *FIB) teardownLocked(streamID types.StreamID) {
 		return
 	}
 
-	// Stop any pending timer (just in case)
+	// Stop any pending timers
 	if entry.TeardownTimer != nil {
 		entry.TeardownTimer.Stop()
 		entry.TeardownTimer = nil
+	}
+	if entry.OptimizationTimer != nil {
+		entry.OptimizationTimer.Stop()
+		entry.OptimizationTimer = nil
 	}
 
 	// Stop Watcher
@@ -376,6 +404,9 @@ func (f *FIB) Close() {
 		if entry.TeardownTimer != nil {
 			entry.TeardownTimer.Stop()
 		}
+		if entry.OptimizationTimer != nil {
+			entry.OptimizationTimer.Stop()
+		}
 
 		// Disconnect Pipe
 		if f.DisconnectPipe != nil {
@@ -394,4 +425,152 @@ func (f *FIB) Close() {
 
 	// Clear map
 	f.entries = make(map[types.StreamID]*types.FIBEntry)
+}
+
+// scheduleOptimization starts a timer to periodically check for better paths
+func (f *FIB) scheduleOptimization(entry *types.FIBEntry) {
+	if entry.OptimizationTimer != nil {
+		entry.OptimizationTimer.Stop()
+	}
+
+	entry.OptimizationTimer = time.AfterFunc(f.OptimizationInterval, func() {
+		f.optimizeRoute(entry.StreamID)
+	})
+}
+
+// optimizeRoute checks if there is a significantly better path
+func (f *FIB) optimizeRoute(streamID types.StreamID) {
+	f.mu.Lock()
+	entry, exists := f.entries[streamID]
+	if !exists {
+		f.mu.Unlock()
+		return
+	}
+
+	// Reschedule optimization (periodic)
+	defer f.scheduleOptimization(entry)
+
+	currentUpstream := entry.UpstreamNode
+	findPath := entry.FindPathFunc
+
+	// Current Cost?
+	// We don't store current cost in FIBEntry, but we can query RIB or guess.
+	// Actually, we should probably just find the BEST path now and compare.
+	f.mu.Unlock()
+
+	// Find best path
+	bestRoute, err := findPath()
+	if err != nil || bestRoute == nil {
+		return // No path found, keep current
+	}
+
+	if bestRoute.OriginNode == currentUpstream {
+		return // Same upstream, nothing to do
+	}
+
+	// We need to compare costs.
+	// Issue: findPath usually returns the best route.
+	// If it returns a different node, it implies that node is "better" (lower cost).
+	// But we need to apply Hysteresis (Threshold).
+
+	// To do this properly, we need the Cost of the CURRENT route.
+	// We can try to fetch the candidate for current upstream from RIB.
+	candidates, err := f.rib.GetCandidates(streamID)
+	if err != nil {
+		return
+	}
+
+	var currentRoute *types.RouteKVValue
+	for _, c := range candidates {
+		if c.OriginNode == currentUpstream {
+			currentRoute = &c
+			break
+		}
+	}
+
+	if currentRoute == nil {
+		// Current upstream is gone?
+		// If gone, we should have triggered failover already.
+		// But maybe failover is slow or racing.
+		// If we found a new best route, let's switch.
+		log.Printf("[FIB] Optimize: Current upstream %s not found in RIB. Switching to %s.", currentUpstream, bestRoute.OriginNode)
+		f.switchUpstream(streamID, bestRoute)
+		return
+	}
+
+	// Skip optimization if current upstream is in the same Cluster
+	// Intra-cluster traffic is usually preferred/free, so don't switch away unless broken.
+	if currentRoute.OriginCluster == f.rib.LocalInfo().Cluster {
+		// log.Printf("[FIB] Optimize: Current upstream %s is in same cluster (%s). Skipping optimization.", currentUpstream, currentRoute.OriginCluster)
+		return
+	}
+
+	// Apply Threshold
+	// Switch if: NewCost < CurrentCost - Threshold
+	if bestRoute.BaseCost < currentRoute.BaseCost-f.OptimizationThreshold {
+		log.Printf("[FIB] Optimize: Found better path via %s (Cost: %d) vs %s (Cost: %d). Switching.",
+			bestRoute.OriginNode, bestRoute.BaseCost, currentUpstream, currentRoute.BaseCost)
+		f.switchUpstream(streamID, bestRoute)
+	}
+}
+
+// switchUpstream performs a Make-Before-Break switch to a new upstream
+func (f *FIB) switchUpstream(streamID types.StreamID, newRoute *types.RouteKVValue) {
+	f.mu.Lock()
+	entry, exists := f.entries[streamID]
+	if !exists {
+		f.mu.Unlock()
+		return
+	}
+	oldUpstream := entry.UpstreamNode
+	oldPipeID := entry.PipeID
+	f.mu.Unlock()
+
+	log.Printf("[FIB] Switching upstream for %s: %s -> %s", streamID, oldUpstream, newRoute.OriginNode)
+
+	// 1. Connect New Pipe
+	var newPipeID string
+	if f.ConnectPipe != nil {
+		var err error
+		newPipeID, err = f.ConnectPipe(streamID, newRoute.OriginNode)
+		if err != nil {
+			log.Printf("[FIB] Switch failed: ConnectPipe error: %v", err)
+			return
+		}
+	}
+
+	// 2. Update FIB Entry
+	f.mu.Lock()
+	// Re-check existence
+	entry, exists = f.entries[streamID]
+	if !exists {
+		f.mu.Unlock()
+		// Clean up new pipe
+		if f.DisconnectPipe != nil {
+			f.DisconnectPipe(newPipeID)
+		}
+		return
+	}
+
+	entry.UpstreamNode = newRoute.OriginNode
+	entry.PipeID = newPipeID
+	f.mu.Unlock()
+
+	// 3. Update Advertisement (Propagate new path)
+	newPathVector := append(newRoute.PathVector, f.localNodeID)
+	err := f.rib.StartAdvertise(streamID, newRoute.BaseCost+10, newPathVector, newRoute.RttToOrigin+20)
+	if err != nil {
+		log.Printf("[FIB] Failed to update advertisement during switch: %v", err)
+	}
+
+	// 4. Update Watcher
+	// We need to monitor the NEW upstream
+	f.monitorUpstream(streamID, newRoute.OriginNode, entry.FindPathFunc)
+
+	// 5. Disconnect Old Pipe
+	if f.DisconnectPipe != nil {
+		f.DisconnectPipe(oldPipeID)
+	}
+
+	log.Printf("[FIB] Switch complete: %s is now via %s", streamID, newRoute.OriginNode)
 }

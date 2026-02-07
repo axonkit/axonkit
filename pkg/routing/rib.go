@@ -136,6 +136,11 @@ func NewRIB(js jetstream.JetStream, local types.NodeInfo) (*RIB, error) {
 	return r, nil
 }
 
+// LocalInfo returns the local node information
+func (r *RIB) LocalInfo() types.NodeInfo {
+	return r.local
+}
+
 // updateConsumerFilter updates the NATS consumer filter subjects
 func (r *RIB) updateConsumerFilter() {
 	r.filterMu.Lock()
