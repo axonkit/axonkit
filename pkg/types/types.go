@@ -46,5 +46,5 @@ type FIBEntry struct {
 
 	TeardownTimer     *time.Timer // Timer for idle timeout (linger)
 	OptimizationTimer *time.Timer // Timer for periodic path optimization
-	FindPathFunc      func() (*RouteKVValue, error)
+	FindPathFunc      func(StreamID) (*RouteKVValue, error)
 }

@@ -74,19 +74,17 @@ func TestFIBOptimization(t *testing.T) {
 	}
 
 	// Dynamic FindPath (always picks best from RIB)
-	findPath := func(streamID types.StreamID) func() (*types.RouteKVValue, error) {
-		return func() (*types.RouteKVValue, error) {
-			candidates, _ := rib.GetCandidates(streamID)
-			var best *types.RouteKVValue
-			for _, c := range candidates {
-				// Copy variable
-				candidate := c
-				if best == nil || candidate.BaseCost < best.BaseCost {
-					best = &candidate
-				}
+	findPath := func(sid types.StreamID) (*types.RouteKVValue, error) {
+		candidates, _ := rib.GetCandidates(sid)
+		var best *types.RouteKVValue
+		for _, c := range candidates {
+			// Copy variable
+			candidate := c
+			if best == nil || candidate.BaseCost < best.BaseCost {
+				best = &candidate
 			}
-			return best, nil
 		}
+		return best, nil
 	}
 
 	// Case 1: Sticky Same Cluster
@@ -97,7 +95,7 @@ func TestFIBOptimization(t *testing.T) {
 		time.Sleep(50 * time.Millisecond) // Propagate
 
 		// Subscribe
-		fib.Subscribe(sID, findPath(sID))
+		fib.Subscribe(sID, findPath)
 
 		// Expect Connect->NodeSame
 		expectMsg(t, pipeHistory, "Connect->NodeSame")
@@ -121,7 +119,7 @@ func TestFIBOptimization(t *testing.T) {
 		putRoute(sID, "NodeRemote1", "C2", 100)
 		time.Sleep(50 * time.Millisecond)
 
-		fib.Subscribe(sID, findPath(sID))
+		fib.Subscribe(sID, findPath)
 		expectMsg(t, pipeHistory, "Connect->NodeRemote1")
 
 		// Inject Better: NodeRemote2 (C2, 50) -> Cost Diff = 50 > Threshold(10)
@@ -143,7 +141,7 @@ func TestFIBOptimization(t *testing.T) {
 		putRoute(sID, "NodeRemoteA", "C2", 100)
 		time.Sleep(50 * time.Millisecond)
 
-		fib.Subscribe(sID, findPath(sID))
+		fib.Subscribe(sID, findPath)
 		expectMsg(t, pipeHistory, "Connect->NodeRemoteA")
 
 		// Inject Slightly Better: NodeRemoteB (C2, 95) -> Diff = 5 < Threshold(10)

@@ -99,8 +99,8 @@ func TestCascadingTeardown(t *testing.T) {
 	time.Sleep(500 * time.Millisecond) // Wait for propagation
 
 	// 2. EdgeA Subscribe (to Origin)
-	_, upstream, err := edgeA.FIB.Subscribe(streamID, func() (*types.RouteKVValue, error) {
-		candidates, _ := edgeA.RIB.GetCandidates(streamID)
+	_, upstream, err := edgeA.FIB.Subscribe(streamID, func(sid types.StreamID) (*types.RouteKVValue, error) {
+		candidates, _ := edgeA.RIB.GetCandidates(sid)
 		for _, c := range candidates {
 			// Loop prevention: Don't pick self or route containing self
 			if c.OriginNode == edgeA.ID {
@@ -114,7 +114,9 @@ func TestCascadingTeardown(t *testing.T) {
 				}
 			}
 			if !hasLoop {
-				return &c, nil
+				// Copy c to avoid loop variable capture issues in future
+				val := c
+				return &val, nil
 			}
 		}
 		return nil, fmt.Errorf("no valid route")
@@ -129,8 +131,8 @@ func TestCascadingTeardown(t *testing.T) {
 
 	// 3. EdgeB Subscribe (to EdgeA)
 	// EdgeA should be advertising now
-	_, upstreamB, err := edgeB.FIB.Subscribe(streamID, func() (*types.RouteKVValue, error) {
-		candidates, _ := edgeB.RIB.GetCandidates(streamID)
+	_, upstreamB, err := edgeB.FIB.Subscribe(streamID, func(sid types.StreamID) (*types.RouteKVValue, error) {
+		candidates, _ := edgeB.RIB.GetCandidates(sid)
 		for _, c := range candidates {
 			// Loop prevention
 			if c.OriginNode == edgeB.ID {
@@ -147,14 +149,17 @@ func TestCascadingTeardown(t *testing.T) {
 				continue
 			}
 
-			// Prefer EdgeA
+			// Test specific: Prefer EdgeA to force daisy chain
 			if c.OriginNode == edgeA.ID {
-				return &c, nil
+				val := c
+				return &val, nil
 			}
 		}
-		// If EdgeA not found but Origin is, we might fallback to Origin
-		// But for this test, we want to ensure it picked EdgeA initially
-		// Let's iterate again and pick any valid if EdgeA not found (optional)
+
+		// Fallback: If EdgeA not found, maybe just pick first valid?
+		// But for this test we WANT EdgeA.
+		// Let's retry loop to find ANY valid if strict preference failed (optional)
+		// Or just fail.
 		return nil, fmt.Errorf("no route via EdgeA")
 	})
 	if err != nil {
@@ -213,7 +218,7 @@ func TestLinger(t *testing.T) {
 
 	// Subscribe Self (Loopback just to test FIB logic)
 	// Actually we can mock findPath to return anything
-	node.FIB.Subscribe(streamID, func() (*types.RouteKVValue, error) {
+	node.FIB.Subscribe(streamID, func(sid types.StreamID) (*types.RouteKVValue, error) {
 		return &types.RouteKVValue{OriginNode: "MockUpstream", BaseCost: 0, PathVector: []types.NodeID{"MockUpstream"}}, nil
 	})
 

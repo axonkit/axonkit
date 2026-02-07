@@ -45,7 +45,7 @@ func NewFIB(rib *RIB, localNodeID types.NodeID) *FIB {
 
 // Subscribe increments ref count and establishes connection if needed
 // Returns pipeID and upstream node
-func (f *FIB) Subscribe(streamID types.StreamID, findPath func() (*types.RouteKVValue, error)) (string, types.NodeID, error) {
+func (f *FIB) Subscribe(streamID types.StreamID, findPath func(types.StreamID) (*types.RouteKVValue, error)) (string, types.NodeID, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -59,7 +59,7 @@ func (f *FIB) Subscribe(streamID types.StreamID, findPath func() (*types.RouteKV
 
 	// New subscription
 	// 1. Find Path
-	route, err := findPath()
+	route, err := findPath(streamID)
 	if err != nil {
 		return "", "", err
 	}
@@ -150,7 +150,7 @@ func (f *FIB) handleDownstreamChange(streamID types.StreamID, nodeID types.NodeI
 }
 
 // monitorUpstream watches the RIB for changes to the upstream node
-func (f *FIB) monitorUpstream(streamID types.StreamID, currentUpstream types.NodeID, findPath func() (*types.RouteKVValue, error)) {
+func (f *FIB) monitorUpstream(streamID types.StreamID, currentUpstream types.NodeID, findPath func(types.StreamID) (*types.RouteKVValue, error)) {
 	cancel := f.rib.SubscribeUpdates(streamID, func(val types.RouteKVValue) {
 		// Check for "Delete" event
 		// We defined convention: BaseCost = -1 means deleted.
@@ -191,7 +191,7 @@ func (f *FIB) monitorUpstream(streamID types.StreamID, currentUpstream types.Nod
 	log.Printf("[FIB] Started monitoring upstream %s for stream %s", currentUpstream, streamID)
 }
 
-func (f *FIB) handleFailover(streamID types.StreamID, failedUpstream types.NodeID, findPath func() (*types.RouteKVValue, error)) {
+func (f *FIB) handleFailover(streamID types.StreamID, failedUpstream types.NodeID, findPath func(types.StreamID) (*types.RouteKVValue, error)) {
 	f.mu.Lock()
 	entry, exists := f.entries[streamID]
 	if !exists {
@@ -209,7 +209,7 @@ func (f *FIB) handleFailover(streamID types.StreamID, failedUpstream types.NodeI
 	log.Printf("[FIB] Attempting to reroute stream %s...", streamID)
 
 	// 1. Try to find a NEW path
-	newRoute, err := findPath()
+	newRoute, err := findPath(streamID)
 	if err != nil || newRoute == nil {
 		log.Printf("[FIB] Reroute failed: No alternative path for %s. Tearing down downstream.", streamID)
 
@@ -459,7 +459,7 @@ func (f *FIB) optimizeRoute(streamID types.StreamID) {
 	f.mu.Unlock()
 
 	// Find best path
-	bestRoute, err := findPath()
+	bestRoute, err := findPath(streamID)
 	if err != nil || bestRoute == nil {
 		return // No path found, keep current
 	}

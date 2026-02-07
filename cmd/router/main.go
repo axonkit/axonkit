@@ -126,9 +126,7 @@ func main() {
 			return
 		}
 
-		pipeID, upstream, err := fib.Subscribe(types.StreamID(streamID), func() (*types.RouteKVValue, error) {
-			return finder.FindPath(types.StreamID(streamID))
-		})
+		pipeID, upstream, err := fib.Subscribe(types.StreamID(streamID), finder.FindPath)
 
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Subscribe failed: %v", err), 500)
