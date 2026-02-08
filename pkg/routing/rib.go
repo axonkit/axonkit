@@ -29,6 +29,17 @@ type adEntry struct {
 	RttToOrigin int64
 }
 
+type streamWatcher struct {
+	streamID types.StreamID
+	cancel   context.CancelFunc // Stop the NATS watcher
+
+	mu          sync.RWMutex
+	subscribers map[int64]func(types.RouteKVValue)
+	downstreams map[int64]func(types.NodeID, bool)
+	subSeq      int64
+	dsSeq       int64
+}
+
 type RIB struct {
 	kv    jetstream.KeyValue
 	js    jetstream.JetStream
@@ -45,6 +56,10 @@ type RIB struct {
 	stopCh   chan struct{} // stop loop
 
 	logger *slog.Logger
+
+	// Stream Watchers
+	watchers   map[types.StreamID]*streamWatcher
+	watchersMu sync.Mutex
 }
 
 func NewRIB(js jetstream.JetStream, local types.NodeInfo) (*RIB, error) {
@@ -71,6 +86,7 @@ func NewRIB(js jetstream.JetStream, local types.NodeInfo) (*RIB, error) {
 		signalCh: make(chan struct{}, 1),
 		stopCh:   make(chan struct{}),
 		logger:   slog.Default().With("component", "RIB"),
+		watchers: make(map[types.StreamID]*streamWatcher),
 	}
 
 	heap.Init(&r.pq)
@@ -86,106 +102,148 @@ func (r *RIB) LocalInfo() types.NodeInfo {
 	return r.local
 }
 
-// SubscribeUpdates starts a watcher for a specific stream's routes
-// It returns a cancel function to stop the watcher.
-func (r *RIB) SubscribeUpdates(streamID types.StreamID, cb func(types.RouteKVValue)) func() {
-	// Pattern: route.<StreamID>.>
-	pattern := fmt.Sprintf("route.%s.>", streamID)
+func (r *RIB) getOrStartWatcher(streamID types.StreamID) (*streamWatcher, error) {
+	r.watchersMu.Lock()
+	defer r.watchersMu.Unlock()
 
-	// We use a separate context for the watcher so we can cancel it
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// Watch includes deletes (we need to know if upstream is gone)
-	watcher, err := r.kv.Watch(ctx, pattern)
-	if err != nil {
-		r.logger.Error("Failed to watch stream", "stream_id", streamID, "error", err)
-		cancel()
-		return func() {}
+	if sw, exists := r.watchers[streamID]; exists {
+		return sw, nil
 	}
 
+	pattern := fmt.Sprintf("route.%s.>", streamID)
+	// Use separate context for cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+
+	natsWatcher, err := r.kv.Watch(ctx, pattern)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
+	sw := &streamWatcher{
+		streamID:    streamID,
+		cancel:      cancel,
+		subscribers: make(map[int64]func(types.RouteKVValue)),
+		downstreams: make(map[int64]func(types.NodeID, bool)),
+	}
+	r.watchers[streamID] = sw
+
+	// Start dispatch loop
 	go func() {
-		defer watcher.Stop()
+		defer natsWatcher.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case entry, ok := <-watcher.Updates():
+			case <-r.stopCh: // Also stop if RIB stops
+				return
+			case entry, ok := <-natsWatcher.Updates():
 				if !ok {
 					return
 				}
 				if entry == nil {
 					continue
 				}
-
-				// Handle Delete
-				if entry.Operation() == jetstream.KeyValueDelete || entry.Operation() == jetstream.KeyValuePurge {
-					// Key: route.<StreamID>...
-					// We pass the Key as OriginNode (hack compatible with previous logic)
-					cb(types.RouteKVValue{
-						StreamID:   streamID,
-						BaseCost:   -1,
-						OriginNode: types.NodeID(entry.Key()),
-					})
-					continue
-				}
-
-				var val types.RouteKVValue
-				if err := json.Unmarshal(entry.Value(), &val); err != nil {
-					continue
-				}
-				cb(val)
+				r.dispatchUpdate(sw, entry)
 			}
 		}
 	}()
 
-	return cancel
+	return sw, nil
+}
+
+func (r *RIB) dispatchUpdate(sw *streamWatcher, entry jetstream.KeyValueEntry) {
+	isDelete := entry.Operation() == jetstream.KeyValueDelete || entry.Operation() == jetstream.KeyValuePurge
+	key := entry.Key()
+
+	var val types.RouteKVValue
+	if isDelete {
+		val.BaseCost = -1
+		val.OriginNode = types.NodeID(key) // Hack: use Key as ID for delete
+		// StreamID is known from sw
+		val.StreamID = sw.streamID
+	} else {
+		if err := json.Unmarshal(entry.Value(), &val); err != nil {
+			return
+		}
+	}
+
+	sw.mu.RLock()
+	defer sw.mu.RUnlock()
+
+	// 1. Notify Subscribers
+	for _, cb := range sw.subscribers {
+		cb(val)
+	}
+
+	// 2. Notify Downstreams
+	for _, cb := range sw.downstreams {
+		if isDelete {
+			cb(types.NodeID(key), false)
+		} else {
+			// Check if we are upstream
+			if len(val.PathVector) > 0 && val.PathVector[len(val.PathVector)-1] == r.local.ID {
+				cb(val.OriginNode, true)
+			}
+		}
+	}
+}
+
+func (r *RIB) cleanupWatcher(streamID types.StreamID, sw *streamWatcher) {
+	r.watchersMu.Lock()
+	defer r.watchersMu.Unlock()
+
+	// Only clean up if it's the same watcher instance and empty
+	if current, ok := r.watchers[streamID]; ok && current == sw {
+		sw.mu.RLock()
+		empty := len(sw.subscribers) == 0 && len(sw.downstreams) == 0
+		sw.mu.RUnlock()
+
+		if empty {
+			sw.cancel()
+			delete(r.watchers, streamID)
+		}
+	}
+}
+
+// SubscribeUpdates starts a watcher for a specific stream's routes
+// It returns a cancel function to stop the watcher.
+func (r *RIB) SubscribeUpdates(streamID types.StreamID, cb func(types.RouteKVValue)) func() {
+	sw, err := r.getOrStartWatcher(streamID)
+	if err != nil {
+		r.logger.Error("Failed to watch stream", "stream_id", streamID, "error", err)
+		return func() {}
+	}
+
+	sw.mu.Lock()
+	sw.subSeq++
+	id := sw.subSeq
+	sw.subscribers[id] = cb
+	sw.mu.Unlock()
+
+	return func() {
+		sw.mu.Lock()
+		delete(sw.subscribers, id)
+		sw.mu.Unlock()
+		r.cleanupWatcher(streamID, sw)
+	}
 }
 
 // WatchDownstream registers a callback to track who depends on us
 func (r *RIB) WatchDownstream(streamID types.StreamID, cb func(downstreamNode types.NodeID, isAdd bool)) {
-	pattern := fmt.Sprintf("route.%s.>", streamID)
-
-	// We use r.ctx (global) because FIB doesn't cancel WatchDownstream explicitly
-	// This means these watchers run until RIB is closed.
-	watcher, err := r.kv.Watch(r.ctx, pattern)
+	sw, err := r.getOrStartWatcher(streamID)
 	if err != nil {
 		r.logger.Error("Failed to watch downstream", "stream_id", streamID, "error", err)
 		return
 	}
 
-	go func() {
-		defer watcher.Stop()
-		for {
-			select {
-			case <-r.stopCh: // Stop if RIB stops
-				return
-			case entry, ok := <-watcher.Updates():
-				if !ok {
-					return
-				}
-				if entry == nil {
-					continue
-				}
+	sw.mu.Lock()
+	sw.dsSeq++
+	id := sw.dsSeq
+	sw.downstreams[id] = cb
+	sw.mu.Unlock()
 
-				// Handle Delete
-				if entry.Operation() == jetstream.KeyValueDelete || entry.Operation() == jetstream.KeyValuePurge {
-					// Assume node removed dependency
-					cb(types.NodeID(entry.Key()), false)
-					continue
-				}
-
-				var val types.RouteKVValue
-				if err := json.Unmarshal(entry.Value(), &val); err != nil {
-					continue
-				}
-
-				// Check if we are in the PathVector as the last hop (upstream)
-				if len(val.PathVector) > 0 && val.PathVector[len(val.PathVector)-1] == r.local.ID {
-					cb(val.OriginNode, true)
-				}
-			}
-		}
-	}()
+	// No cleanup returned, persists until RIB close or implicit cleanup
 }
 
 // StartAdvertise registers a stream for keepalive
@@ -304,6 +362,13 @@ func (r *RIB) keepAliveLoop() {
 func (r *RIB) Close() {
 	// Stop keepAliveLoop
 	close(r.stopCh)
+
+	// Cancel all watchers
+	r.watchersMu.Lock()
+	for _, sw := range r.watchers {
+		sw.cancel()
+	}
+	r.watchersMu.Unlock()
 
 	// Unadvertise all active streams
 	r.mu.Lock()
