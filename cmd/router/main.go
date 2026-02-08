@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 
 	"rib-control/pkg/discovery"
 	"rib-control/pkg/routing"
+	"rib-control/pkg/store"
 	"rib-control/pkg/types"
 
 	"github.com/nats-io/nats.go"
@@ -57,11 +59,13 @@ func main() {
 	}
 
 	// 2. Init Components
-	rib, err := routing.NewRIB(js, myNode)
+	kv, err := store.NewNatsStore(context.Background(), js, routing.RibBucketName, routing.RIBTTL)
 	if err != nil {
-		slog.Error("Failed to init RIB", "error", err)
+		slog.Error("Failed to init NATS Store", "error", err)
 		os.Exit(1)
 	}
+
+	rib := routing.NewRIB(kv, myNode)
 
 	linkDB := routing.NewLinkDB()
 	finder := discovery.NewFinder(rib, linkDB, myNode.ID)

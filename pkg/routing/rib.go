@@ -10,9 +10,8 @@ import (
 	"time"
 
 	"rib-control/pkg/ds"
+	"rib-control/pkg/store"
 	"rib-control/pkg/types"
-
-	"github.com/nats-io/nats.go/jetstream"
 )
 
 const (
@@ -41,8 +40,7 @@ type streamWatcher struct {
 }
 
 type RIB struct {
-	kv    jetstream.KeyValue
-	js    jetstream.JetStream
+	kv    store.Store
 	local types.NodeInfo
 	ctx   context.Context
 
@@ -62,23 +60,11 @@ type RIB struct {
 	watchersMu sync.Mutex
 }
 
-func NewRIB(js jetstream.JetStream, local types.NodeInfo) (*RIB, error) {
+func NewRIB(kv store.Store, local types.NodeInfo) *RIB {
 	ctx := context.Background()
-
-	// Ensure Bucket Exists
-	kv, err := js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
-		Bucket:      RibBucketName,
-		Description: "Routing Information Base",
-		TTL:         RIBTTL,
-		History:     1,
-	})
-	if err != nil {
-		return nil, err
-	}
 
 	r := &RIB{
 		kv:       kv,
-		js:       js,
 		local:    local,
 		ctx:      ctx,
 		pq:       ds.NewPriorityQueue[*adEntry](0),
@@ -94,7 +80,7 @@ func NewRIB(js jetstream.JetStream, local types.NodeInfo) (*RIB, error) {
 	// Start keepalive scheduler
 	go r.keepAliveLoop()
 
-	return r, nil
+	return r
 }
 
 // LocalInfo returns the local node information
@@ -114,7 +100,7 @@ func (r *RIB) getOrStartWatcher(streamID types.StreamID) (*streamWatcher, error)
 	// Use separate context for cancellation
 	ctx, cancel := context.WithCancel(context.Background())
 
-	natsWatcher, err := r.kv.Watch(ctx, pattern)
+	kvWatcher, err := r.kv.Watch(ctx, pattern)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -130,14 +116,14 @@ func (r *RIB) getOrStartWatcher(streamID types.StreamID) (*streamWatcher, error)
 
 	// Start dispatch loop
 	go func() {
-		defer natsWatcher.Stop()
+		defer kvWatcher.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-r.stopCh: // Also stop if RIB stops
 				return
-			case entry, ok := <-natsWatcher.Updates():
+			case entry, ok := <-kvWatcher.Updates():
 				if !ok {
 					return
 				}
@@ -152,8 +138,8 @@ func (r *RIB) getOrStartWatcher(streamID types.StreamID) (*streamWatcher, error)
 	return sw, nil
 }
 
-func (r *RIB) dispatchUpdate(sw *streamWatcher, entry jetstream.KeyValueEntry) {
-	isDelete := entry.Operation() == jetstream.KeyValueDelete || entry.Operation() == jetstream.KeyValuePurge
+func (r *RIB) dispatchUpdate(sw *streamWatcher, entry store.Entry) {
+	isDelete := entry.Operation() == store.OpDelete || entry.Operation() == store.OpPurge
 	key := entry.Key()
 
 	var val types.RouteKVValue
@@ -404,8 +390,7 @@ func (r *RIB) advertiseOnce(entry *adEntry) error {
 		return err
 	}
 
-	_, err = r.kv.Put(r.ctx, key, data)
-	return err
+	return r.kv.Put(r.ctx, key, data)
 }
 
 // Unadvertise removes the entry directly
@@ -418,7 +403,7 @@ func (r *RIB) Unadvertise(streamID types.StreamID) error {
 func (r *RIB) GetCandidates(streamID types.StreamID) ([]types.RouteKVValue, error) {
 	pattern := fmt.Sprintf("route.%s.>", streamID)
 
-	watcher, err := r.kv.Watch(r.ctx, pattern, jetstream.IgnoreDeletes())
+	watcher, err := r.kv.Watch(r.ctx, pattern, store.IgnoreDeletes())
 	if err != nil {
 		return nil, err
 	}

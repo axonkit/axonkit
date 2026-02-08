@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"rib-control/pkg/routing"
+	"rib-control/pkg/store"
 	"rib-control/pkg/types"
 
 	"github.com/nats-io/nats.go"
@@ -35,10 +36,12 @@ func TestFIBOptimization(t *testing.T) {
 		t.Fatalf("Failed to init JetStream: %v", err)
 	}
 
-	rib, err := routing.NewRIB(js, localInfo)
+	kvStore, err := store.NewNatsStore(context.Background(), js, routing.RibBucketName, routing.RIBTTL)
 	if err != nil {
-		t.Fatalf("NewRIB failed: %v", err)
+		t.Fatalf("Failed to create NATS store: %v", err)
 	}
+
+	rib := routing.NewRIB(kvStore, localInfo)
 	defer rib.Close()
 
 	fib := routing.NewFIB(rib, localInfo.ID)
@@ -200,10 +203,12 @@ func TestConcurrentOptimization(t *testing.T) {
 		t.Fatalf("Failed to init JetStream: %v", err)
 	}
 
-	rib, err := routing.NewRIB(js, localInfo)
+	kvStore, err := store.NewNatsStore(context.Background(), js, routing.RibBucketName, routing.RIBTTL)
 	if err != nil {
-		t.Fatalf("NewRIB failed: %v", err)
+		t.Fatalf("Failed to create NATS store: %v", err)
 	}
+
+	rib := routing.NewRIB(kvStore, localInfo)
 	defer rib.Close()
 
 	fib := routing.NewFIB(rib, localInfo.ID)

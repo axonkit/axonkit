@@ -1,11 +1,13 @@
 package integration
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
 
 	"rib-control/pkg/routing"
+	"rib-control/pkg/store"
 	"rib-control/pkg/types"
 
 	server "github.com/nats-io/nats-server/v2/server"
@@ -53,10 +55,12 @@ func createNode(t *testing.T, srv *server.Server, id string) *MockNode {
 		Cluster: "TestCluster",
 	}
 
-	rib, err := routing.NewRIB(js, nodeInfo)
+	kv, err := store.NewNatsStore(context.Background(), js, routing.RibBucketName, routing.RIBTTL)
 	if err != nil {
-		t.Fatalf("Failed to create RIB: %v", err)
+		t.Fatalf("Failed to create NATS store: %v", err)
 	}
+
+	rib := routing.NewRIB(kv, nodeInfo)
 
 	fib := routing.NewFIB(rib, nodeInfo.ID)
 
