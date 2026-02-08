@@ -17,10 +17,10 @@ type NodeInfo struct {
 // RouteKVValue is the value stored in NATS KV
 // Key format: route.<StreamID>.<Region>.<Cluster>.<NodeID>
 type RouteKVValue struct {
-	StreamID      StreamID  `json:"stream_id"`
-	OriginNode    NodeID    `json:"origin_node"` // The node providing this hop
-	OriginRegion  RegionID  `json:"origin_region"`
-	OriginCluster ClusterID `json:"origin_cluster"`
+	StreamID StreamID  `json:"stream_id"`
+	Node     NodeID    `json:"node"` // The node providing this hop
+	Region   RegionID  `json:"region"`
+	Cluster  ClusterID `json:"cluster"`
 
 	BaseCost    int       `json:"base_cost"`     // Cost to reach this node (from stream source)
 	PathVector  []NodeID  `json:"path_vector"`   // Loop detection

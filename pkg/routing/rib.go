@@ -159,7 +159,7 @@ func (r *RIB) dispatchUpdate(sw *streamWatcher, entry jetstream.KeyValueEntry) {
 	var val types.RouteKVValue
 	if isDelete {
 		val.BaseCost = -1
-		val.OriginNode = types.NodeID(key) // Hack: use Key as ID for delete
+		val.Node = types.NodeID(key) // Hack: use Key as ID for delete
 		// StreamID is known from sw
 		val.StreamID = sw.streamID
 	} else {
@@ -183,7 +183,7 @@ func (r *RIB) dispatchUpdate(sw *streamWatcher, entry jetstream.KeyValueEntry) {
 		} else {
 			// Check if we are upstream
 			if len(val.PathVector) > 0 && val.PathVector[len(val.PathVector)-1] == r.local.ID {
-				cb(val.OriginNode, true)
+				cb(val.Node, true)
 			}
 		}
 	}
@@ -389,14 +389,14 @@ func (r *RIB) advertiseOnce(entry *adEntry) error {
 	key := fmt.Sprintf("route.%s.%s.%s.%s", entry.StreamID, r.local.Region, r.local.Cluster, r.local.ID)
 
 	val := types.RouteKVValue{
-		StreamID:      entry.StreamID,
-		OriginNode:    r.local.ID,
-		OriginRegion:  r.local.Region,
-		OriginCluster: r.local.Cluster,
-		BaseCost:      entry.BaseCost,
-		PathVector:    entry.PathVector,
-		RttToOrigin:   entry.RttToOrigin,
-		ExpireAt:      time.Now().Add(RIBTTL),
+		StreamID:    entry.StreamID,
+		Node:        r.local.ID,
+		Region:      r.local.Region,
+		Cluster:     r.local.Cluster,
+		BaseCost:    entry.BaseCost,
+		PathVector:  entry.PathVector,
+		RttToOrigin: entry.RttToOrigin,
+		ExpireAt:    time.Now().Add(RIBTTL),
 	}
 
 	data, err := json.Marshal(val)

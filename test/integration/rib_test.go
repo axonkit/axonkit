@@ -103,7 +103,7 @@ func TestCascadingTeardown(t *testing.T) {
 		candidates, _ := edgeA.RIB.GetCandidates(sid)
 		for _, c := range candidates {
 			// Loop prevention: Don't pick self or route containing self
-			if c.OriginNode == edgeA.ID {
+			if c.Node == edgeA.ID {
 				continue
 			}
 			hasLoop := false
@@ -135,7 +135,7 @@ func TestCascadingTeardown(t *testing.T) {
 		candidates, _ := edgeB.RIB.GetCandidates(sid)
 		for _, c := range candidates {
 			// Loop prevention
-			if c.OriginNode == edgeB.ID {
+			if c.Node == edgeB.ID {
 				continue
 			}
 			hasLoop := false
@@ -150,7 +150,7 @@ func TestCascadingTeardown(t *testing.T) {
 			}
 
 			// Test specific: Prefer EdgeA to force daisy chain
-			if c.OriginNode == edgeA.ID {
+			if c.Node == edgeA.ID {
 				val := c
 				return &val, nil
 			}
@@ -178,7 +178,7 @@ func TestCascadingTeardown(t *testing.T) {
 	candidates, _ := origin.RIB.GetCandidates(streamID) // Check from Origin perspective or any perspective
 	foundEdgeA := false
 	for _, c := range candidates {
-		if c.OriginNode == edgeA.ID {
+		if c.Node == edgeA.ID {
 			foundEdgeA = true
 			break
 		}
@@ -219,7 +219,7 @@ func TestLinger(t *testing.T) {
 	// Subscribe Self (Loopback just to test FIB logic)
 	// Actually we can mock findPath to return anything
 	node.FIB.Subscribe(streamID, func(sid types.StreamID) (*types.RouteKVValue, error) {
-		return &types.RouteKVValue{OriginNode: "MockUpstream", BaseCost: 0, PathVector: []types.NodeID{"MockUpstream"}}, nil
+		return &types.RouteKVValue{Node: "MockUpstream", BaseCost: 0, PathVector: []types.NodeID{"MockUpstream"}}, nil
 	})
 
 	// Unsubscribe6sese6erv6refe热形成的珊珊深色的婷婷也一样          测试下c CDv f c f v f g v f v

@@ -70,13 +70,13 @@ func (f *FIB) Subscribe(streamID types.StreamID, findPath func(types.StreamID) (
 		return "", "", fmt.Errorf("no route found for %s", streamID)
 	}
 
-	f.logger.Info("Found best route", "stream_id", streamID, "via", route.OriginNode, "cost", route.BaseCost)
+	f.logger.Info("Found best route", "stream_id", streamID, "via", route.Node, "cost", route.BaseCost)
 
 	// 2. Connect Pipe (Mock)
 	pipeID := fmt.Sprintf("pipe-%d", time.Now().UnixNano())
 	if f.ConnectPipe != nil {
 		var err error
-		pipeID, err = f.ConnectPipe(streamID, route.OriginNode)
+		pipeID, err = f.ConnectPipe(streamID, route.Node)
 		if err != nil {
 			return "", "", err
 		}
@@ -85,7 +85,7 @@ func (f *FIB) Subscribe(streamID types.StreamID, findPath func(types.StreamID) (
 	// 3. Create Entry
 	entry = &types.FIBEntry{
 		StreamID:        streamID,
-		UpstreamNode:    route.OriginNode,
+		UpstreamNode:    route.Node,
 		PipeID:          pipeID,
 		State:           "connected",
 		RefCount:        1,
@@ -106,7 +106,7 @@ func (f *FIB) Subscribe(streamID types.StreamID, findPath func(types.StreamID) (
 	}
 
 	// 5. Start Watching for Upstream Teardown AND Downstream Dependency
-	f.monitorUpstream(streamID, route.OriginNode, findPath)
+	f.monitorUpstream(streamID, route.Node, findPath)
 
 	// 6. Schedule Periodic Optimization
 	if f.EnableRouteOptimization {
@@ -118,7 +118,7 @@ func (f *FIB) Subscribe(streamID types.StreamID, findPath func(types.StreamID) (
 		f.handleDownstreamChange(streamID, nodeID, isAdd)
 	})
 
-	return pipeID, route.OriginNode, nil
+	return pipeID, route.Node, nil
 }
 
 func (f *FIB) handleDownstreamChange(streamID types.StreamID, nodeID types.NodeID, isAdd bool) {
@@ -160,7 +160,7 @@ func (f *FIB) monitorUpstream(streamID types.StreamID, currentUpstream types.Nod
 
 		if val.BaseCost == -1 {
 			// A route was deleted. Is it OUR upstream?
-			key := string(val.OriginNode) // We stored Key in OriginNode
+			key := string(val.Node) // We stored Key in OriginNode
 			expectedSuffix := fmt.Sprintf(".%s", currentUpstream)
 
 			if len(key) > len(expectedSuffix) && key[len(key)-len(expectedSuffix):] == expectedSuffix {
@@ -232,7 +232,7 @@ func (f *FIB) handleFailover(streamID types.StreamID, failedUpstream types.NodeI
 	}
 
 	// 2. Found new path? Switch!
-	f.logger.Info("Reroute successful", "from", failedUpstream, "to", newRoute.OriginNode)
+	f.logger.Info("Reroute successful", "from", failedUpstream, "to", newRoute.Node)
 
 	// Disconnect old pipe
 	if f.DisconnectPipe != nil {
@@ -242,7 +242,7 @@ func (f *FIB) handleFailover(streamID types.StreamID, failedUpstream types.NodeI
 	// Connect new pipe
 	newPipeID := fmt.Sprintf("pipe-%d-reroute", time.Now().UnixNano())
 	if f.ConnectPipe != nil {
-		pid, err := f.ConnectPipe(streamID, newRoute.OriginNode)
+		pid, err := f.ConnectPipe(streamID, newRoute.Node)
 		if err == nil {
 			newPipeID = pid
 		} else {
@@ -256,19 +256,21 @@ func (f *FIB) handleFailover(streamID types.StreamID, failedUpstream types.NodeI
 	f.mu.Lock()
 	// Re-check existence
 	if entry, ok := f.entries[streamID]; ok {
-		entry.UpstreamNode = newRoute.OriginNode
+		entry.UpstreamNode = newRoute.Node
 		entry.PipeID = newPipeID
 		// RefCount remains same
 	}
 	f.mu.Unlock()
 
 	// Restart monitoring for NEW upstream
-	go f.monitorUpstream(streamID, newRoute.OriginNode, findPath)
+	go f.monitorUpstream(streamID, newRoute.Node, findPath)
 
 	// Update Re-advertise (PathVector changed!)
 	// We need to update our advertisement because the path vector is different now
 	newPathVector := append(newRoute.PathVector, f.localNodeID)
-	f.rib.StartAdvertise(streamID, newRoute.BaseCost+10, newPathVector, newRoute.RttToOrigin+20)
+	if err := f.rib.StartAdvertise(streamID, newRoute.BaseCost+10, newPathVector, newRoute.RttToOrigin+20); err != nil {
+		f.logger.Error("Failed to re-advertise during failover", "stream_id", streamID, "error", err)
+	}
 }
 
 // Unsubscribe decrements ref count and tears down if 0
@@ -466,7 +468,7 @@ func (f *FIB) optimizeRoute(streamID types.StreamID) {
 		return // No path found, keep current
 	}
 
-	if bestRoute.OriginNode == currentUpstream {
+	if bestRoute.Node == currentUpstream {
 		return // Same upstream, nothing to do
 	}
 
@@ -484,7 +486,7 @@ func (f *FIB) optimizeRoute(streamID types.StreamID) {
 
 	var currentRoute *types.RouteKVValue
 	for _, c := range candidates {
-		if c.OriginNode == currentUpstream {
+		if c.Node == currentUpstream {
 			currentRoute = &c
 			break
 		}
@@ -495,14 +497,14 @@ func (f *FIB) optimizeRoute(streamID types.StreamID) {
 		// If gone, we should have triggered failover already.
 		// But maybe failover is slow or racing.
 		// If we found a new best route, let's switch.
-		f.logger.Info("Optimize: Current upstream not found, switching", "current", currentUpstream, "new", bestRoute.OriginNode)
+		f.logger.Info("Optimize: Current upstream not found, switching", "current", currentUpstream, "new", bestRoute.Node)
 		f.switchUpstream(streamID, bestRoute)
 		return
 	}
 
 	// Skip optimization if current upstream is in the same Cluster
 	// Intra-cluster traffic is usually preferred/free, so don't switch away unless broken.
-	if currentRoute.OriginCluster == f.rib.LocalInfo().Cluster {
+	if currentRoute.Cluster == f.rib.LocalInfo().Cluster {
 		// log.Printf("[FIB] Optimize: Current upstream %s is in same cluster (%s). Skipping optimization.", currentUpstream, currentRoute.OriginCluster)
 		return
 	}
@@ -510,7 +512,7 @@ func (f *FIB) optimizeRoute(streamID types.StreamID) {
 	// Apply Threshold
 	// Switch if: NewCost < CurrentCost - Threshold
 	if bestRoute.BaseCost < currentRoute.BaseCost-f.OptimizationThreshold {
-		f.logger.Info("Optimize: Found better path", "new_node", bestRoute.OriginNode, "new_cost", bestRoute.BaseCost, "current_node", currentUpstream, "current_cost", currentRoute.BaseCost)
+		f.logger.Info("Optimize: Found better path", "new_node", bestRoute.Node, "new_cost", bestRoute.BaseCost, "current_node", currentUpstream, "current_cost", currentRoute.BaseCost)
 		f.switchUpstream(streamID, bestRoute)
 	}
 }
@@ -527,13 +529,13 @@ func (f *FIB) switchUpstream(streamID types.StreamID, newRoute *types.RouteKVVal
 	oldPipeID := entry.PipeID
 	f.mu.Unlock()
 
-	f.logger.Info("Switching upstream", "stream_id", streamID, "from", oldUpstream, "to", newRoute.OriginNode)
+	f.logger.Info("Switching upstream", "stream_id", streamID, "from", oldUpstream, "to", newRoute.Node)
 
 	// 1. Connect New Pipe
 	var newPipeID string
 	if f.ConnectPipe != nil {
 		var err error
-		newPipeID, err = f.ConnectPipe(streamID, newRoute.OriginNode)
+		newPipeID, err = f.ConnectPipe(streamID, newRoute.Node)
 		if err != nil {
 			f.logger.Error("Switch failed: ConnectPipe error", "error", err)
 			return
@@ -553,7 +555,7 @@ func (f *FIB) switchUpstream(streamID types.StreamID, newRoute *types.RouteKVVal
 		return
 	}
 
-	entry.UpstreamNode = newRoute.OriginNode
+	entry.UpstreamNode = newRoute.Node
 	entry.PipeID = newPipeID
 	f.mu.Unlock()
 
@@ -566,12 +568,12 @@ func (f *FIB) switchUpstream(streamID types.StreamID, newRoute *types.RouteKVVal
 
 	// 4. Update Watcher
 	// We need to monitor the NEW upstream
-	f.monitorUpstream(streamID, newRoute.OriginNode, entry.FindPathFunc)
+	f.monitorUpstream(streamID, newRoute.Node, entry.FindPathFunc)
 
 	// 5. Disconnect Old Pipe
 	if f.DisconnectPipe != nil {
 		f.DisconnectPipe(oldPipeID)
 	}
 
-	f.logger.Info("Switch complete", "stream_id", streamID, "via", newRoute.OriginNode)
+	f.logger.Info("Switch complete", "stream_id", streamID, "via", newRoute.Node)
 }

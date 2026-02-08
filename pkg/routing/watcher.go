@@ -172,7 +172,7 @@ func (dw *DynamicWatcher) dispatch(entry jetstream.KeyValueEntry) {
 	var val types.RouteKVValue
 	if isDelete {
 		val.BaseCost = -1
-		val.OriginNode = types.NodeID(key)
+		val.Node = types.NodeID(key)
 		// Extract StreamID from key
 		parts := strings.Split(key, ".")
 		if len(parts) >= 2 {

@@ -63,13 +63,13 @@ func TestFIBOptimization(t *testing.T) {
 	putRoute := func(streamID types.StreamID, nodeID types.NodeID, cluster types.ClusterID, cost int) {
 		key := fmt.Sprintf("route.%s.R1.%s.%s", streamID, cluster, nodeID)
 		val := types.RouteKVValue{
-			StreamID:      streamID,
-			OriginNode:    nodeID,
-			OriginRegion:  "R1",
-			OriginCluster: cluster,
-			BaseCost:      cost,
-			PathVector:    []types.NodeID{nodeID},
-			ExpireAt:      time.Now().Add(10 * time.Second),
+			StreamID:   streamID,
+			Node:       nodeID,
+			Region:     "R1",
+			Cluster:    cluster,
+			BaseCost:   cost,
+			PathVector: []types.NodeID{nodeID},
+			ExpireAt:   time.Now().Add(10 * time.Second),
 		}
 		data, _ := json.Marshal(val)
 		kv.Put(context.Background(), key, data)
@@ -231,13 +231,13 @@ func TestConcurrentOptimization(t *testing.T) {
 		// Always use C2 to allow optimization switching
 		key := fmt.Sprintf("route.%s.R1.C2.%s", streamID, nodeID)
 		val := types.RouteKVValue{
-			StreamID:      streamID,
-			OriginNode:    nodeID,
-			OriginRegion:  "R1",
-			OriginCluster: "C2", // Diff cluster
-			BaseCost:      cost,
-			PathVector:    []types.NodeID{nodeID},
-			ExpireAt:      time.Now().Add(10 * time.Second),
+			StreamID:   streamID,
+			Node:       nodeID,
+			Region:     "R1",
+			Cluster:    "C2", // Diff cluster
+			BaseCost:   cost,
+			PathVector: []types.NodeID{nodeID},
+			ExpireAt:   time.Now().Add(10 * time.Second),
 		}
 		data, _ := json.Marshal(val)
 		kv.Put(context.Background(), key, data)
@@ -247,7 +247,7 @@ func TestConcurrentOptimization(t *testing.T) {
 		candidates, _ := rib.GetCandidates(sid)
 		var best *types.RouteKVValue
 		for _, c := range candidates {
-			if c.OriginNode == "LocalNode" {
+			if c.Node == "LocalNode" {
 				continue
 			}
 			candidate := c

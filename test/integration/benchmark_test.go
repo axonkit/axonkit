@@ -44,7 +44,7 @@ func BenchmarkStreamScale(b *testing.B) {
 	// This focuses on "FIB Subscription Overhead".
 
 	mockRoute := types.RouteKVValue{
-		OriginNode: origin.ID,
+		Node:       origin.ID,
 		BaseCost:   0,
 		PathVector: []types.NodeID{origin.ID},
 	}
@@ -93,7 +93,7 @@ func BenchmarkChurn(b *testing.B) {
 	defer node.Close()
 
 	streamID := types.StreamID("churn-stream")
-	mockRoute := types.RouteKVValue{OriginNode: "MockOrigin", BaseCost: 0}
+	mockRoute := types.RouteKVValue{Node: "MockOrigin", BaseCost: 0}
 
 	b.ResetTimer()
 
@@ -146,7 +146,7 @@ func TestHighConcurrency(t *testing.T) {
 
 				// Subscribe
 				node.FIB.Subscribe(streamID, func(sid types.StreamID) (*types.RouteKVValue, error) {
-					return &types.RouteKVValue{OriginNode: "MockOrigin", BaseCost: 0}, nil
+					return &types.RouteKVValue{Node: "MockOrigin", BaseCost: 0}, nil
 				})
 
 				// Wait a bit
