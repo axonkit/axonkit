@@ -2,7 +2,7 @@ package routing
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"rib-control/pkg/types"
 	"sync"
 	"time"
@@ -29,6 +29,8 @@ type FIB struct {
 	EnableRouteOptimization bool
 	OptimizationInterval    time.Duration
 	OptimizationThreshold   int // Cost improvement threshold to trigger switch
+
+	logger *slog.Logger
 }
 
 func NewFIB(rib *RIB, localNodeID types.NodeID) *FIB {
@@ -40,6 +42,7 @@ func NewFIB(rib *RIB, localNodeID types.NodeID) *FIB {
 		EnableRouteOptimization: false,           // Default disabled, enable via feature flag
 		OptimizationInterval:    5 * time.Minute, // Slow convergence
 		OptimizationThreshold:   10,              // Hysteresis
+		logger:                  slog.Default().With("component", "FIB"),
 	}
 }
 
@@ -53,7 +56,7 @@ func (f *FIB) Subscribe(streamID types.StreamID, findPath func(types.StreamID) (
 	if exists {
 		f.cancelTeardown(entry)
 		entry.RefCount++
-		log.Printf("[FIB] Stream %s ref++ -> %d (Existing Pipe: %s)", streamID, entry.RefCount, entry.PipeID)
+		f.logger.Info("Stream ref increased", "stream_id", streamID, "ref_count", entry.RefCount, "existing_pipe", entry.PipeID)
 		return entry.PipeID, entry.UpstreamNode, nil
 	}
 
@@ -67,8 +70,7 @@ func (f *FIB) Subscribe(streamID types.StreamID, findPath func(types.StreamID) (
 		return "", "", fmt.Errorf("no route found for %s", streamID)
 	}
 
-	log.Printf("[FIB] Stream %s: Found best route via %s (Origin: %s, Cost: %d)",
-		streamID, route.OriginNode, route.OriginNode, route.BaseCost)
+	f.logger.Info("Found best route", "stream_id", streamID, "via", route.OriginNode, "cost", route.BaseCost)
 
 	// 2. Connect Pipe (Mock)
 	pipeID := fmt.Sprintf("pipe-%d", time.Now().UnixNano())
@@ -98,9 +100,9 @@ func (f *FIB) Subscribe(streamID types.StreamID, findPath func(types.StreamID) (
 	// Start Keepalive Advertise
 	err = f.rib.StartAdvertise(streamID, route.BaseCost+10, newPathVector, route.RttToOrigin+20)
 	if err != nil {
-		log.Printf("[FIB] Failed to start re-advertise stream %s: %v", streamID, err)
+		f.logger.Error("Failed to start re-advertise", "stream_id", streamID, "error", err)
 	} else {
-		log.Printf("[FIB] Re-advertised stream %s as new source (Keepalive started)", streamID)
+		f.logger.Info("Re-advertised stream as new source", "stream_id", streamID)
 	}
 
 	// 5. Start Watching for Upstream Teardown AND Downstream Dependency
@@ -132,17 +134,17 @@ func (f *FIB) handleDownstreamChange(streamID types.StreamID, nodeID types.NodeI
 		f.cancelTeardown(entry) // Cancel linger if active again
 		if !entry.DownstreamNodes[nodeID] {
 			entry.DownstreamNodes[nodeID] = true
-			log.Printf("[FIB] New downstream dependency for %s: %s (Total Downstreams: %d)", streamID, nodeID, len(entry.DownstreamNodes))
+			f.logger.Info("New downstream dependency", "stream_id", streamID, "downstream_node", nodeID, "total", len(entry.DownstreamNodes))
 		}
 	} else {
 		if entry.DownstreamNodes[nodeID] {
 			delete(entry.DownstreamNodes, nodeID)
-			log.Printf("[FIB] Downstream dependency removed for %s: %s (Total Downstreams: %d)", streamID, nodeID, len(entry.DownstreamNodes))
+			f.logger.Info("Downstream dependency removed", "stream_id", streamID, "downstream_node", nodeID, "total", len(entry.DownstreamNodes))
 
 			// Check if we need to teardown
 			// Logic: If RefCount == 0 AND len(DownstreamNodes) == 0 -> Teardown
 			if entry.RefCount <= 0 && len(entry.DownstreamNodes) == 0 {
-				log.Printf("[FIB] No local users and no downstream dependencies for %s. Scheduling teardown.", streamID)
+				f.logger.Info("Scheduling teardown (no users/downstreams)", "stream_id", streamID)
 				f.scheduleTeardown(streamID)
 			}
 		}
@@ -162,7 +164,7 @@ func (f *FIB) monitorUpstream(streamID types.StreamID, currentUpstream types.Nod
 			expectedSuffix := fmt.Sprintf(".%s", currentUpstream)
 
 			if len(key) > len(expectedSuffix) && key[len(key)-len(expectedSuffix):] == expectedSuffix {
-				log.Printf("[FIB] Upstream %s disappeared for stream %s! Triggering failover...", currentUpstream, streamID)
+				f.logger.Warn("Upstream disappeared, triggering failover", "upstream", currentUpstream, "stream_id", streamID)
 
 				// We need to trigger failover logic.
 				// NOTE: This callback is executed in RIB's global watcher loop.
@@ -188,7 +190,7 @@ func (f *FIB) monitorUpstream(streamID types.StreamID, currentUpstream types.Nod
 		// We should remove defer.
 	}()
 
-	log.Printf("[FIB] Started monitoring upstream %s for stream %s", currentUpstream, streamID)
+	f.logger.Info("Started monitoring upstream", "upstream", currentUpstream, "stream_id", streamID)
 }
 
 func (f *FIB) handleFailover(streamID types.StreamID, failedUpstream types.NodeID, findPath func(types.StreamID) (*types.RouteKVValue, error)) {
@@ -206,12 +208,12 @@ func (f *FIB) handleFailover(streamID types.StreamID, failedUpstream types.NodeI
 	}
 	f.mu.Unlock()
 
-	log.Printf("[FIB] Attempting to reroute stream %s...", streamID)
+	f.logger.Info("Attempting to reroute stream", "stream_id", streamID)
 
 	// 1. Try to find a NEW path
 	newRoute, err := findPath(streamID)
 	if err != nil || newRoute == nil {
-		log.Printf("[FIB] Reroute failed: No alternative path for %s. Tearing down downstream.", streamID)
+		f.logger.Error("Reroute failed: No alternative path", "stream_id", streamID)
 
 		// Force stop advertising to prevent downstream from using us
 		f.rib.StopAdvertise(streamID)
@@ -230,7 +232,7 @@ func (f *FIB) handleFailover(streamID types.StreamID, failedUpstream types.NodeI
 	}
 
 	// 2. Found new path? Switch!
-	log.Printf("[FIB] Reroute successful! Switching from %s to %s", failedUpstream, newRoute.OriginNode)
+	f.logger.Info("Reroute successful", "from", failedUpstream, "to", newRoute.OriginNode)
 
 	// Disconnect old pipe
 	if f.DisconnectPipe != nil {
@@ -244,7 +246,7 @@ func (f *FIB) handleFailover(streamID types.StreamID, failedUpstream types.NodeI
 		if err == nil {
 			newPipeID = pid
 		} else {
-			log.Printf("[FIB] Failed to connect to new upstream: %v", err)
+			f.logger.Error("Failed to connect to new upstream", "error", err)
 			f.Unsubscribe(streamID)
 			return
 		}
@@ -284,7 +286,7 @@ func (f *FIB) Unsubscribe(streamID types.StreamID) {
 	// For failover case, we might need a "ForceTeardown".
 	// Assuming standard usage:
 	entry.RefCount--
-	log.Printf("[FIB] Stream %s ref-- -> %d", streamID, entry.RefCount)
+	f.logger.Info("Stream ref decreased", "stream_id", streamID, "ref_count", entry.RefCount)
 
 	if entry.RefCount <= 0 && len(entry.DownstreamNodes) == 0 {
 		// Stop Optimization if we are tearing down (or lingering)
@@ -310,7 +312,7 @@ func (f *FIB) scheduleTeardown(streamID types.StreamID) {
 	}
 
 	entry.State = "lingering"
-	log.Printf("[FIB] Stream %s entered lingering state (waiting %v)...", streamID, LingerDuration)
+	f.logger.Info("Stream entered lingering state", "stream_id", streamID, "duration", LingerDuration)
 
 	entry.TeardownTimer = time.AfterFunc(LingerDuration, func() {
 		f.mu.Lock()
@@ -328,11 +330,11 @@ func (f *FIB) scheduleTeardown(streamID types.StreamID) {
 			// Resurrected during wait!
 			currentEntry.TeardownTimer = nil
 			currentEntry.State = "connected"
-			log.Printf("[FIB] Stream %s resurrected during linger, cancelling teardown", streamID)
+			f.logger.Info("Stream resurrected during linger", "stream_id", streamID)
 			return
 		}
 
-		log.Printf("[FIB] Stream %s linger expired. Executing physical teardown.", streamID)
+		f.logger.Info("Stream linger expired, executing teardown", "stream_id", streamID)
 		f.teardownLocked(streamID)
 	})
 }
@@ -343,7 +345,7 @@ func (f *FIB) cancelTeardown(entry *types.FIBEntry) {
 		entry.TeardownTimer.Stop()
 		entry.TeardownTimer = nil
 		entry.State = "connected"
-		log.Printf("[FIB] Stream %s linger cancelled (reused)", entry.StreamID)
+		f.logger.Info("Stream linger cancelled (reused)", "stream_id", entry.StreamID)
 
 		// Restart Optimization Timer if enabled
 		if f.EnableRouteOptimization {
@@ -386,9 +388,9 @@ func (f *FIB) teardownLocked(streamID types.StreamID) {
 	// Stop Advertise
 	err := f.rib.StopAdvertise(streamID)
 	if err != nil {
-		log.Printf("[FIB] Failed to stop advertise %s: %v", streamID, err)
+		f.logger.Error("Failed to stop advertise", "stream_id", streamID, "error", err)
 	} else {
-		log.Printf("[FIB] Unadvertised stream %s", streamID)
+		f.logger.Info("Unadvertised stream", "stream_id", streamID)
 	}
 }
 
@@ -397,7 +399,7 @@ func (f *FIB) Close() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	log.Println("[FIB] Closing: Cleaning up all streams...")
+	f.logger.Info("Closing: Cleaning up all streams")
 
 	for streamID, entry := range f.entries {
 		// Stop Timer
@@ -410,7 +412,7 @@ func (f *FIB) Close() {
 
 		// Disconnect Pipe
 		if f.DisconnectPipe != nil {
-			log.Printf("[FIB] Disconnecting pipe for %s", streamID)
+			f.logger.Info("Disconnecting pipe", "stream_id", streamID)
 			f.DisconnectPipe(entry.PipeID)
 		}
 
@@ -493,7 +495,7 @@ func (f *FIB) optimizeRoute(streamID types.StreamID) {
 		// If gone, we should have triggered failover already.
 		// But maybe failover is slow or racing.
 		// If we found a new best route, let's switch.
-		log.Printf("[FIB] Optimize: Current upstream %s not found in RIB. Switching to %s.", currentUpstream, bestRoute.OriginNode)
+		f.logger.Info("Optimize: Current upstream not found, switching", "current", currentUpstream, "new", bestRoute.OriginNode)
 		f.switchUpstream(streamID, bestRoute)
 		return
 	}
@@ -508,8 +510,7 @@ func (f *FIB) optimizeRoute(streamID types.StreamID) {
 	// Apply Threshold
 	// Switch if: NewCost < CurrentCost - Threshold
 	if bestRoute.BaseCost < currentRoute.BaseCost-f.OptimizationThreshold {
-		log.Printf("[FIB] Optimize: Found better path via %s (Cost: %d) vs %s (Cost: %d). Switching.",
-			bestRoute.OriginNode, bestRoute.BaseCost, currentUpstream, currentRoute.BaseCost)
+		f.logger.Info("Optimize: Found better path", "new_node", bestRoute.OriginNode, "new_cost", bestRoute.BaseCost, "current_node", currentUpstream, "current_cost", currentRoute.BaseCost)
 		f.switchUpstream(streamID, bestRoute)
 	}
 }
@@ -526,7 +527,7 @@ func (f *FIB) switchUpstream(streamID types.StreamID, newRoute *types.RouteKVVal
 	oldPipeID := entry.PipeID
 	f.mu.Unlock()
 
-	log.Printf("[FIB] Switching upstream for %s: %s -> %s", streamID, oldUpstream, newRoute.OriginNode)
+	f.logger.Info("Switching upstream", "stream_id", streamID, "from", oldUpstream, "to", newRoute.OriginNode)
 
 	// 1. Connect New Pipe
 	var newPipeID string
@@ -534,7 +535,7 @@ func (f *FIB) switchUpstream(streamID types.StreamID, newRoute *types.RouteKVVal
 		var err error
 		newPipeID, err = f.ConnectPipe(streamID, newRoute.OriginNode)
 		if err != nil {
-			log.Printf("[FIB] Switch failed: ConnectPipe error: %v", err)
+			f.logger.Error("Switch failed: ConnectPipe error", "error", err)
 			return
 		}
 	}
@@ -560,7 +561,7 @@ func (f *FIB) switchUpstream(streamID types.StreamID, newRoute *types.RouteKVVal
 	newPathVector := append(newRoute.PathVector, f.localNodeID)
 	err := f.rib.StartAdvertise(streamID, newRoute.BaseCost+10, newPathVector, newRoute.RttToOrigin+20)
 	if err != nil {
-		log.Printf("[FIB] Failed to update advertisement during switch: %v", err)
+		f.logger.Error("Failed to update advertisement during switch", "error", err)
 	}
 
 	// 4. Update Watcher
@@ -572,5 +573,5 @@ func (f *FIB) switchUpstream(streamID types.StreamID, newRoute *types.RouteKVVal
 		f.DisconnectPipe(oldPipeID)
 	}
 
-	log.Printf("[FIB] Switch complete: %s is now via %s", streamID, newRoute.OriginNode)
+	f.logger.Info("Switch complete", "stream_id", streamID, "via", newRoute.OriginNode)
 }

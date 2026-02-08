@@ -3,7 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -30,30 +30,37 @@ var (
 func main() {
 	flag.Parse()
 
+	// Initialize structured logger
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	slog.SetDefault(logger)
+
 	myNode := types.NodeInfo{
 		ID:      types.NodeID(*nodeID),
 		Region:  types.RegionID(*regionID),
 		Cluster: types.ClusterID(*clusterID),
 	}
 
-	log.Printf("Starting Node %s in Region %s, Cluster %s", myNode.ID, myNode.Region, myNode.Cluster)
+	slog.Info("Starting Node", "id", myNode.ID, "region", myNode.Region, "cluster", myNode.Cluster)
 
 	// 1. Connect to NATS
 	nc, err := nats.Connect(*natsURL)
 	if err != nil {
-		log.Fatalf("Failed to connect to NATS: %v", err)
+		slog.Error("Failed to connect to NATS", "error", err)
+		os.Exit(1)
 	}
 	defer nc.Close()
 
 	js, err := jetstream.New(nc)
 	if err != nil {
-		log.Fatalf("Failed to init JetStream: %v", err)
+		slog.Error("Failed to init JetStream", "error", err)
+		os.Exit(1)
 	}
 
 	// 2. Init Components
 	rib, err := routing.NewRIB(js, myNode)
 	if err != nil {
-		log.Fatalf("Failed to init RIB: %v", err)
+		slog.Error("Failed to init RIB", "error", err)
+		os.Exit(1)
 	}
 
 	linkDB := routing.NewLinkDB()
@@ -62,12 +69,12 @@ func main() {
 
 	// Mock Pipe Callbacks
 	fib.ConnectPipe = func(streamID types.StreamID, upstream types.NodeID) (string, error) {
-		log.Printf(">>> [PIPE] Connecting to %s for stream %s...", upstream, streamID)
+		slog.Info("Pipe Connect", "upstream", upstream, "stream_id", streamID)
 		time.Sleep(100 * time.Millisecond) // Simulate delay
 		return fmt.Sprintf("pipe-%s-%s", upstream, streamID), nil
 	}
 	fib.DisconnectPipe = func(pipeID string) error {
-		log.Printf("<<< [PIPE] Disconnecting pipe %s", pipeID)
+		slog.Info("Pipe Disconnect", "pipe_id", pipeID)
 		return nil
 	}
 
@@ -77,10 +84,10 @@ func main() {
 		case "US-B":
 			linkDB.UpdateLink("CN", 200, 0, 100)
 			linkDB.UpdateLink("US-A", 30, 0, 10)
-			log.Println("Configured LinkDB: US-B -> CN (200ms), US-B -> US-A (30ms)")
+			slog.Info("Configured LinkDB: US-B -> CN (200ms), US-B -> US-A (30ms)")
 		case "US-A":
 			linkDB.UpdateLink("CN", 200, 0, 100)
-			log.Println("Configured LinkDB: US-A -> CN (200ms)")
+			slog.Info("Configured LinkDB: US-A -> CN (200ms)")
 		}
 	}
 
@@ -99,7 +106,7 @@ func main() {
 			return
 		}
 		fmt.Fprintf(w, "Advertised %s (Keepalive Started)\n", streamID)
-		log.Printf("Origin Advertised %s", streamID)
+		slog.Info("Origin Advertised", "stream_id", streamID)
 	})
 
 	http.HandleFunc("/unadvertise", func(w http.ResponseWriter, r *http.Request) {
@@ -116,7 +123,7 @@ func main() {
 			return
 		}
 		fmt.Fprintf(w, "Unadvertised %s (Keepalive Stopped)\n", streamID)
-		log.Printf("Origin Unadvertised %s", streamID)
+		slog.Info("Origin Unadvertised", "stream_id", streamID)
 	})
 
 	http.HandleFunc("/subscribe", func(w http.ResponseWriter, r *http.Request) {
@@ -145,14 +152,15 @@ func main() {
 
 		fib.Unsubscribe(types.StreamID(streamID))
 		fmt.Fprintf(w, "Unsubscribed %s\n", streamID)
-		log.Printf("Unsubscribed %s", streamID)
+		slog.Info("Unsubscribed", "stream_id", streamID)
 	})
 
 	go func() {
 		addr := fmt.Sprintf(":%d", *httpPort)
-		log.Printf("HTTP server listening on %s", addr)
+		slog.Info("HTTP server listening", "addr", addr)
 		if err := http.ListenAndServe(addr, nil); err != nil {
-			log.Fatalf("HTTP server failed: %v", err)
+			slog.Error("HTTP server failed", "error", err)
+			os.Exit(1)
 		}
 	}()
 
@@ -160,11 +168,11 @@ func main() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
-	log.Println("Shutting down...")
+	slog.Info("Shutting down...")
 
 	// Graceful Shutdown
 	fib.Close()
 	rib.Close()
 
-	log.Println("Bye!")
+	slog.Info("Bye!")
 }

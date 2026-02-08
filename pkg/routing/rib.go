@@ -5,7 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -43,6 +43,8 @@ type RIB struct {
 	// Channels for keepalive loop
 	signalCh chan struct{} // signal when new item added
 	stopCh   chan struct{} // stop loop
+
+	logger *slog.Logger
 }
 
 func NewRIB(js jetstream.JetStream, local types.NodeInfo) (*RIB, error) {
@@ -68,6 +70,7 @@ func NewRIB(js jetstream.JetStream, local types.NodeInfo) (*RIB, error) {
 		entryMap: make(map[types.StreamID]*ds.Item[*adEntry]),
 		signalCh: make(chan struct{}, 1),
 		stopCh:   make(chan struct{}),
+		logger:   slog.Default().With("component", "RIB"),
 	}
 
 	heap.Init(&r.pq)
@@ -95,7 +98,7 @@ func (r *RIB) SubscribeUpdates(streamID types.StreamID, cb func(types.RouteKVVal
 	// Watch includes deletes (we need to know if upstream is gone)
 	watcher, err := r.kv.Watch(ctx, pattern)
 	if err != nil {
-		log.Printf("[RIB] Failed to watch stream %s: %v", streamID, err)
+		r.logger.Error("Failed to watch stream", "stream_id", streamID, "error", err)
 		cancel()
 		return func() {}
 	}
@@ -146,7 +149,7 @@ func (r *RIB) WatchDownstream(streamID types.StreamID, cb func(downstreamNode ty
 	// This means these watchers run until RIB is closed.
 	watcher, err := r.kv.Watch(r.ctx, pattern)
 	if err != nil {
-		log.Printf("[RIB] Failed to watch downstream for %s: %v", streamID, err)
+		r.logger.Error("Failed to watch downstream", "stream_id", streamID, "error", err)
 		return
 	}
 
@@ -283,7 +286,7 @@ func (r *RIB) keepAliveLoop() {
 			if item, wait := r.pq.PeekAndShift(now); item != nil {
 				go func(val *adEntry) {
 					if err := r.advertiseOnce(val); err != nil {
-						log.Printf("[RIB] Advertise failed for %s: %v", val.StreamID, err)
+						r.logger.Error("Advertise failed", "stream_id", val.StreamID, "error", err)
 					}
 				}(item.Value)
 
@@ -307,9 +310,9 @@ func (r *RIB) Close() {
 	defer r.mu.Unlock()
 
 	for streamID, item := range r.entryMap {
-		log.Printf("[RIB] Closing: Unadvertising stream %s", streamID)
+		r.logger.Info("Closing: Unadvertising stream", "stream_id", streamID)
 		if err := r.Unadvertise(streamID); err != nil {
-			log.Printf("[RIB] Failed to unadvertise %s: %v", streamID, err)
+			r.logger.Error("Failed to unadvertise", "stream_id", streamID, "error", err)
 		}
 		delete(r.entryMap, streamID)
 		heap.Remove(&r.pq, item.Index)
