@@ -77,8 +77,8 @@ func main() {
 		time.Sleep(100 * time.Millisecond) // Simulate delay
 		return fmt.Sprintf("pipe-%s-%s", upstream, streamID), nil
 	}
-	fib.DisconnectPipe = func(pipeID string) error {
-		slog.Info("Pipe Disconnect", "pipe_id", pipeID)
+	fib.DisconnectPipe = func(streamID types.StreamID, pipeID string, upstreamNode types.NodeID) error {
+		slog.Info("Pipe Disconnect", "pipe_id", pipeID, "stream_id", streamID, "upstream_node", upstreamNode)
 		return nil
 	}
 

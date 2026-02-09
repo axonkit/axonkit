@@ -6,6 +6,8 @@ import (
 	"rib-control/pkg/types"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // FIB (Forwarding Information Base) manages local active connections
@@ -13,12 +15,14 @@ type FIB struct {
 	entries map[types.StreamID]*types.FIBEntry
 	mu      sync.RWMutex
 
+	sf singleflight.Group
+
 	rib         *RIB
 	localNodeID types.NodeID
 
 	// Callbacks for Pipe management
 	ConnectPipe    func(streamID types.StreamID, upstream types.NodeID) (string, error)
-	DisconnectPipe func(pipeID string) error
+	DisconnectPipe func(streamID types.StreamID, pipeID string, upstreamNode types.NodeID) error
 
 	// Watcher management
 	// watchers map[types.StreamID]jetstream.KeyWatcher // Old
@@ -50,36 +54,63 @@ func NewFIB(rib *RIB, localNodeID types.NodeID) *FIB {
 // Returns pipeID and upstream node
 func (f *FIB) Subscribe(streamID types.StreamID, findPath func(types.StreamID) (*types.RouteKVValue, error)) (string, types.NodeID, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-
 	entry, exists := f.entries[streamID]
 	if exists {
 		f.cancelTeardown(entry)
 		entry.RefCount++
 		f.logger.Info("Stream ref increased", "stream_id", streamID, "ref_count", entry.RefCount, "existing_pipe", entry.PipeID)
+		f.mu.Unlock()
 		return entry.PipeID, entry.UpstreamNode, nil
 	}
+	f.mu.Unlock()
 
-	// New subscription
-	// 1. Find Path
-	route, err := findPath(streamID)
+	type subResult struct {
+		pipeID string
+		route  *types.RouteKVValue
+	}
+
+	// Singleflight for FindPath + ConnectPipe
+	val, err, _ := f.sf.Do(string(streamID), func() (interface{}, error) {
+		// 1. Find Path
+		route, err := findPath(streamID)
+		if err != nil {
+			return nil, err
+		}
+		if route == nil {
+			return nil, fmt.Errorf("no route found for %s", streamID)
+		}
+
+		f.logger.Info("Found best route", "stream_id", streamID, "via", route.Node, "cost", route.BaseCost)
+
+		// 2. Connect Pipe (Mock)
+		pipeID := fmt.Sprintf("pipe-%d", time.Now().UnixNano())
+		if f.ConnectPipe != nil {
+			var err error
+			pipeID, err = f.ConnectPipe(streamID, route.Node)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return subResult{pipeID: pipeID, route: route}, nil
+	})
+
 	if err != nil {
 		return "", "", err
 	}
-	if route == nil {
-		return "", "", fmt.Errorf("no route found for %s", streamID)
-	}
 
-	f.logger.Info("Found best route", "stream_id", streamID, "via", route.Node, "cost", route.BaseCost)
+	res := val.(subResult)
+	pipeID := res.pipeID
+	route := res.route
 
-	// 2. Connect Pipe (Mock)
-	pipeID := fmt.Sprintf("pipe-%d", time.Now().UnixNano())
-	if f.ConnectPipe != nil {
-		var err error
-		pipeID, err = f.ConnectPipe(streamID, route.Node)
-		if err != nil {
-			return "", "", err
-		}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	// Check again in case created concurrently
+	if entry, exists := f.entries[streamID]; exists {
+		f.cancelTeardown(entry)
+		entry.RefCount++
+		f.logger.Info("Stream ref increased (concurrent)", "stream_id", streamID, "ref_count", entry.RefCount)
+		return entry.PipeID, entry.UpstreamNode, nil
 	}
 
 	// 3. Create Entry
@@ -210,55 +241,65 @@ func (f *FIB) handleFailover(streamID types.StreamID, failedUpstream types.NodeI
 
 	f.logger.Info("Attempting to reroute stream", "stream_id", streamID)
 
-	// 1. Try to find a NEW path
-	newRoute, err := findPath(streamID)
-	if err != nil || newRoute == nil {
-		f.logger.Error("Reroute failed: No alternative path", "stream_id", streamID)
+	type subResult struct {
+		pipeID string
+		route  *types.RouteKVValue
+	}
 
-		// Force stop advertising to prevent downstream from using us
-		f.rib.StopAdvertise(streamID)
-
-		// We should also disconnect the broken pipe
-		if f.DisconnectPipe != nil {
-			f.DisconnectPipe(entry.PipeID)
+	// Use Singleflight for FindPath + ConnectPipe
+	val, err, _ := f.sf.Do(string(streamID), func() (interface{}, error) {
+		// 1. Try to find a NEW path
+		newRoute, err := findPath(streamID)
+		if err != nil || newRoute == nil {
+			return nil, fmt.Errorf("no alternative path")
 		}
 
-		// We keep the entry (RefCount > 0), but state is broken.
-		// Downstream nodes will see our StopAdvertise and trigger their own failover.
-		// Local users will experience timeout/error.
-		// Eventually users will Unsubscribe, reducing RefCount to 0.
+		// 2. Connect new pipe
+		newPipeID := fmt.Sprintf("pipe-%d-reroute", time.Now().UnixNano())
+		if f.ConnectPipe != nil {
+			pid, err := f.ConnectPipe(streamID, newRoute.Node)
+			if err != nil {
+				return nil, err
+			}
+			newPipeID = pid
+		}
+		return subResult{pipeID: newPipeID, route: newRoute}, nil
+	})
 
+	if err != nil {
+		f.logger.Error("Reroute failed", "stream_id", streamID, "error", err)
+
+		// Force stop advertising
+		f.rib.StopAdvertise(streamID)
+
+		// Disconnect broken pipe
+		f.mu.Lock()
+		if ent, ok := f.entries[streamID]; ok && f.DisconnectPipe != nil {
+			f.DisconnectPipe(streamID, ent.PipeID, ent.UpstreamNode)
+		}
+		f.mu.Unlock()
 		return
 	}
 
-	// 2. Found new path? Switch!
-	f.logger.Info("Reroute successful", "from", failedUpstream, "to", newRoute.Node)
+	res := val.(subResult)
+	newRoute := res.route
+	newPipeID := res.pipeID
 
-	// Disconnect old pipe
-	if f.DisconnectPipe != nil {
-		f.DisconnectPipe(entry.PipeID)
-	}
-
-	// Connect new pipe
-	newPipeID := fmt.Sprintf("pipe-%d-reroute", time.Now().UnixNano())
-	if f.ConnectPipe != nil {
-		pid, err := f.ConnectPipe(streamID, newRoute.Node)
-		if err == nil {
-			newPipeID = pid
-		} else {
-			f.logger.Error("Failed to connect to new upstream", "error", err)
-			f.Unsubscribe(streamID)
-			return
-		}
-	}
-
-	// Update FIB Entry
 	f.mu.Lock()
 	// Re-check existence
 	if entry, ok := f.entries[streamID]; ok {
-		entry.UpstreamNode = newRoute.Node
-		entry.PipeID = newPipeID
-		// RefCount remains same
+		// Only update if we haven't already switched to this node
+		if entry.UpstreamNode != newRoute.Node {
+			f.logger.Info("Reroute successful", "from", failedUpstream, "to", newRoute.Node)
+
+			// Disconnect old pipe
+			if f.DisconnectPipe != nil {
+				f.DisconnectPipe(streamID, entry.PipeID, entry.UpstreamNode)
+			}
+
+			entry.UpstreamNode = newRoute.Node
+			entry.PipeID = newPipeID
+		}
 	}
 	f.mu.Unlock()
 
@@ -383,7 +424,7 @@ func (f *FIB) teardownLocked(streamID types.StreamID) {
 
 	// Teardown
 	if f.DisconnectPipe != nil {
-		f.DisconnectPipe(entry.PipeID)
+		f.DisconnectPipe(streamID, entry.PipeID, entry.UpstreamNode)
 	}
 	delete(f.entries, streamID)
 
@@ -415,7 +456,7 @@ func (f *FIB) Close() {
 		// Disconnect Pipe
 		if f.DisconnectPipe != nil {
 			f.logger.Info("Disconnecting pipe", "stream_id", streamID)
-			f.DisconnectPipe(entry.PipeID)
+			f.DisconnectPipe(streamID, entry.PipeID, entry.UpstreamNode)
 		}
 
 		// Stop Watcher
@@ -550,7 +591,7 @@ func (f *FIB) switchUpstream(streamID types.StreamID, newRoute *types.RouteKVVal
 		f.mu.Unlock()
 		// Clean up new pipe
 		if f.DisconnectPipe != nil {
-			f.DisconnectPipe(newPipeID)
+			f.DisconnectPipe(streamID, newPipeID, newRoute.Node)
 		}
 		return
 	}
@@ -572,7 +613,7 @@ func (f *FIB) switchUpstream(streamID types.StreamID, newRoute *types.RouteKVVal
 
 	// 5. Disconnect Old Pipe
 	if f.DisconnectPipe != nil {
-		f.DisconnectPipe(oldPipeID)
+		f.DisconnectPipe(streamID, oldPipeID, oldUpstream)
 	}
 
 	f.logger.Info("Switch complete", "stream_id", streamID, "via", newRoute.Node)
