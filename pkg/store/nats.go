@@ -88,10 +88,8 @@ func (n *natsEntry) Operation() Operation {
 	switch n.e.Operation() {
 	case jetstream.KeyValuePut:
 		return OpPut
-	case jetstream.KeyValueDelete:
+	case jetstream.KeyValueDelete, jetstream.KeyValuePurge:
 		return OpDelete
-	case jetstream.KeyValuePurge:
-		return OpPurge
 	default:
 		return OpPut
 	}

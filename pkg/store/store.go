@@ -7,7 +7,6 @@ type Operation int
 const (
 	OpPut Operation = iota
 	OpDelete
-	OpPurge
 )
 
 type Entry interface {

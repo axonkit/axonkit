@@ -139,7 +139,7 @@ func (r *RIB) getOrStartWatcher(streamID types.StreamID) (*streamWatcher, error)
 }
 
 func (r *RIB) dispatchUpdate(sw *streamWatcher, entry store.Entry) {
-	isDelete := entry.Operation() == store.OpDelete || entry.Operation() == store.OpPurge
+	isDelete := entry.Operation() == store.OpDelete
 	key := entry.Key()
 
 	var val types.RouteKVValue
