@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"log/slog"
-	"math/rand"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -28,8 +28,8 @@ type Manager struct {
 	routers  []*mediasoup.Router
 	workerMu sync.RWMutex
 
-	// Pipe Reuse: map[LocalRouterID]map[RemoteNodeID]*mediasoup.Transport
-	pipeTransports map[string]map[types.NodeID]*mediasoup.Transport
+	// Pipe Reuse: map[LocalRouterID]map[RemoteRouterID]*mediasoup.Transport
+	pipeTransports map[string]map[string]*mediasoup.Transport
 	pipeMu         sync.RWMutex
 
 	// Local Producers: StreamID -> {RouterIndex, Producer}
@@ -84,7 +84,7 @@ func NewManager(nodeID types.NodeID, nc *nats.Conn, workerBin string) *Manager {
 		nc:               nc,
 		workerBin:        workerBin,
 		logger:           slog.Default().With("component", "MediaManager"),
-		pipeTransports:   make(map[string]map[types.NodeID]*mediasoup.Transport),
+		pipeTransports:   make(map[string]map[string]*mediasoup.Transport),
 		producers:        make(map[types.StreamID]*LocalProducer),
 		clients:          make(map[string]*ClientContext),
 		servingConsumers: make(map[string]*mediasoup.Consumer),
@@ -310,12 +310,22 @@ func (m *Manager) ConnectPipe(streamID types.StreamID, upstreamNode types.NodeID
 			return lp.Id(), nil
 		}
 
-		// 2. Remote Logic: Pipe from Remote -> Router 0 (Ingress Gateway)
-		clientRouter := m.routers[0]
-		localRouter := clientRouter
+		// 1. Locate Stream on Remote
+		locateResp, err := m.request(upstreamNode, PipeRequest{
+			Command:  "Locate",
+			StreamID: streamID,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("locate stream failed: %v", err)
+		}
+		remoteRouterId := locateResp.OriginRouterId
 
-		// 3. Get/Create Local Pipe (Not connected yet if new)
-		pipe, isNew, err := m.getOrCreateLocalPipe(localRouter, upstreamNode)
+		// 2. Load Balance Local Router
+		idx := int(crc32.ChecksumIEEE([]byte(streamID))) % len(m.routers)
+		localRouter := m.routers[idx]
+
+		// 3. Get/Create Pipe (Reuse if possible)
+		pipe, isNew, err := m.getOrCreateLocalPipe(localRouter, remoteRouterId, upstreamNode)
 		if err != nil {
 			return nil, err
 		}
@@ -323,10 +333,16 @@ func (m *Manager) ConnectPipe(streamID types.StreamID, upstreamNode types.NodeID
 		// Extract Info from Pipe
 		dump, err := pipe.Dump()
 		if err != nil {
+			if isNew {
+				pipe.Close()
+			}
 			return nil, err
 		}
 		// Assuming it's a PipeTransport, PipeTransportDump should be present
 		if dump.PipeTransportDump == nil {
+			if isNew {
+				pipe.Close()
+			}
 			return nil, fmt.Errorf("transport dump missing PipeTransport data")
 		}
 		tuple := dump.PipeTransportDump.Tuple
@@ -348,10 +364,13 @@ func (m *Manager) ConnectPipe(streamID types.StreamID, upstreamNode types.NodeID
 		// 5. Signaling
 		resp, err := m.request(upstreamNode, req)
 		if err != nil {
+			if isNew {
+				pipe.Close()
+			}
 			return nil, err
 		}
 
-		// 6. Connect if new (and remote sent info)
+		// 6. Connect (Only if New)
 		if isNew {
 			err = pipe.Connect(&mediasoup.TransportConnectOptions{
 				Ip:             resp.PipeInfo.Ip,
@@ -359,6 +378,7 @@ func (m *Manager) ConnectPipe(streamID types.StreamID, upstreamNode types.NodeID
 				SrtpParameters: resp.PipeInfo.SrtpParameters,
 			})
 			if err != nil {
+				pipe.Close()
 				return nil, fmt.Errorf("pipe connect failed: %v", err)
 			}
 			m.logger.Info("Pipe Connected", "upstream", upstreamNode)
@@ -378,7 +398,7 @@ func (m *Manager) ConnectPipe(streamID types.StreamID, upstreamNode types.NodeID
 		m.producersMu.Lock()
 		m.producers[streamID] = &LocalProducer{
 			StreamID:     streamID,
-			RouterIdx:    0,
+			RouterIdx:    idx,
 			Producer:     pipeProducer,
 			RouterId:     localRouter.Id(),
 			UpstreamNode: upstreamNode,
@@ -395,15 +415,19 @@ func (m *Manager) ConnectPipe(streamID types.StreamID, upstreamNode types.NodeID
 	return val.(string), nil
 }
 
-func (m *Manager) getOrCreateLocalPipe(localRouter *mediasoup.Router, remoteNode types.NodeID) (*mediasoup.Transport, bool, error) {
+func (m *Manager) getOrCreateLocalPipe(localRouter *mediasoup.Router, remoteRouterId string, remoteNode types.NodeID) (*mediasoup.Transport, bool, error) {
+	if remoteRouterId == "" {
+		return nil, false, fmt.Errorf("remoteRouterId is required")
+	}
+
 	m.pipeMu.Lock()
 	defer m.pipeMu.Unlock()
 
 	if _, ok := m.pipeTransports[localRouter.Id()]; !ok {
-		m.pipeTransports[localRouter.Id()] = make(map[types.NodeID]*mediasoup.Transport)
+		m.pipeTransports[localRouter.Id()] = make(map[string]*mediasoup.Transport)
 	}
 
-	if pipe, ok := m.pipeTransports[localRouter.Id()][remoteNode]; ok {
+	if pipe, ok := m.pipeTransports[localRouter.Id()][remoteRouterId]; ok {
 		return pipe, false, nil
 	}
 
@@ -414,20 +438,23 @@ func (m *Manager) getOrCreateLocalPipe(localRouter *mediasoup.Router, remoteNode
 			Protocol: mediasoup.TransportProtocolUDP,
 		},
 		EnableSrtp: true,
+		AppData: map[string]interface{}{
+			"remoteNode": remoteNode,
+		},
 	})
 	if err != nil {
 		return nil, false, err
 	}
 
-	m.pipeTransports[localRouter.Id()][remoteNode] = pipe
+	m.pipeTransports[localRouter.Id()][remoteRouterId] = pipe
 
 	// Cleanup on close
 	pipe.OnClose(func(ctx context.Context) {
 		m.pipeMu.Lock()
 		defer m.pipeMu.Unlock()
 		if pipes, ok := m.pipeTransports[localRouter.Id()]; ok {
-			delete(pipes, remoteNode)
-			m.logger.Info("Pipe transport closed and removed", "router_id", localRouter.Id(), "remote_node", remoteNode)
+			delete(pipes, remoteRouterId)
+			m.logger.Info("Pipe transport closed and removed", "router_id", localRouter.Id(), "remote_router", remoteRouterId)
 		}
 	})
 
@@ -440,10 +467,12 @@ func (m *Manager) CleanUpNode(remoteNode types.NodeID) {
 	var pipesToClose []*mediasoup.Transport
 
 	for _, pipes := range m.pipeTransports {
-		if pipe, ok := pipes[remoteNode]; ok {
-			pipesToClose = append(pipesToClose, pipe)
-			// Remove immediately to avoid race and handle OnClose logic gracefully
-			delete(pipes, remoteNode)
+		for remoteRouterId, pipe := range pipes {
+			// Check AppData for remoteNode
+			if node, ok := pipe.AppData()["remoteNode"].(types.NodeID); ok && node == remoteNode {
+				pipesToClose = append(pipesToClose, pipe)
+				delete(pipes, remoteRouterId)
+			}
 		}
 	}
 	m.pipeMu.Unlock()
@@ -475,6 +504,17 @@ func (m *Manager) handleSignaling(msg *nats.Msg) {
 	resp := PipeResponse{}
 
 	switch req.Command {
+	case "Locate":
+		m.producersMu.RLock()
+		lp, ok := m.producers[req.StreamID]
+		m.producersMu.RUnlock()
+
+		if !ok {
+			resp.Error = "Stream not found"
+			break
+		}
+		resp.OriginRouterId = m.routers[lp.RouterIdx].Id()
+
 	case "EstablishPipe":
 		// 1. Find Stream
 		m.producersMu.RLock()
@@ -489,7 +529,7 @@ func (m *Manager) handleSignaling(msg *nats.Msg) {
 		router := m.routers[lp.RouterIdx]
 
 		// 2. Get/Create Pipe to Requester
-		pipe, isNew, err := m.getOrCreateLocalPipe(router, req.RequesterNode)
+		pipe, isNew, err := m.getOrCreateLocalPipe(router, req.RequesterRouterId, req.RequesterNode)
 		if err != nil {
 			resp.Error = err.Error()
 			break
@@ -503,6 +543,7 @@ func (m *Manager) handleSignaling(msg *nats.Msg) {
 				SrtpParameters: req.PipeInfo.SrtpParameters,
 			})
 			if err != nil {
+				pipe.Close()
 				resp.Error = "Connect failed: " + err.Error()
 				break
 			}
@@ -594,8 +635,8 @@ func (m *Manager) Consume(clientID string, streamID types.StreamID) (*mediasoup.
 
 	// Reuse or Create Transport
 	if clientCtx.Transport == nil {
-		// Select Random Router
-		idx := rand.Intn(len(m.routers))
+		// Select Router based on ClientID for Affinity
+		idx := int(crc32.ChecksumIEEE([]byte(clientID))) % len(m.routers)
 		clientRouter = m.routers[idx]
 		clientCtx.Router = clientRouter
 
