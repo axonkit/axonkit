@@ -386,9 +386,11 @@ func (m *Manager) ConnectPipe(streamID types.StreamID, upstreamNode types.NodeID
 
 		// 7. Produce (Receive from remote)
 		pipeProducer, err := pipe.Produce(&mediasoup.ProducerOptions{
-			Id:            resp.PipeProducerId,
-			Kind:          mediasoup.MediaKindVideo,
-			RtpParameters: &resp.RtpParameters, // resp.RtpParameters is struct, need pointer
+			Id:            resp.ProducerInfo.Id,
+			Kind:          resp.ProducerInfo.Kind,
+			RtpParameters: resp.ProducerInfo.RtpParameters,
+			Paused:        resp.ProducerInfo.Paused,
+			AppData:       resp.ProducerInfo.AppData,
 		})
 		if err != nil {
 			m.logger.Error("Pipe Produce failed", "error", err)
@@ -578,8 +580,13 @@ func (m *Manager) handleSignaling(msg *nats.Msg) {
 		}
 		tuple := dump.PipeTransportDump.Tuple
 
-		resp.PipeProducerId = consumer.Id()
-		resp.RtpParameters = *consumer.RtpParameters()
+		resp.ProducerInfo = ProducerInfo{
+			Id:            lp.Producer.Id(),
+			Kind:          consumer.Kind(),
+			RtpParameters: consumer.RtpParameters(),
+			Paused:        consumer.ProducerPaused(),
+			AppData:       lp.Producer.AppData(),
+		}
 
 		// Fill Response
 		resp.PipeInfo = PipeInfo{
@@ -597,7 +604,7 @@ func (m *Manager) handleSignaling(msg *nats.Msg) {
 			consumer.Close()
 			m.logger.Info("Closed serving pipe consumer", "consumer_id", req.PipeConsumerId)
 		} else {
-			m.logger.Warn("ClosePipe: consumer not found", "consumer_id", req.PipeConsumerId)
+			m.logger.Warn("ClosePipe: consumer not found (already closed?)", "consumer_id", req.PipeConsumerId)
 		}
 	}
 
@@ -680,21 +687,8 @@ func (m *Manager) Consume(clientID string, streamID types.StreamID) (*mediasoup.
 
 	// Consume
 	consumer, err := clientCtx.Transport.Consume(&mediasoup.ConsumerOptions{
-		ProducerId: producerIDToConsume,
-		RtpCapabilities: &mediasoup.RtpCapabilities{
-			Codecs: []*mediasoup.RtpCodecCapability{
-				{
-					Kind:      mediasoup.MediaKindVideo,
-					MimeType:  "video/VP8",
-					ClockRate: 90000,
-				},
-				{
-					Kind:      mediasoup.MediaKindVideo,
-					MimeType:  "video/H264",
-					ClockRate: 90000,
-				},
-			},
-		},
+		ProducerId:      producerIDToConsume,
+		RtpCapabilities: consumerDeviceCapabilities,
 	})
 
 	if err != nil {

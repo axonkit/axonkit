@@ -22,9 +22,16 @@ type PipeRequest struct {
 }
 
 type PipeResponse struct {
-	PipeInfo       PipeInfo                `json:"pipeInfo,omitempty"`
-	OriginRouterId string                  `json:"originRouterId,omitempty"`
-	PipeProducerId string                  `json:"pipeProducerId,omitempty"` // For Consume
-	RtpParameters  mediasoup.RtpParameters `json:"rtpParameters,omitempty"`
-	Error          string                  `json:"error,omitempty"`
+	PipeInfo       PipeInfo     `json:"pipeInfo,omitempty"`
+	OriginRouterId string       `json:"originRouterId,omitempty"`
+	ProducerInfo   ProducerInfo `json:"producerInfo,omitempty"`
+	Error          string       `json:"error,omitempty"`
+}
+
+type ProducerInfo struct {
+	Id            string                   `json:"id,omitempty"`
+	Kind          mediasoup.MediaKind      `json:"kind,omitempty"`
+	RtpParameters *mediasoup.RtpParameters `json:"rtpParameters,omitempty"`
+	Paused        bool                     `json:"paused,omitempty"`
+	AppData       map[string]any           `json:"appData,omitempty"`
 }
