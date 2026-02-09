@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"rib-control/pkg/types"
@@ -23,8 +24,9 @@ type Manager struct {
 	workerBin string
 	logger    *slog.Logger
 
-	workers []*mediasoup.Worker
-	routers []*mediasoup.Router
+	workers  []*mediasoup.Worker
+	routers  []*mediasoup.Router
+	workerMu sync.RWMutex
 
 	// Pipe Reuse: map[LocalRouterID]map[RemoteNodeID]*mediasoup.Transport
 	pipeTransports map[string]map[types.NodeID]*mediasoup.Transport
@@ -44,6 +46,9 @@ type Manager struct {
 	// Serving Remote Consumers (Pipe): ConsumerID -> Consumer
 	servingConsumers map[string]*mediasoup.Consumer
 	servingMu        sync.Mutex
+
+	closed    atomic.Bool
+	cleanupWg sync.WaitGroup
 }
 
 type ClientContext struct {
@@ -60,6 +65,7 @@ type LocalProducer struct {
 	Producer     *mediasoup.Producer
 	PipeConsumer *mediasoup.Consumer
 	RouterId     string
+	UpstreamNode types.NodeID
 }
 
 func (lp *LocalProducer) Id() string {
@@ -89,44 +95,13 @@ func (m *Manager) Start() error {
 	numWorkers := runtime.NumCPU()
 	m.logger.Info("Starting mediasoup workers", "count", numWorkers, "bin", m.workerBin)
 
-	for i := 0; i < numWorkers; i++ {
-		worker, err := mediasoup.NewWorker(m.workerBin, func(o *mediasoup.WorkerSettings) {
-			o.LogLevel = mediasoup.WorkerLogLevelWarn
-		})
-		if err != nil {
-			return err
-		}
-		m.workers = append(m.workers, worker)
+	m.workers = make([]*mediasoup.Worker, numWorkers)
+	m.routers = make([]*mediasoup.Router, numWorkers)
 
-		router, err := worker.CreateRouter(&mediasoup.RouterOptions{
-			MediaCodecs: []*mediasoup.RtpCodecCapability{
-				{
-					Kind:      mediasoup.MediaKindAudio,
-					MimeType:  "audio/opus",
-					ClockRate: 48000,
-					Channels:  2,
-				},
-				{
-					Kind:      mediasoup.MediaKindVideo,
-					MimeType:  "video/VP8",
-					ClockRate: 90000,
-				},
-				{
-					Kind:      "video",
-					MimeType:  "video/H264",
-					ClockRate: 90000,
-					Parameters: mediasoup.RtpCodecSpecificParameters{
-						LevelAsymmetryAllowed: 1,
-						PacketizationMode:     1,
-						ProfileLevelId:        "4d0032",
-					},
-				},
-			},
-		})
-		if err != nil {
+	for i := 0; i < numWorkers; i++ {
+		if err := m.launchWorker(i); err != nil {
 			return err
 		}
-		m.routers = append(m.routers, router)
 	}
 
 	// Start NATS Subscription for Signaling
@@ -136,6 +111,97 @@ func (m *Manager) Start() error {
 	}
 
 	return nil
+}
+
+func (m *Manager) Close() {
+	if m.closed.Swap(true) {
+		return
+	}
+	m.logger.Info("Closing Media Manager...")
+
+	m.workerMu.Lock()
+	defer m.workerMu.Unlock()
+
+	for _, worker := range m.workers {
+		if worker != nil {
+			worker.Close()
+		}
+	}
+	m.logger.Info("Waiting for cleanup requests...")
+	m.cleanupWg.Wait()
+}
+
+func (m *Manager) launchWorker(index int) error {
+	m.logger.Info("Launching worker", "index", index)
+	worker, err := mediasoup.NewWorker(m.workerBin, func(o *mediasoup.WorkerSettings) {
+		o.LogLevel = mediasoup.WorkerLogLevelWarn
+	})
+	if err != nil {
+		return err
+	}
+
+	router, err := worker.CreateRouter(&mediasoup.RouterOptions{
+		MediaCodecs: []*mediasoup.RtpCodecCapability{
+			{
+				Kind:      mediasoup.MediaKindAudio,
+				MimeType:  "audio/opus",
+				ClockRate: 48000,
+				Channels:  2,
+			},
+			{
+				Kind:      mediasoup.MediaKindVideo,
+				MimeType:  "video/VP8",
+				ClockRate: 90000,
+			},
+			{
+				Kind:      mediasoup.MediaKindVideo,
+				MimeType:  "video/H264",
+				ClockRate: 90000,
+				Parameters: mediasoup.RtpCodecSpecificParameters{
+					LevelAsymmetryAllowed: 1,
+					PacketizationMode:     1,
+					ProfileLevelId:        "4d0032",
+				},
+			},
+		},
+	})
+	if err != nil {
+		worker.Close()
+		return err
+	}
+
+	m.workerMu.Lock()
+	m.workers[index] = worker
+	m.routers[index] = router
+	m.workerMu.Unlock()
+
+	m.logger.Info("Worker started", "index", index, "pid", worker.Pid())
+
+	// Wait for death
+	worker.OnClose(func(context.Context) {
+		if m.closed.Load() {
+			return
+		}
+		m.logger.Error("Worker died, cleaning up and restarting...", "index", index, "pid", worker.Pid())
+		m.cleanupWorkerResources(router)
+		go m.restartWorker(index)
+	})
+
+	return nil
+}
+
+func (m *Manager) restartWorker(index int) {
+	for {
+		if m.closed.Load() {
+			return
+		}
+		time.Sleep(1 * time.Second)
+		if err := m.launchWorker(index); err == nil {
+			m.logger.Info("Worker restarted", "index", index)
+			return
+		}
+		m.logger.Error("Restart failed, retrying...", "index", index)
+	}
 }
 
 // Publish simulates a client publishing a stream
@@ -205,10 +271,11 @@ func (m *Manager) Publish(streamID types.StreamID) error {
 
 	m.producersMu.Lock()
 	m.producers[streamID] = &LocalProducer{
-		StreamID:  streamID,
-		RouterIdx: idx,
-		Producer:  producer,
-		RouterId:  router.Id(),
+		StreamID:     streamID,
+		RouterIdx:    idx,
+		Producer:     producer,
+		RouterId:     router.Id(),
+		UpstreamNode: m.nodeID,
 	}
 	m.producersMu.Unlock()
 
@@ -310,10 +377,11 @@ func (m *Manager) ConnectPipe(streamID types.StreamID, upstreamNode types.NodeID
 
 		m.producersMu.Lock()
 		m.producers[streamID] = &LocalProducer{
-			StreamID:  streamID,
-			RouterIdx: 0,
-			Producer:  pipeProducer,
-			RouterId:  localRouter.Id(),
+			StreamID:     streamID,
+			RouterIdx:    0,
+			Producer:     pipeProducer,
+			RouterId:     localRouter.Id(),
+			UpstreamNode: upstreamNode,
 		}
 		m.producersMu.Unlock()
 
@@ -369,15 +437,21 @@ func (m *Manager) getOrCreateLocalPipe(localRouter *mediasoup.Router, remoteNode
 // CleanUpNode closes all pipe transports to a specific remote node
 func (m *Manager) CleanUpNode(remoteNode types.NodeID) {
 	m.pipeMu.Lock()
-	defer m.pipeMu.Unlock()
+	var pipesToClose []*mediasoup.Transport
 
-	for routerID, pipes := range m.pipeTransports {
+	for _, pipes := range m.pipeTransports {
 		if pipe, ok := pipes[remoteNode]; ok {
-			// Closing the pipe will trigger the OnClose handler above,
-			// which removes it from the map.
-			pipe.Close()
-			m.logger.Info("Force closed pipe to remote node", "remote_node", remoteNode, "router_id", routerID)
+			pipesToClose = append(pipesToClose, pipe)
+			// Remove immediately to avoid race and handle OnClose logic gracefully
+			delete(pipes, remoteNode)
 		}
+	}
+	m.pipeMu.Unlock()
+
+	// Close outside lock to avoid deadlock with OnClose handler
+	for _, pipe := range pipesToClose {
+		pipe.Close()
+		m.logger.Info("Force closed pipe to remote node", "remote_node", remoteNode, "pipe_id", pipe.Id())
 	}
 }
 
@@ -666,4 +740,51 @@ func (m *Manager) Unsubscribe(clientID string, streamID types.StreamID) error {
 		m.logger.Info("Unsubscribed stream", "client_id", clientID, "stream_id", streamID)
 	}
 	return nil
+}
+
+func (m *Manager) cleanupWorkerResources(deadRouter *mediasoup.Router) {
+	deadRouterID := deadRouter.Id()
+	m.logger.Info("Cleaning up worker resources", "router_id", deadRouterID)
+
+	// 1. Clean Producers
+	m.producersMu.Lock()
+	for streamID, lp := range m.producers {
+		if lp.RouterId == deadRouterID {
+			// Notify Remote if it's a Pipe
+			if lp.UpstreamNode != "" && lp.UpstreamNode != m.nodeID {
+				req := PipeRequest{
+					Command:        "ClosePipe",
+					StreamID:       streamID,
+					RequesterNode:  m.nodeID,
+					PipeConsumerId: lp.Id(),
+				}
+				m.cleanupWg.Add(1)
+				go func(node types.NodeID, r PipeRequest) {
+					defer m.cleanupWg.Done()
+					m.request(node, r)
+				}(lp.UpstreamNode, req)
+			}
+
+			delete(m.producers, streamID)
+			m.logger.Info("Cleaned up producer", "stream_id", streamID)
+		}
+	}
+	m.producersMu.Unlock()
+
+	// 2. Clean Pipe Transports
+	m.pipeMu.Lock()
+	delete(m.pipeTransports, deadRouterID)
+	m.pipeMu.Unlock()
+
+	// 3. Clean Clients
+	m.clientsMu.Lock()
+	for clientID, ctx := range m.clients {
+		if ctx.Router.Id() == deadRouterID {
+			delete(m.clients, clientID)
+			m.logger.Info("Cleaned up client", "client_id", clientID)
+		}
+	}
+	m.clientsMu.Unlock()
+
+	// 4. Serving Consumers: Cleaned up by their own OnClose handlers
 }
