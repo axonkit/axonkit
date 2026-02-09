@@ -403,17 +403,17 @@ func (r *RIB) Unadvertise(streamID types.StreamID) error {
 func (r *RIB) GetCandidates(streamID types.StreamID) ([]types.RouteKVValue, error) {
 	pattern := fmt.Sprintf("route.%s.>", streamID)
 
-	watcher, err := r.kv.Watch(r.ctx, pattern, store.IgnoreDeletes())
+	keys, err := r.kv.Keys(r.ctx, pattern)
 	if err != nil {
 		return nil, err
 	}
-	defer watcher.Stop()
 
 	var candidates []types.RouteKVValue
 
-	for entry := range watcher.Updates() {
-		if entry == nil {
-			break
+	for _, key := range keys {
+		entry, err := r.kv.Get(r.ctx, key)
+		if err != nil {
+			continue
 		}
 
 		var val types.RouteKVValue

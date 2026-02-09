@@ -46,5 +46,6 @@ type Store interface {
 	Get(ctx context.Context, key string) (Entry, error)
 	Delete(ctx context.Context, key string) error
 	Watch(ctx context.Context, pattern string, opts ...WatchOption) (Watcher, error)
+	Keys(ctx context.Context, pattern string) ([]string, error)
 	Close() error
 }

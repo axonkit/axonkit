@@ -73,6 +73,20 @@ func (s *NatsStore) Watch(ctx context.Context, pattern string, opts ...WatchOpti
 	return nw, nil
 }
 
+func (s *NatsStore) Keys(ctx context.Context, pattern string) ([]string, error) {
+	lister, err := s.kv.ListKeysFiltered(ctx, pattern)
+	if err != nil {
+		return nil, err
+	}
+	defer lister.Stop()
+
+	var matched []string
+	for k := range lister.Keys() {
+		matched = append(matched, k)
+	}
+	return matched, nil
+}
+
 func (s *NatsStore) Close() error {
 	return nil
 }

@@ -113,6 +113,19 @@ func (s *MemoryStore) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+func (s *MemoryStore) Keys(ctx context.Context, pattern string) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var matched []string
+	for k := range s.data {
+		if matchSubject(pattern, k) {
+			matched = append(matched, k)
+		}
+	}
+	return matched, nil
+}
+
 func (s *MemoryStore) Watch(ctx context.Context, pattern string, opts ...WatchOption) (Watcher, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
