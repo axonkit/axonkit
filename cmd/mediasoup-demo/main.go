@@ -68,13 +68,28 @@ func main() {
 
 	linkDB := routing.NewLinkDB()
 	// Populate linkDB with some defaults for demo
-	linkDB.UpdateLink("default-region", 10, 0, 100)
+	switch *regionID {
+	case "US-B":
+		linkDB.UpdateLink("CN", 200, 0, 100)
+		linkDB.UpdateLink("US-A", 30, 0, 10)
+		slog.Info("Configured LinkDB: US-B -> CN (200ms), US-B -> US-A (30ms)")
+	case "US-A":
+		linkDB.UpdateLink("CN", 200, 0, 100)
+		slog.Info("Configured LinkDB: US-A -> CN (200ms)")
+	}
 
 	finder := discovery.NewFinder(rib, linkDB, myNode.ID)
 	fib := routing.NewFIB(rib, myNode.ID)
 
 	// 3. Init Media Manager
 	mediaMgr := media.NewManager(myNode.ID, nc, *workerBin)
+	mediaMgr.OnStreamClosed = func(streamID types.StreamID) {
+		if err := rib.StopAdvertise(streamID); err != nil {
+			slog.Error("Failed to stop advertise closed stream", "stream_id", streamID, "error", err)
+		} else {
+			slog.Info("Stop advertise closed stream", "stream_id", streamID)
+		}
+	}
 	if err := mediaMgr.Start(); err != nil {
 		slog.Error("Failed to start MediaManager", "error", err)
 		os.Exit(1)
@@ -209,6 +224,7 @@ func main() {
 	fib.Close()
 	rib.Close()
 	registry.Close()
+	mediaMgr.Close()
 
 	slog.Info("Bye!")
 }

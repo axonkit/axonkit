@@ -57,7 +57,7 @@ func TestFIBOptimization(t *testing.T) {
 		pipeHistory <- msg
 		return fmt.Sprintf("pipe-%s", upstream), nil
 	}
-	fib.DisconnectPipe = func(pipeID string) error {
+	fib.DisconnectPipe = func(streamID types.StreamID, pipeID string, upstreamNode types.NodeID) error {
 		return nil
 	}
 
@@ -226,7 +226,7 @@ func TestConcurrentOptimization(t *testing.T) {
 		currentUpstreams.Store(streamID, upstream)
 		return fmt.Sprintf("pipe-%s", upstream), nil
 	}
-	fib.DisconnectPipe = func(pipeID string) error {
+	fib.DisconnectPipe = func(streamID types.StreamID, pipeID string, upstreamNode types.NodeID) error {
 		return nil
 	}
 

@@ -3,6 +3,7 @@ package media
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"log/slog"
@@ -43,12 +44,19 @@ type Manager struct {
 	// Singleflight
 	sf singleflight.Group
 
-	// Serving Remote Consumers (Pipe): ConsumerID -> Consumer
-	servingConsumers map[string]*mediasoup.Consumer
+	// Serving Remote Consumers (Pipe): ConsumerID -> Info
+	servingConsumers map[string]*ServingConsumerInfo
 	servingMu        sync.Mutex
 
-	closed    atomic.Bool
-	cleanupWg sync.WaitGroup
+	closed atomic.Bool
+
+	OnStreamClosed func(streamID types.StreamID)
+}
+
+type ServingConsumerInfo struct {
+	Consumer   *mediasoup.Consumer
+	RemoteNode types.NodeID
+	StreamID   types.StreamID
 }
 
 type ClientContext struct {
@@ -60,22 +68,16 @@ type ClientContext struct {
 }
 
 type LocalProducer struct {
-	StreamID     types.StreamID
-	RouterIdx    int
-	Producer     *mediasoup.Producer
-	PipeConsumer *mediasoup.Consumer
-	RouterId     string
-	UpstreamNode types.NodeID
+	StreamID           types.StreamID
+	RouterIdx          int
+	Producer           *mediasoup.Producer
+	RouterId           string
+	UpstreamNode       types.NodeID
+	UpstreamConsumerId string
 }
 
 func (lp *LocalProducer) Id() string {
-	if lp.Producer != nil {
-		return lp.Producer.Id()
-	}
-	if lp.PipeConsumer != nil {
-		return lp.PipeConsumer.Id()
-	}
-	return ""
+	return lp.Producer.Id()
 }
 
 func NewManager(nodeID types.NodeID, nc *nats.Conn, workerBin string) *Manager {
@@ -87,7 +89,7 @@ func NewManager(nodeID types.NodeID, nc *nats.Conn, workerBin string) *Manager {
 		pipeTransports:   make(map[string]map[string]*mediasoup.Transport),
 		producers:        make(map[types.StreamID]*LocalProducer),
 		clients:          make(map[string]*ClientContext),
-		servingConsumers: make(map[string]*mediasoup.Consumer),
+		servingConsumers: make(map[string]*ServingConsumerInfo),
 	}
 }
 
@@ -119,6 +121,15 @@ func (m *Manager) Close() {
 	}
 	m.logger.Info("Closing Media Manager...")
 
+	// 1. Cleanup all streams (Unadvertise)
+	m.producersMu.Lock()
+	for streamID := range m.producers {
+		if m.OnStreamClosed != nil {
+			m.OnStreamClosed(streamID)
+		}
+	}
+	m.producersMu.Unlock()
+
 	m.workerMu.Lock()
 	defer m.workerMu.Unlock()
 
@@ -127,8 +138,6 @@ func (m *Manager) Close() {
 			worker.Close()
 		}
 	}
-	m.logger.Info("Waiting for cleanup requests...")
-	m.cleanupWg.Wait()
 }
 
 func (m *Manager) launchWorker(index int) error {
@@ -399,16 +408,17 @@ func (m *Manager) ConnectPipe(streamID types.StreamID, upstreamNode types.NodeID
 
 		m.producersMu.Lock()
 		m.producers[streamID] = &LocalProducer{
-			StreamID:     streamID,
-			RouterIdx:    idx,
-			Producer:     pipeProducer,
-			RouterId:     localRouter.Id(),
-			UpstreamNode: upstreamNode,
+			StreamID:           streamID,
+			RouterIdx:          idx,
+			Producer:           pipeProducer,
+			RouterId:           localRouter.Id(),
+			UpstreamNode:       upstreamNode,
+			UpstreamConsumerId: resp.PipeConsumerId,
 		}
 		m.producersMu.Unlock()
 
 		m.logger.Info("Pipe Stream Ready", "stream_id", streamID, "pipe_producer_id", pipeProducer.Id())
-		return pipeProducer.Id(), nil
+		return resp.PipeConsumerId, nil
 	})
 
 	if err != nil {
@@ -450,40 +460,35 @@ func (m *Manager) getOrCreateLocalPipe(localRouter *mediasoup.Router, remoteRout
 
 	m.pipeTransports[localRouter.Id()][remoteRouterId] = pipe
 
-	// Cleanup on close
-	pipe.OnClose(func(ctx context.Context) {
-		m.pipeMu.Lock()
-		defer m.pipeMu.Unlock()
-		if pipes, ok := m.pipeTransports[localRouter.Id()]; ok {
-			delete(pipes, remoteRouterId)
-			m.logger.Info("Pipe transport closed and removed", "router_id", localRouter.Id(), "remote_router", remoteRouterId)
-		}
-	})
-
 	return pipe, true, nil
 }
 
 // CleanUpNode closes all pipe transports to a specific remote node
 func (m *Manager) CleanUpNode(remoteNode types.NodeID) {
+	// 2. Clean Pipe Transports
 	m.pipeMu.Lock()
-	var pipesToClose []*mediasoup.Transport
-
 	for _, pipes := range m.pipeTransports {
 		for remoteRouterId, pipe := range pipes {
 			// Check AppData for remoteNode
 			if node, ok := pipe.AppData()["remoteNode"].(types.NodeID); ok && node == remoteNode {
-				pipesToClose = append(pipesToClose, pipe)
 				delete(pipes, remoteRouterId)
+				pipe.Close()
+				m.logger.Info("Force closed pipe to remote node", "remote_node", remoteNode, "pipe_id", pipe.Id())
 			}
 		}
 	}
 	m.pipeMu.Unlock()
 
-	// Close outside lock to avoid deadlock with OnClose handler
-	for _, pipe := range pipesToClose {
-		pipe.Close()
-		m.logger.Info("Force closed pipe to remote node", "remote_node", remoteNode, "pipe_id", pipe.Id())
+	// 3. Clean Serving Consumers for this node
+	m.servingMu.Lock()
+	for id, info := range m.servingConsumers {
+		if info.RemoteNode == remoteNode {
+			delete(m.servingConsumers, id)
+			info.Consumer.Close()
+			m.logger.Info("Cleaned up serving consumer for dead node", "consumer_id", id, "node", remoteNode)
+		}
 	}
+	m.servingMu.Unlock()
 }
 
 func (m *Manager) request(node types.NodeID, req PipeRequest) (*PipeResponse, error) {
@@ -563,14 +568,12 @@ func (m *Manager) handleSignaling(msg *nats.Msg) {
 
 		// Track Serving Consumer
 		m.servingMu.Lock()
-		m.servingConsumers[consumer.Id()] = consumer
+		m.servingConsumers[consumer.Id()] = &ServingConsumerInfo{
+			Consumer:   consumer,
+			RemoteNode: req.RequesterNode,
+			StreamID:   req.StreamID,
+		}
 		m.servingMu.Unlock()
-
-		consumer.OnClose(func(context.Context) {
-			m.servingMu.Lock()
-			delete(m.servingConsumers, consumer.Id())
-			m.servingMu.Unlock()
-		})
 
 		// Get Pipe Info for Response
 		dump, err := pipe.Dump()
@@ -595,17 +598,19 @@ func (m *Manager) handleSignaling(msg *nats.Msg) {
 			SrtpParameters: dump.PipeTransportDump.SrtpParameters,
 		}
 		resp.OriginRouterId = router.Id()
+		resp.PipeConsumerId = consumer.Id()
 
 	case "ClosePipe":
 		m.servingMu.Lock()
-		consumer, ok := m.servingConsumers[req.PipeConsumerId]
-		m.servingMu.Unlock()
+		info, ok := m.servingConsumers[req.PipeConsumerId]
 		if ok {
-			consumer.Close()
+			delete(m.servingConsumers, req.PipeConsumerId)
+			info.Consumer.Close()
 			m.logger.Info("Closed serving pipe consumer", "consumer_id", req.PipeConsumerId)
 		} else {
 			m.logger.Warn("ClosePipe: consumer not found (already closed?)", "consumer_id", req.PipeConsumerId)
 		}
+		m.servingMu.Unlock()
 	}
 
 	data, _ := json.Marshal(resp)
@@ -702,18 +707,24 @@ func (m *Manager) Consume(clientID string, streamID types.StreamID) (*mediasoup.
 
 func (m *Manager) Unpublish(streamID types.StreamID) error {
 	m.producersMu.Lock()
-	defer m.producersMu.Unlock()
-
 	if lp, ok := m.producers[streamID]; ok {
-		if lp.Producer != nil {
-			lp.Producer.Close()
-		}
-		if lp.PipeConsumer != nil {
-			lp.PipeConsumer.Close()
-		}
 		delete(m.producers, streamID)
+		lp.Producer.Close()
 		m.logger.Info("Unpublished stream", "stream_id", streamID)
 	}
+	m.producersMu.Unlock()
+
+	// Clean up serving consumers (Downstreams)
+	m.servingMu.Lock()
+	for id, info := range m.servingConsumers {
+		if info.StreamID == streamID {
+			delete(m.servingConsumers, id)
+			info.Consumer.Close()
+			m.logger.Info("Closing serving consumer for unpublished stream", "consumer_id", id, "remote_node", info.RemoteNode)
+		}
+	}
+	m.servingMu.Unlock()
+
 	return nil
 }
 
@@ -724,18 +735,14 @@ func (m *Manager) DisconnectPipe(streamID types.StreamID, pipeID string, upstrea
 	lp, ok := m.producers[streamID]
 	if ok {
 		// Verify ID matches to avoid deleting wrong producer
-		if lp.Id() != pipeID {
-			m.logger.Warn("DisconnectPipe mismatch, skipping", "stream_id", streamID, "expected", pipeID, "found", lp.Id())
+		if lp.UpstreamConsumerId != pipeID {
+			m.logger.Warn("DisconnectPipe mismatch, skipping", "stream_id", streamID, "expected", pipeID, "found", lp.UpstreamConsumerId)
 			return nil
 		}
 
-		if lp.Producer != nil {
-			lp.Producer.Close()
-		}
-		if lp.PipeConsumer != nil {
-			lp.PipeConsumer.Close()
-		}
 		delete(m.producers, streamID)
+
+		lp.Producer.Close()
 		m.logger.Info("Disconnected pipe", "stream_id", streamID, "pipe_id", pipeID)
 	}
 
@@ -750,7 +757,11 @@ func (m *Manager) DisconnectPipe(streamID types.StreamID, pipeID string, upstrea
 		// Send async to avoid blocking lock/caller
 		go func() {
 			if _, err := m.request(upstreamNode, req); err != nil {
-				m.logger.Warn("Failed to send ClosePipe signaling", "upstream", upstreamNode, "error", err)
+				if errors.Is(err, nats.ErrNoResponders) {
+					m.logger.Info("ClosePipe signaling skipped (node offline)", "upstream", upstreamNode)
+				} else {
+					m.logger.Warn("Failed to send ClosePipe signaling", "upstream", upstreamNode, "error", err)
+				}
 			}
 		}()
 	}
@@ -785,22 +796,10 @@ func (m *Manager) cleanupWorkerResources(deadRouter *mediasoup.Router) {
 	m.producersMu.Lock()
 	for streamID, lp := range m.producers {
 		if lp.RouterId == deadRouterID {
-			// Notify Remote if it's a Pipe
-			if lp.UpstreamNode != "" && lp.UpstreamNode != m.nodeID {
-				req := PipeRequest{
-					Command:        "ClosePipe",
-					StreamID:       streamID,
-					RequesterNode:  m.nodeID,
-					PipeConsumerId: lp.Id(),
-				}
-				m.cleanupWg.Add(1)
-				go func(node types.NodeID, r PipeRequest) {
-					defer m.cleanupWg.Done()
-					m.request(node, r)
-				}(lp.UpstreamNode, req)
-			}
-
 			delete(m.producers, streamID)
+			if m.OnStreamClosed != nil {
+				m.OnStreamClosed(streamID)
+			}
 			m.logger.Info("Cleaned up producer", "stream_id", streamID)
 		}
 	}

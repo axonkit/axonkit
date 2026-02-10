@@ -195,6 +195,32 @@ func (f *FIB) monitorUpstream(streamID types.StreamID, currentUpstream types.Nod
 			expectedSuffix := fmt.Sprintf(".%s", currentUpstream)
 
 			if len(key) > len(expectedSuffix) && key[len(key)-len(expectedSuffix):] == expectedSuffix {
+				// Optimization: Check if we have any alternatives before triggering failover
+				candidates, _ := f.rib.GetCandidates(streamID)
+				hasAlternatives := false
+
+				f.mu.Lock()
+				ent, ok := f.entries[streamID]
+				for _, c := range candidates {
+					if c.Node == f.localNodeID {
+						continue
+					}
+					// Check if it is a downstream node
+					if ok && ent != nil && ent.DownstreamNodes[c.Node] {
+						continue
+					}
+					hasAlternatives = true
+					break
+				}
+				f.mu.Unlock()
+
+				if !hasAlternatives {
+					f.logger.Info("Upstream removed and no alternatives, tearing down", "stream_id", streamID)
+					// Disconnect immediately
+					f.teardownUpstream(streamID, currentUpstream)
+					return
+				}
+
 				f.logger.Warn("Upstream disappeared, triggering failover", "upstream", currentUpstream, "stream_id", streamID)
 
 				// We need to trigger failover logic.
@@ -273,11 +299,7 @@ func (f *FIB) handleFailover(streamID types.StreamID, failedUpstream types.NodeI
 		f.rib.StopAdvertise(streamID)
 
 		// Disconnect broken pipe
-		f.mu.Lock()
-		if ent, ok := f.entries[streamID]; ok && f.DisconnectPipe != nil {
-			f.DisconnectPipe(streamID, ent.PipeID, ent.UpstreamNode)
-		}
-		f.mu.Unlock()
+		f.teardownUpstream(streamID, failedUpstream)
 		return
 	}
 
@@ -311,6 +333,21 @@ func (f *FIB) handleFailover(streamID types.StreamID, failedUpstream types.NodeI
 	newPathVector := append(newRoute.PathVector, f.localNodeID)
 	if err := f.rib.StartAdvertise(streamID, newRoute.BaseCost+10, newPathVector, newRoute.RttToOrigin+20); err != nil {
 		f.logger.Error("Failed to re-advertise during failover", "stream_id", streamID, "error", err)
+	}
+}
+
+// teardownUpstream safely disconnects and clears the upstream state
+func (f *FIB) teardownUpstream(streamID types.StreamID, expectedUpstream types.NodeID) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if ent, ok := f.entries[streamID]; ok && ent.UpstreamNode == expectedUpstream {
+		if f.DisconnectPipe != nil {
+			f.DisconnectPipe(streamID, ent.PipeID, ent.UpstreamNode)
+		}
+		// Clear state to avoid duplicate disconnects
+		ent.UpstreamNode = ""
+		ent.PipeID = ""
 	}
 }
 

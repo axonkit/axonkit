@@ -40,7 +40,7 @@ func (s *NatsStore) Get(ctx context.Context, key string) (Entry, error) {
 }
 
 func (s *NatsStore) Delete(ctx context.Context, key string) error {
-	return s.kv.Delete(ctx, key)
+	return s.kv.Purge(ctx, key)
 }
 
 func (s *NatsStore) Watch(ctx context.Context, pattern string, opts ...WatchOption) (Watcher, error) {
@@ -64,7 +64,7 @@ func (s *NatsStore) Watch(ctx context.Context, pattern string, opts ...WatchOpti
 		defer close(nw.ch)
 		for e := range w.Updates() {
 			if e == nil {
-				return
+				continue
 			}
 			nw.ch <- &natsEntry{e}
 		}

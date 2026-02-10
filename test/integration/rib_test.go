@@ -68,7 +68,7 @@ func createNode(t *testing.T, srv *server.Server, id string) *MockNode {
 	fib.ConnectPipe = func(streamID types.StreamID, upstream types.NodeID) (string, error) {
 		return fmt.Sprintf("pipe-%s-%s", id, upstream), nil
 	}
-	fib.DisconnectPipe = func(pipeID string) error {
+	fib.DisconnectPipe = func(streamID types.StreamID, pipeID string, upstreamNode types.NodeID) error {
 		return nil
 	}
 

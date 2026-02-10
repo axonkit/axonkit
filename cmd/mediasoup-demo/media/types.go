@@ -24,6 +24,7 @@ type PipeRequest struct {
 type PipeResponse struct {
 	PipeInfo       PipeInfo     `json:"pipeInfo,omitempty"`
 	OriginRouterId string       `json:"originRouterId,omitempty"`
+	PipeConsumerId string       `json:"pipeConsumerId,omitempty"`
 	ProducerInfo   ProducerInfo `json:"producerInfo,omitempty"`
 	Error          string       `json:"error,omitempty"`
 }
