@@ -25,6 +25,7 @@ type RouteKVValue struct {
 	BaseCost    int       `json:"base_cost"`     // Cost to reach this node (from stream source)
 	PathVector  []NodeID  `json:"path_vector"`   // Loop detection
 	RttToOrigin int64     `json:"rtt_to_origin"` // Cumulative RTT from source to here
+	IsOrigin    bool      `json:"is_origin"`     // Whether this node is the origin
 	ExpireAt    time.Time `json:"expire_at"`
 }
 
@@ -37,12 +38,13 @@ type LinkStats struct {
 
 // FIBEntry represents a local active subscription
 type FIBEntry struct {
-	StreamID        StreamID
-	UpstreamNode    NodeID
-	PipeID          string          // Mock Pipe ID
-	State           string          // "connected", "connecting", "disconnected", "lingering"
-	RefCount        int             // Local user references
-	DownstreamNodes map[NodeID]bool // Set of downstream nodes depending on us
+	StreamID         StreamID
+	UpstreamNode     NodeID
+	UpstreamIsOrigin bool            // Whether current upstream is origin
+	PipeID           string          // Mock Pipe ID
+	State            string          // "connected", "connecting", "disconnected", "lingering"
+	RefCount         int             // Local user references
+	DownstreamNodes  map[NodeID]bool // Set of downstream nodes depending on us
 
 	TeardownTimer     *time.Timer // Timer for idle timeout (linger)
 	OptimizationTimer *time.Timer // Timer for periodic path optimization

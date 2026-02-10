@@ -104,7 +104,13 @@ func main() {
 		}
 
 		// Origin advertising
-		err := rib.StartAdvertise(types.StreamID(streamID), 0, []types.NodeID{myNode.ID}, 0)
+		err := rib.StartAdvertise(routing.AdvertiseOptions{
+			StreamID:    types.StreamID(streamID),
+			BaseCost:    0,
+			PathVector:  []types.NodeID{myNode.ID},
+			RttToOrigin: 0,
+			IsOrigin:    true,
+		})
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +27,7 @@ type adEntry struct {
 	BaseCost    int
 	PathVector  []types.NodeID
 	RttToOrigin int64
+	IsOrigin    bool
 }
 
 type streamWatcher struct {
@@ -33,7 +35,7 @@ type streamWatcher struct {
 	cancel   context.CancelFunc // Stop the NATS watcher
 
 	mu          sync.RWMutex
-	subscribers map[int64]func(types.RouteKVValue)
+	subscribers map[int64]func(types.RouteKVValue, bool)
 	downstreams map[int64]func(types.NodeID, bool)
 	subSeq      int64
 	dsSeq       int64
@@ -109,7 +111,7 @@ func (r *RIB) getOrStartWatcher(streamID types.StreamID) (*streamWatcher, error)
 	sw := &streamWatcher{
 		streamID:    streamID,
 		cancel:      cancel,
-		subscribers: make(map[int64]func(types.RouteKVValue)),
+		subscribers: make(map[int64]func(types.RouteKVValue, bool)),
 		downstreams: make(map[int64]func(types.NodeID, bool)),
 	}
 	r.watchers[streamID] = sw
@@ -145,8 +147,12 @@ func (r *RIB) dispatchUpdate(sw *streamWatcher, entry store.Entry) {
 	var val types.RouteKVValue
 	if isDelete {
 		val.BaseCost = -1
-		val.Node = types.NodeID(key) // Hack: use Key as ID for delete
-		// StreamID is known from sw
+		// Parse Key: route.<StreamID>.<Region>.<Cluster>.<NodeID>
+		// We expect Key to be full key or at least contain NodeID at end.
+		parts := strings.Split(key, ".")
+		if len(parts) > 0 {
+			val.Node = types.NodeID(parts[len(parts)-1])
+		}
 		val.StreamID = sw.streamID
 	} else {
 		if err := json.Unmarshal(entry.Value(), &val); err != nil {
@@ -159,16 +165,23 @@ func (r *RIB) dispatchUpdate(sw *streamWatcher, entry store.Entry) {
 
 	// 1. Notify Subscribers
 	for _, cb := range sw.subscribers {
-		cb(val)
+		cb(val, isDelete)
 	}
 
 	// 2. Notify Downstreams
 	for _, cb := range sw.downstreams {
+		// Ignore updates about ourselves
+		if val.Node == r.local.ID {
+			continue
+		}
+
 		if isDelete {
-			cb(types.NodeID(key), false)
+			cb(val.Node, false)
 		} else {
 			// Check if we are upstream
-			if len(val.PathVector) > 0 && val.PathVector[len(val.PathVector)-1] == r.local.ID {
+			// Since PathVector includes the advertising node at the end,
+			// we look for ourselves at len-2.
+			if len(val.PathVector) >= 2 && val.PathVector[len(val.PathVector)-2] == r.local.ID {
 				cb(val.Node, true)
 			}
 		}
@@ -194,7 +207,7 @@ func (r *RIB) cleanupWatcher(streamID types.StreamID, sw *streamWatcher) {
 
 // SubscribeUpdates starts a watcher for a specific stream's routes
 // It returns a cancel function to stop the watcher.
-func (r *RIB) SubscribeUpdates(streamID types.StreamID, cb func(types.RouteKVValue)) func() {
+func (r *RIB) SubscribeUpdates(streamID types.StreamID, cb func(types.RouteKVValue, bool)) func() {
 	sw, err := r.getOrStartWatcher(streamID)
 	if err != nil {
 		r.logger.Error("Failed to watch stream", "stream_id", streamID, "error", err)
@@ -232,20 +245,30 @@ func (r *RIB) WatchDownstream(streamID types.StreamID, cb func(downstreamNode ty
 	// No cleanup returned, persists until RIB close or implicit cleanup
 }
 
+// AdvertiseOptions configures the advertisement parameters
+type AdvertiseOptions struct {
+	StreamID    types.StreamID
+	BaseCost    int
+	PathVector  []types.NodeID
+	RttToOrigin int64
+	IsOrigin    bool
+}
+
 // StartAdvertise registers a stream for keepalive
-func (r *RIB) StartAdvertise(streamID types.StreamID, baseCost int, pathVector []types.NodeID, rttToOrigin int64) error {
+func (r *RIB) StartAdvertise(opts AdvertiseOptions) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if _, exists := r.entryMap[streamID]; exists {
+	if _, exists := r.entryMap[opts.StreamID]; exists {
 		return nil
 	}
 
 	val := &adEntry{
-		StreamID:    streamID,
-		BaseCost:    baseCost,
-		PathVector:  pathVector,
-		RttToOrigin: rttToOrigin,
+		StreamID:    opts.StreamID,
+		BaseCost:    opts.BaseCost,
+		PathVector:  opts.PathVector,
+		RttToOrigin: opts.RttToOrigin,
+		IsOrigin:    opts.IsOrigin,
 	}
 
 	// Initial advertise immediately
@@ -259,7 +282,7 @@ func (r *RIB) StartAdvertise(streamID types.StreamID, baseCost int, pathVector [
 		Priority: priority,
 	}
 
-	r.entryMap[streamID] = item
+	r.entryMap[opts.StreamID] = item
 	heap.Push(&r.pq, item)
 
 	// Signal keepAliveLoop
@@ -382,6 +405,7 @@ func (r *RIB) advertiseOnce(entry *adEntry) error {
 		BaseCost:    entry.BaseCost,
 		PathVector:  entry.PathVector,
 		RttToOrigin: entry.RttToOrigin,
+		IsOrigin:    entry.IsOrigin,
 		ExpireAt:    time.Now().Add(RIBTTL),
 	}
 

@@ -115,13 +115,14 @@ func (f *FIB) Subscribe(streamID types.StreamID, findPath func(types.StreamID) (
 
 	// 3. Create Entry
 	entry = &types.FIBEntry{
-		StreamID:        streamID,
-		UpstreamNode:    route.Node,
-		PipeID:          pipeID,
-		State:           "connected",
-		RefCount:        1,
-		DownstreamNodes: make(map[types.NodeID]bool),
-		FindPathFunc:    findPath,
+		StreamID:         streamID,
+		UpstreamNode:     route.Node,
+		UpstreamIsOrigin: route.IsOrigin,
+		PipeID:           pipeID,
+		State:            "connected",
+		RefCount:         1,
+		DownstreamNodes:  make(map[types.NodeID]bool),
+		FindPathFunc:     findPath,
 	}
 	f.entries[streamID] = entry
 
@@ -129,7 +130,13 @@ func (f *FIB) Subscribe(streamID types.StreamID, findPath func(types.StreamID) (
 	newPathVector := append(route.PathVector, f.localNodeID)
 
 	// Start Keepalive Advertise
-	err = f.rib.StartAdvertise(streamID, route.BaseCost+10, newPathVector, route.RttToOrigin+20)
+	err = f.rib.StartAdvertise(AdvertiseOptions{
+		StreamID:    streamID,
+		BaseCost:    route.BaseCost + 10,
+		PathVector:  newPathVector,
+		RttToOrigin: route.RttToOrigin + 20,
+		IsOrigin:    false,
+	})
 	if err != nil {
 		f.logger.Error("Failed to start re-advertise", "stream_id", streamID, "error", err)
 	} else {
@@ -184,50 +191,53 @@ func (f *FIB) handleDownstreamChange(streamID types.StreamID, nodeID types.NodeI
 
 // monitorUpstream watches the RIB for changes to the upstream node
 func (f *FIB) monitorUpstream(streamID types.StreamID, currentUpstream types.NodeID, findPath func(types.StreamID) (*types.RouteKVValue, error)) {
-	cancel := f.rib.SubscribeUpdates(streamID, func(val types.RouteKVValue) {
-		// Check for "Delete" event
-		// We defined convention: BaseCost = -1 means deleted.
-		// And OriginNode contains the Key (hack).
-
-		if val.BaseCost == -1 {
+	cancel := f.rib.SubscribeUpdates(streamID, func(val types.RouteKVValue, deleted bool) {
+		if deleted {
 			// A route was deleted. Is it OUR upstream?
-			key := string(val.Node) // We stored Key in OriginNode
-			expectedSuffix := fmt.Sprintf(".%s", currentUpstream)
-
-			if len(key) > len(expectedSuffix) && key[len(key)-len(expectedSuffix):] == expectedSuffix {
-				// Optimization: Check if we have any alternatives before triggering failover
-				candidates, _ := f.rib.GetCandidates(streamID)
-				hasAlternatives := false
-
+			if val.Node == currentUpstream {
+				// 1. Check if we are connected to Origin (Fast check)
 				f.mu.Lock()
 				ent, ok := f.entries[streamID]
-				for _, c := range candidates {
-					if c.Node == f.localNodeID {
-						continue
-					}
-					// Check if it is a downstream node
-					if ok && ent != nil && ent.DownstreamNodes[c.Node] {
-						continue
-					}
-					hasAlternatives = true
-					break
-				}
+				isOrigin := ok && ent.UpstreamIsOrigin
 				f.mu.Unlock()
 
+				var candidates []types.RouteKVValue
+				if !isOrigin {
+					// 2. Not origin, so check alternatives (IO operation, outside lock)
+					candidates, _ = f.rib.GetCandidates(streamID)
+				}
+
+				hasAlternatives := false
+				if len(candidates) > 0 {
+					// 3. Filter candidates (Requires lock for DownstreamNodes)
+					f.mu.Lock()
+					ent, ok = f.entries[streamID]
+					for _, c := range candidates {
+						if c.Node == f.localNodeID {
+							continue
+						}
+						// Avoid loops through downstreams
+						if ok && ent != nil && ent.DownstreamNodes[c.Node] {
+							continue
+						}
+						hasAlternatives = true
+						break
+					}
+					f.mu.Unlock()
+				}
+
 				if !hasAlternatives {
-					f.logger.Info("Upstream removed and no alternatives, tearing down", "stream_id", streamID)
-					// Disconnect immediately
+					f.logger.Info("No alternatives found, tearing down", "stream_id", streamID)
+					if err := f.rib.StopAdvertise(streamID); err != nil {
+						f.logger.Error("Failed to stop advertise", "stream_id", streamID, "error", err)
+					}
 					f.teardownUpstream(streamID, currentUpstream)
 					return
 				}
 
+				// Trigger failover immediately.
+				// handleFailover will check for alternatives and teardown if none found.
 				f.logger.Warn("Upstream disappeared, triggering failover", "upstream", currentUpstream, "stream_id", streamID)
-
-				// We need to trigger failover logic.
-				// NOTE: This callback is executed in RIB's global watcher loop.
-				// We MUST NOT block here or do heavy work.
-				// We should spawn a goroutine or use a worker pool in FIB.
-				// For now, spawn a goroutine to handle failover.
 				go f.handleFailover(streamID, currentUpstream, findPath)
 			}
 		}
@@ -320,6 +330,7 @@ func (f *FIB) handleFailover(streamID types.StreamID, failedUpstream types.NodeI
 			}
 
 			entry.UpstreamNode = newRoute.Node
+			entry.UpstreamIsOrigin = newRoute.IsOrigin
 			entry.PipeID = newPipeID
 		}
 	}
@@ -331,7 +342,13 @@ func (f *FIB) handleFailover(streamID types.StreamID, failedUpstream types.NodeI
 	// Update Re-advertise (PathVector changed!)
 	// We need to update our advertisement because the path vector is different now
 	newPathVector := append(newRoute.PathVector, f.localNodeID)
-	if err := f.rib.StartAdvertise(streamID, newRoute.BaseCost+10, newPathVector, newRoute.RttToOrigin+20); err != nil {
+	if err := f.rib.StartAdvertise(AdvertiseOptions{
+		StreamID:    streamID,
+		BaseCost:    newRoute.BaseCost + 10,
+		PathVector:  newPathVector,
+		RttToOrigin: newRoute.RttToOrigin + 20,
+		IsOrigin:    false,
+	}); err != nil {
 		f.logger.Error("Failed to re-advertise during failover", "stream_id", streamID, "error", err)
 	}
 }
@@ -634,12 +651,19 @@ func (f *FIB) switchUpstream(streamID types.StreamID, newRoute *types.RouteKVVal
 	}
 
 	entry.UpstreamNode = newRoute.Node
+	entry.UpstreamIsOrigin = newRoute.IsOrigin
 	entry.PipeID = newPipeID
 	f.mu.Unlock()
 
 	// 3. Update Advertisement (Propagate new path)
 	newPathVector := append(newRoute.PathVector, f.localNodeID)
-	err := f.rib.StartAdvertise(streamID, newRoute.BaseCost+10, newPathVector, newRoute.RttToOrigin+20)
+	err := f.rib.StartAdvertise(AdvertiseOptions{
+		StreamID:    streamID,
+		BaseCost:    newRoute.BaseCost + 10,
+		PathVector:  newPathVector,
+		RttToOrigin: newRoute.RttToOrigin + 20,
+		IsOrigin:    false,
+	})
 	if err != nil {
 		f.logger.Error("Failed to update advertisement during switch", "error", err)
 	}

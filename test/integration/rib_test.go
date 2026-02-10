@@ -96,7 +96,13 @@ func TestCascadingTeardown(t *testing.T) {
 	streamID := types.StreamID("stream-test-1")
 
 	// 1. Origin Advertise
-	err := origin.RIB.StartAdvertise(streamID, 0, []types.NodeID{origin.ID}, 0)
+	err := origin.RIB.StartAdvertise(routing.AdvertiseOptions{
+		StreamID:    streamID,
+		BaseCost:    0,
+		PathVector:  []types.NodeID{origin.ID},
+		RttToOrigin: 0,
+		IsOrigin:    true,
+	})
 	if err != nil {
 		t.Fatalf("Origin failed to advertise: %v", err)
 	}
@@ -218,7 +224,13 @@ func TestLinger(t *testing.T) {
 	streamID := types.StreamID("stream-linger")
 
 	// Advertise self (as if we are Origin)
-	node.RIB.StartAdvertise(streamID, 0, []types.NodeID{node.ID}, 0)
+	node.RIB.StartAdvertise(routing.AdvertiseOptions{
+		StreamID:    streamID,
+		BaseCost:    0,
+		PathVector:  []types.NodeID{node.ID},
+		RttToOrigin: 0,
+		IsOrigin:    true,
+	})
 
 	// Subscribe Self (Loopback just to test FIB logic)
 	// Actually we can mock findPath to return anything

@@ -97,9 +97,7 @@ func main() {
 
 	// Wire FIB to Media Manager
 	fib.ConnectPipe = mediaMgr.ConnectPipe
-	fib.DisconnectPipe = func(streamID types.StreamID, pipeID string, upstreamNode types.NodeID) error {
-		return mediaMgr.DisconnectPipe(streamID, pipeID, upstreamNode)
-	}
+	fib.DisconnectPipe = mediaMgr.DisconnectPipe
 
 	// 4. Init Node Registry (Discovery & Heartbeat)
 	nodeStore, err := store.NewNatsStore(context.Background(), js, discovery.NodeBucketName, discovery.NodeTTL)
@@ -142,7 +140,13 @@ func main() {
 
 		// 2. Advertise to RIB
 		// Origin advertising (Cost 0)
-		err := rib.StartAdvertise(types.StreamID(streamID), 0, []types.NodeID{myNode.ID}, 0)
+		err := rib.StartAdvertise(routing.AdvertiseOptions{
+			StreamID:    types.StreamID(streamID),
+			BaseCost:    0,
+			PathVector:  []types.NodeID{myNode.ID},
+			RttToOrigin: 0,
+			IsOrigin:    true,
+		})
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
