@@ -176,7 +176,7 @@ func TestNatsStore_TTL(t *testing.T) {
 	}
 
 	// 2. Watch
-	w, err := store.Watch(ctx, key)
+	w, err := store.Watch(ctx, ">")
 	if err != nil {
 		t.Fatalf("Watch failed: %v", err)
 	}

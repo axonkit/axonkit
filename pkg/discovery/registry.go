@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -11,9 +12,8 @@ import (
 )
 
 const (
-	NodeBucketName    = "NODES"
-	NodeTTL           = 5 * time.Second
-	KeepAliveInterval = 2 * time.Second
+	NodeBucketName = "NODES"
+	NodeTTL        = 5 * time.Second
 )
 
 type Registry struct {
@@ -21,15 +21,29 @@ type Registry struct {
 	local  types.NodeInfo
 	logger *slog.Logger
 	stopCh chan struct{}
+	ttl    time.Duration
 }
 
-func NewRegistry(s store.Store, local types.NodeInfo) *Registry {
-	return &Registry{
+type RegistryOption func(*Registry)
+
+func WithTTL(ttl time.Duration) RegistryOption {
+	return func(r *Registry) {
+		r.ttl = ttl
+	}
+}
+
+func NewRegistry(s store.Store, local types.NodeInfo, opts ...RegistryOption) *Registry {
+	r := &Registry{
 		store:  s,
 		local:  local,
 		logger: slog.Default().With("component", "Registry"),
 		stopCh: make(chan struct{}),
+		ttl:    NodeTTL,
 	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // Start registers the node and starts the keepalive loop
@@ -52,7 +66,7 @@ func (r *Registry) register() error {
 }
 
 func (r *Registry) keepAliveLoop() {
-	ticker := time.NewTicker(KeepAliveInterval)
+	ticker := time.NewTicker(r.ttl / 2)
 	defer ticker.Stop()
 
 	for {
@@ -74,14 +88,18 @@ func (r *Registry) Close() {
 }
 
 // WatchNodes watches for node changes and calls callbacks
-func (r *Registry) WatchNodes(onNodeDown func(types.NodeID)) error {
+func (r *Registry) WatchNodes(cb func(nodeID types.NodeID, isDelete bool)) error {
 	w, err := r.store.Watch(context.Background(), ">") // Watch all keys
 	if err != nil {
 		return err
 	}
 
+	// Watcher Loop
 	go func() {
 		defer w.Stop()
+
+		lastSeen := make(map[types.NodeID][]byte)
+
 		for {
 			select {
 			case <-r.stopCh:
@@ -94,15 +112,39 @@ func (r *Registry) WatchNodes(onNodeDown func(types.NodeID)) error {
 					continue
 				}
 
+				nodeID := types.NodeID(entry.Key())
+				if nodeID == r.local.ID {
+					continue
+				}
+
 				if entry.Operation() == store.OpDelete {
-					nodeID := types.NodeID(entry.Key())
-					if nodeID != r.local.ID {
-						r.logger.Info("Node down detected", "node_id", nodeID)
-						onNodeDown(nodeID)
+					r.logger.Info("Node down detected", "node_id", nodeID)
+					delete(lastSeen, nodeID)
+					cb(nodeID, true)
+				} else {
+					// Notify Put/Update
+					newValue := entry.Value()
+
+					// Check if changed
+					if oldValue, exists := lastSeen[nodeID]; exists {
+						if bytes.Equal(oldValue, newValue) {
+							continue
+						}
 					}
+
+					// Clone to ensure we own the data
+					// Although in most cases string(newValue) would also allocate
+					// bytes.Clone is cleaner if available (Go 1.20+)
+					// Or manual copy
+					cloned := make([]byte, len(newValue))
+					copy(cloned, newValue)
+					lastSeen[nodeID] = cloned
+
+					cb(nodeID, false)
 				}
 			}
 		}
 	}()
+
 	return nil
 }

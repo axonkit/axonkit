@@ -12,7 +12,7 @@ import (
 )
 
 func TestWatchDownstream_SelfExclusion(t *testing.T) {
-	ms := store.NewMemoryStore()
+	ms := store.NewMemoryStore(0)
 	localNode := types.NodeInfo{ID: "NodeA", Region: "R1", Cluster: "C1"}
 	r := NewRIB(ms, localNode)
 

@@ -106,7 +106,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	registry := discovery.NewRegistry(nodeStore, myNode)
+	registry := discovery.NewRegistry(nodeStore, myNode, discovery.WithTTL(discovery.NodeTTL))
 	if err := registry.Start(); err != nil {
 		slog.Error("Failed to start Node Registry", "error", err)
 		os.Exit(1)
@@ -116,9 +116,11 @@ func main() {
 	// But for graceful shutdown we can call it at the end.
 
 	// Watch for node offline events to cleanup resources
-	err = registry.WatchNodes(func(nodeID types.NodeID) {
-		slog.Info("Detected node offline, cleaning up resources", "node_id", nodeID)
-		mediaMgr.CleanUpNode(nodeID)
+	err = registry.WatchNodes(func(nodeID types.NodeID, isDelete bool) {
+		if isDelete {
+			slog.Info("Detected node offline, cleaning up resources", "node_id", nodeID)
+			mediaMgr.CleanUpNode(nodeID)
+		}
 	})
 	if err != nil {
 		slog.Error("Failed to start node watcher", "error", err)

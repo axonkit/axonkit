@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 )
 
 // MemoryStore implements an in-memory Store.
@@ -12,12 +13,17 @@ type MemoryStore struct {
 	mu       sync.RWMutex
 	data     map[string][]byte
 	watchers []*memoryWatcher
+	ttl      time.Duration
+	timers   map[string]*time.Timer
 }
 
 // NewMemoryStore creates a new in-memory store.
-func NewMemoryStore() *MemoryStore {
+// If ttl > 0, keys will be automatically deleted after ttl.
+func NewMemoryStore(ttl time.Duration) *MemoryStore {
 	return &MemoryStore{
-		data: make(map[string][]byte),
+		data:   make(map[string][]byte),
+		ttl:    ttl,
+		timers: make(map[string]*time.Timer),
 	}
 }
 
@@ -76,6 +82,33 @@ func (s *MemoryStore) Put(ctx context.Context, key string, value []byte) error {
 	copy(valCopy, value)
 	s.data[key] = valCopy
 
+	// Handle TTL
+	if s.ttl > 0 {
+		// Stop existing timer
+		if t, ok := s.timers[key]; ok {
+			t.Stop()
+		}
+
+		// Create a container for the timer so we can reference it in closure
+		type timerWrapper struct {
+			t *time.Timer
+		}
+		tw := &timerWrapper{}
+
+		tw.t = time.AfterFunc(s.ttl, func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+
+			// Check if we are still the active timer
+			if active, ok := s.timers[key]; ok && active == tw.t {
+				delete(s.data, key)
+				delete(s.timers, key)
+				s.notify(key, nil, OpDelete)
+			}
+		})
+		s.timers[key] = tw.t
+	}
+
 	s.notify(key, valCopy, OpPut)
 	return nil
 }
@@ -103,6 +136,12 @@ func (s *MemoryStore) Get(ctx context.Context, key string) (Entry, error) {
 func (s *MemoryStore) Delete(ctx context.Context, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Stop existing timer
+	if t, ok := s.timers[key]; ok {
+		t.Stop()
+		delete(s.timers, key)
+	}
 
 	if _, ok := s.data[key]; !ok {
 		return nil // NATS Delete is idempotent-ish usually, or we can return error
@@ -163,6 +202,13 @@ func (s *MemoryStore) Watch(ctx context.Context, pattern string, opts ...WatchOp
 func (s *MemoryStore) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Stop all timers
+	for _, t := range s.timers {
+		t.Stop()
+	}
+	s.timers = nil
+
 	// Stop all watchers
 	for _, w := range s.watchers {
 		select {
