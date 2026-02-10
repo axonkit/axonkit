@@ -165,8 +165,8 @@ func main() {
 		}
 
 		// FIB Subscribe -> Calls ConnectPipe -> MediaManager ConnectPipe
-		// producerID is the ID available on local router (either pipe consumer or original producer)
-		producerID, upstream, err := fib.Subscribe(types.StreamID(streamID), finder.FindPath)
+		// pipeID is the ID available on local router (either pipe consumer or original producer)
+		pipeID, upstream, err := fib.Subscribe(types.StreamID(streamID), finder.FindPath)
 
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Subscribe failed: %v", err), 500)
@@ -180,7 +180,7 @@ func main() {
 			return
 		}
 
-		fmt.Fprintf(w, "Subscribed %s via %s (Consumer: %s, Producer: %s)\n", streamID, upstream, consumer.Id(), producerID)
+		fmt.Fprintf(w, "Subscribed %s via %s (Consumer: %s, Pipe: %s)\n", streamID, upstream, consumer.Id(), pipeID)
 	})
 
 	http.HandleFunc("/unpublish", func(w http.ResponseWriter, r *http.Request) {

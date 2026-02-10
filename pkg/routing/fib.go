@@ -10,6 +10,8 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
+const LingerDuration = 10 * time.Second
+
 // FIB (Forwarding Information Base) manages local active connections
 type FIB struct {
 	entries map[types.StreamID]*types.FIBEntry
@@ -394,8 +396,6 @@ func (f *FIB) Unsubscribe(streamID types.StreamID) {
 		f.scheduleTeardown(streamID)
 	}
 }
-
-const LingerDuration = 10 * time.Second
 
 // scheduleTeardown schedules disconnection after linger time
 func (f *FIB) scheduleTeardown(streamID types.StreamID) {
