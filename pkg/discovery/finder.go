@@ -55,11 +55,12 @@ func (f *Finder) FindPath(streamID types.StreamID) (*types.RouteKVValue, error) 
 		// Formula: TotalScore = Candidate.BaseCost + MyLinkCost(RTT, Factor)
 		// Lower score is better.
 
-		linkStats := f.linkDB.GetLink(c.Region)
+		// Try to get link stats for the specific cluster, fallback to region
+		linkStats := f.linkDB.GetLink(c.Cluster, c.Region)
 
 		// Heuristic:
 		// BaseCost: Cost from origin to candidate
-		// LinkRTT: Cost from candidate (Region) to me
+		// LinkRTT: Cost from candidate (Cluster) to me
 		// Factor: Administrative cost (e.g. cross-region penalty)
 
 		linkCost := float64(linkStats.AvgRTT) * 1.0 // 1ms = 1 score

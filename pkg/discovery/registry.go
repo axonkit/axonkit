@@ -88,7 +88,7 @@ func (r *Registry) Close() {
 }
 
 // WatchNodes watches for node changes and calls callbacks
-func (r *Registry) WatchNodes(cb func(nodeID types.NodeID, isDelete bool)) error {
+func (r *Registry) WatchNodes(cb func(node types.NodeInfo, isDelete bool)) error {
 	w, err := r.store.Watch(context.Background(), ">") // Watch all keys
 	if err != nil {
 		return err
@@ -118,9 +118,8 @@ func (r *Registry) WatchNodes(cb func(nodeID types.NodeID, isDelete bool)) error
 				}
 
 				if entry.Operation() == store.OpDelete {
-					r.logger.Info("Node down detected", "node_id", nodeID)
 					delete(lastSeen, nodeID)
-					cb(nodeID, true)
+					cb(types.NodeInfo{ID: nodeID}, true)
 				} else {
 					// Notify Put/Update
 					newValue := entry.Value()
@@ -134,7 +133,13 @@ func (r *Registry) WatchNodes(cb func(nodeID types.NodeID, isDelete bool)) error
 
 					lastSeen[nodeID] = newValue
 
-					cb(nodeID, false)
+					var nodeInfo types.NodeInfo
+					if err := json.Unmarshal(newValue, &nodeInfo); err != nil {
+						r.logger.Error("Failed to unmarshal node info", "node_id", nodeID, "error", err)
+						continue
+					}
+
+					cb(nodeInfo, false)
 				}
 			}
 		}

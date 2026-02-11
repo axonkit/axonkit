@@ -162,9 +162,9 @@ func TestRegistryWatch(t *testing.T) {
 	deleteCh := make(chan types.NodeID, 1)
 
 	// Start Watching
-	err = watcher.WatchNodes(func(nodeID types.NodeID, isDelete bool) {
+	err = watcher.WatchNodes(func(node types.NodeInfo, isDelete bool) {
 		if isDelete {
-			deleteCh <- nodeID
+			deleteCh <- node.ID
 		}
 	})
 	if err != nil {

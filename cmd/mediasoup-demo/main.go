@@ -69,16 +69,19 @@ func main() {
 	}
 	rib := routing.NewRIB(kv, myNode)
 
-	linkDB := routing.NewLinkDB()
-	// Populate linkDB with some defaults for demo
-	switch *regionID {
-	case "US-B":
-		linkDB.UpdateLink("CN", 200, 0, 100)
-		linkDB.UpdateLink("US-A", 30, 0, 10)
-		slog.Info("Configured LinkDB: US-B -> CN (200ms), US-B -> US-A (30ms)")
-	case "US-A":
-		linkDB.UpdateLink("CN", 200, 0, 100)
-		slog.Info("Configured LinkDB: US-A -> CN (200ms)")
+	linkDB := routing.NewLinkDB(nc, myNode)
+	// Demo Setup: Pre-populate LinkDB
+	// Note: We use ClusterID for LinkDB now
+	switch *clusterID {
+	case "SanFrancisco": // US-B
+		linkDB.UpdateClusterLink("Beijing", 200, 0, 100)
+		linkDB.UpdateClusterLink("NewYork", 30, 0, 10)
+		// Fallback region link
+		linkDB.UpdateRegionLink("CN", 180, 0, 90)
+		slog.Info("Configured LinkDB: SanFrancisco -> Beijing (200ms), Region CN (180ms)")
+	case "NewYork": // US-A
+		linkDB.UpdateClusterLink("Beijing", 200, 0, 100)
+		slog.Info("Configured LinkDB: NewYork -> Beijing (200ms)")
 	}
 
 	finder := discovery.NewFinder(rib, linkDB, myNode)
@@ -119,15 +122,23 @@ func main() {
 	// But for graceful shutdown we can call it at the end.
 
 	// Watch for node offline events to cleanup resources
-	err = registry.WatchNodes(func(nodeID types.NodeID, isDelete bool) {
+	err = registry.WatchNodes(func(node types.NodeInfo, isDelete bool) {
 		if isDelete {
-			slog.Info("Detected node offline, cleaning up resources", "node_id", nodeID)
-			mediaMgr.CleanUpNode(nodeID)
+			slog.Info("Detected node offline, cleaning up resources", "node_id", node.ID)
+			mediaMgr.CleanUpNode(node.ID)
+			linkDB.RemoveNode(node.ID)
+		} else {
+			// Node Added/Updated
+			slog.Debug("Detected node online", "node_id", node.ID, "cluster", node.Cluster)
+			linkDB.AddNode(node)
 		}
 	})
 	if err != nil {
 		slog.Error("Failed to start node watcher", "error", err)
 	}
+
+	// Start Probing & Ping Handler
+	linkDB.StartProbing(context.Background())
 
 	// 5. HTTP API
 	http.HandleFunc("/publish", func(w http.ResponseWriter, r *http.Request) {
