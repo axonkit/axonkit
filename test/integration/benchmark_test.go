@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"rib-control/pkg/types"
+	"github.com/jiyeyuran/omnistream/pkg/types"
 )
 
 // BenchmarkStreamScale measures performance when subscribing to many streams

@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"rib-control/pkg/types"
+	"github.com/jiyeyuran/omnistream/pkg/types"
 
 	"github.com/jiyeyuran/mediasoup-go/v2"
 	"github.com/nats-io/nats.go"

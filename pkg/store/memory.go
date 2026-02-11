@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"rib-control/pkg/store/ttl"
+	"github.com/jiyeyuran/omnistream/pkg/store/ttl"
 )
 
 // MemoryStore implements an in-memory Store.

@@ -10,11 +10,11 @@ import (
 	"os/signal"
 	"syscall"
 
-	"rib-control/cmd/mediasoup-demo/media"
-	"rib-control/pkg/discovery"
-	"rib-control/pkg/routing"
-	"rib-control/pkg/store"
-	"rib-control/pkg/types"
+	"github.com/jiyeyuran/omnistream/cmd/omnistream/media"
+	"github.com/jiyeyuran/omnistream/pkg/discovery"
+	"github.com/jiyeyuran/omnistream/pkg/routing"
+	"github.com/jiyeyuran/omnistream/pkg/store"
+	"github.com/jiyeyuran/omnistream/pkg/types"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"

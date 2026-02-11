@@ -7,8 +7,8 @@ import (
 	"log/slog"
 	"time"
 
-	"rib-control/pkg/store"
-	"rib-control/pkg/types"
+	"github.com/jiyeyuran/omnistream/pkg/store"
+	"github.com/jiyeyuran/omnistream/pkg/types"
 )
 
 const (

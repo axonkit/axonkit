@@ -3,7 +3,7 @@ package routing
 import (
 	"fmt"
 	"log/slog"
-	"rib-control/pkg/types"
+	"github.com/jiyeyuran/omnistream/pkg/types"
 	"sync"
 	"time"
 

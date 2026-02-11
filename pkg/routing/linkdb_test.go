@@ -2,7 +2,7 @@ package routing
 
 import (
 	"context"
-	"rib-control/pkg/types"
+	"github.com/jiyeyuran/omnistream/pkg/types"
 	"testing"
 	"time"
 

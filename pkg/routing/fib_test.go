@@ -3,8 +3,8 @@ package routing
 import (
 	"context"
 	"fmt"
-	"rib-control/pkg/store"
-	"rib-control/pkg/types"
+	"github.com/jiyeyuran/omnistream/pkg/store"
+	"github.com/jiyeyuran/omnistream/pkg/types"
 	"sync"
 	"testing"
 	"time"

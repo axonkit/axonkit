@@ -4,7 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"math/rand"
-	"rib-control/pkg/types"
+	"github.com/jiyeyuran/omnistream/pkg/types"
 	"sync"
 	"time"
 

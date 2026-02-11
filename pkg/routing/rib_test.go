@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"rib-control/pkg/store"
-	"rib-control/pkg/types"
+	"github.com/jiyeyuran/omnistream/pkg/store"
+	"github.com/jiyeyuran/omnistream/pkg/types"
 )
 
 func TestWatchDownstream_SelfExclusion(t *testing.T) {

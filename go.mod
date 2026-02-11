@@ -1,4 +1,4 @@
-module rib-control
+module github.com/jiyeyuran/omnistream
 
 go 1.25.6
 

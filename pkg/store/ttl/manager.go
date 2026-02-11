@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"rib-control/pkg/ds"
+	"github.com/jiyeyuran/omnistream/pkg/ds"
 )
 
 type Entry[K comparable, V any] struct {

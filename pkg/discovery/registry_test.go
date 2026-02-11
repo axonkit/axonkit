@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"rib-control/pkg/discovery"
-	"rib-control/pkg/store"
-	"rib-control/pkg/types"
+	"github.com/jiyeyuran/omnistream/pkg/discovery"
+	"github.com/jiyeyuran/omnistream/pkg/store"
+	"github.com/jiyeyuran/omnistream/pkg/types"
 
 	server "github.com/nats-io/nats-server/v2/server"
 	natsserver "github.com/nats-io/nats-server/v2/test"

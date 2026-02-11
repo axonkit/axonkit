@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"rib-control/pkg/ds"
-	"rib-control/pkg/store"
-	"rib-control/pkg/types"
+	"github.com/jiyeyuran/omnistream/pkg/ds"
+	"github.com/jiyeyuran/omnistream/pkg/store"
+	"github.com/jiyeyuran/omnistream/pkg/types"
 )
 
 const (

@@ -1,8 +1,8 @@
 package discovery
 
 import (
-	"rib-control/pkg/routing"
-	"rib-control/pkg/types"
+	"github.com/jiyeyuran/omnistream/pkg/routing"
+	"github.com/jiyeyuran/omnistream/pkg/types"
 	"sort"
 )
 

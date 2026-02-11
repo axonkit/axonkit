@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"rib-control/pkg/store/ttl"
+	"github.com/jiyeyuran/omnistream/pkg/store/ttl"
 
 	"github.com/nats-io/nats.go/jetstream"
 )

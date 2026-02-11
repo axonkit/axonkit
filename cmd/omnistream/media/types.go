@@ -1,7 +1,7 @@
 package media
 
 import (
-	"rib-control/pkg/types"
+	"github.com/jiyeyuran/omnistream/pkg/types"
 
 	"github.com/jiyeyuran/mediasoup-go/v2"
 )
