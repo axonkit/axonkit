@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"rib-control/pkg/store/ttl"
 )
 
 // MemoryStore implements an in-memory Store.
@@ -14,17 +16,25 @@ type MemoryStore struct {
 	data     map[string][]byte
 	watchers []*memoryWatcher
 	ttl      time.Duration
-	timers   map[string]*time.Timer
+	ttlMgr   *ttl.Manager[string, struct{}]
 }
 
 // NewMemoryStore creates a new in-memory store.
 // If ttl > 0, keys will be automatically deleted after ttl.
-func NewMemoryStore(ttl time.Duration) *MemoryStore {
-	return &MemoryStore{
-		data:   make(map[string][]byte),
-		ttl:    ttl,
-		timers: make(map[string]*time.Timer),
+func NewMemoryStore(ttlDuration time.Duration) *MemoryStore {
+	ms := &MemoryStore{
+		data: make(map[string][]byte),
+		ttl:  ttlDuration,
 	}
+
+	if ttlDuration > 0 {
+		ms.ttlMgr = ttl.NewManager(func(key string, _ struct{}) {
+			// Expired
+			ms.Delete(context.Background(), key)
+		})
+	}
+
+	return ms
 }
 
 // memoryEntry implements Entry
@@ -82,34 +92,7 @@ func (s *MemoryStore) Put(ctx context.Context, key string, value []byte) error {
 	copy(valCopy, value)
 	s.data[key] = valCopy
 
-	// Handle TTL
-	if s.ttl > 0 {
-		// Stop existing timer
-		if t, ok := s.timers[key]; ok {
-			t.Stop()
-		}
-
-		// Create a container for the timer so we can reference it in closure
-		type timerWrapper struct {
-			t *time.Timer
-		}
-		tw := &timerWrapper{}
-
-		tw.t = time.AfterFunc(s.ttl, func() {
-			s.mu.Lock()
-			defer s.mu.Unlock()
-
-			// Check if we are still the active timer
-			if active, ok := s.timers[key]; ok && active == tw.t {
-				delete(s.data, key)
-				delete(s.timers, key)
-				s.notify(key, nil, OpDelete)
-			}
-		})
-		s.timers[key] = tw.t
-	}
-
-	s.notify(key, valCopy, OpPut)
+	go s.notify(key, valCopy, OpPut)
 	return nil
 }
 
@@ -137,18 +120,12 @@ func (s *MemoryStore) Delete(ctx context.Context, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Stop existing timer
-	if t, ok := s.timers[key]; ok {
-		t.Stop()
-		delete(s.timers, key)
-	}
-
 	if _, ok := s.data[key]; !ok {
 		return nil // NATS Delete is idempotent-ish usually, or we can return error
 	}
 	delete(s.data, key)
 
-	s.notify(key, nil, OpDelete)
+	go s.notify(key, nil, OpDelete)
 	return nil
 }
 
@@ -182,19 +159,26 @@ func (s *MemoryStore) Watch(ctx context.Context, pattern string, opts ...WatchOp
 	s.watchers = append(s.watchers, w)
 
 	// Initial state (NATS watchers usually send current state)
-	// Iterate all data and match
-	for k, v := range s.data {
-		if matchSubject(pattern, k) {
-			// Send copy
-			valCopy := make([]byte, len(v))
-			copy(valCopy, v)
-			select {
-			case w.ch <- &memoryEntry{key: k, value: valCopy, op: OpPut}:
-			default:
-				// Drop if full? Or resize? 100 is generous for demo.
+	// Iterate all data and match asynchronously to avoid blocking
+	go func() {
+		s.mu.RLock()
+
+		for k, v := range s.data {
+			if matchSubject(pattern, k) {
+				// Send copy
+				valCopy := make([]byte, len(v))
+				copy(valCopy, v)
+
+				select {
+				case w.ch <- &memoryEntry{key: k, value: valCopy, op: OpPut}:
+				case <-w.stopCh:
+					s.mu.RUnlock()
+					return
+				}
 			}
 		}
-	}
+		s.mu.RUnlock()
+	}()
 
 	return w, nil
 }
@@ -204,10 +188,9 @@ func (s *MemoryStore) Close() error {
 	defer s.mu.Unlock()
 
 	// Stop all timers
-	for _, t := range s.timers {
-		t.Stop()
+	if s.ttlMgr != nil {
+		s.ttlMgr.Close()
 	}
-	s.timers = nil
 
 	// Stop all watchers
 	for _, w := range s.watchers {
@@ -225,6 +208,16 @@ func (s *MemoryStore) Close() error {
 
 // notify must be called with lock held
 func (s *MemoryStore) notify(key string, value []byte, op Operation) {
+	// Handle TTL globally (once per update)
+	if s.ttlMgr != nil {
+		switch op {
+		case OpPut:
+			s.ttlMgr.Add(key, struct{}{}, s.ttl)
+		case OpDelete:
+			s.ttlMgr.Remove(key)
+		}
+	}
+
 	for _, w := range s.watchers {
 		if w.opts.IgnoreDeletes && op == OpDelete {
 			continue
@@ -236,19 +229,9 @@ func (s *MemoryStore) notify(key string, value []byte, op Operation) {
 				value: value,
 				op:    op,
 			}
-			// Non-blocking send to avoid holding lock forever
 			select {
 			case w.ch <- e:
 			case <-w.stopCh:
-			default:
-				// If channel full, drop message? Or warn?
-				// For in-memory simple store, dropping is bad but blocking is worse.
-				// Ideally we should have a per-watcher goroutine queue.
-				// But for simplicity, we rely on buffer.
-				// In tests, buffer is usually enough.
-				// Let's print a warning if possible, but we don't have logger here easily.
-				// We'll just try with a timeout? No, can't sleep in lock.
-				// Just drop for now.
 			}
 		}
 	}

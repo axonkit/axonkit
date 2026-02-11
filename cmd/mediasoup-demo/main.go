@@ -33,7 +33,10 @@ func main() {
 	flag.Parse()
 
 	// Initialize structured logger
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	opts := &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, opts))
 	slog.SetDefault(logger)
 
 	myNode := types.NodeInfo{
@@ -229,8 +232,8 @@ func main() {
 
 	fib.Close()
 	rib.Close()
-	registry.Close()
 	mediaMgr.Close()
+	registry.Close()
 
 	slog.Info("Bye!")
 }

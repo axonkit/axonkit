@@ -10,7 +10,16 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-const LingerDuration = 10 * time.Second
+const (
+	// DefaultLingerDuration is the default time a pipe is kept alive after refcount drops to 0
+	DefaultLingerDuration = 10 * time.Second
+
+	// DefaultOptimizationInterval is the default interval for checking route optimization
+	DefaultOptimizationInterval = 5 * time.Minute
+
+	// DefaultOptimizationThreshold is the default cost improvement threshold to trigger switch
+	DefaultOptimizationThreshold = 10
+)
 
 // FIB (Forwarding Information Base) manages local active connections
 type FIB struct {
@@ -35,21 +44,53 @@ type FIB struct {
 	EnableRouteOptimization bool
 	OptimizationInterval    time.Duration
 	OptimizationThreshold   int // Cost improvement threshold to trigger switch
+	LingerDuration          time.Duration
 
 	logger *slog.Logger
 }
 
-func NewFIB(rib *RIB, localNodeID types.NodeID) *FIB {
-	return &FIB{
+type FIBOption func(*FIB)
+
+func WithRouteOptimization(enabled bool, interval time.Duration, threshold int) FIBOption {
+	return func(f *FIB) {
+		f.EnableRouteOptimization = enabled
+		f.OptimizationInterval = interval
+		f.OptimizationThreshold = threshold
+	}
+}
+
+func WithLingerDuration(d time.Duration) FIBOption {
+	return func(f *FIB) {
+		f.LingerDuration = d
+	}
+}
+
+func WithLogger(logger *slog.Logger) FIBOption {
+	return func(f *FIB) {
+		f.logger = logger
+	}
+}
+
+func NewFIB(rib *RIB, localNodeID types.NodeID, opts ...FIBOption) *FIB {
+	f := &FIB{
 		entries:                 make(map[types.StreamID]*types.FIBEntry),
 		rib:                     rib,
 		localNodeID:             localNodeID,
 		watchers:                make(map[types.StreamID]func()),
-		EnableRouteOptimization: false,           // Default disabled, enable via feature flag
-		OptimizationInterval:    5 * time.Minute, // Slow convergence
-		OptimizationThreshold:   10,              // Hysteresis
-		logger:                  slog.Default().With("component", "FIB"),
+		EnableRouteOptimization: false,                        // Default disabled, enable via feature flag
+		OptimizationInterval:    DefaultOptimizationInterval,  // Slow convergence
+		OptimizationThreshold:   DefaultOptimizationThreshold, // Hysteresis
+		LingerDuration:          DefaultLingerDuration,
+		logger:                  slog.Default(),
 	}
+
+	for _, opt := range opts {
+		opt(f)
+	}
+
+	f.logger = f.logger.With("component", "FIB")
+
+	return f
 }
 
 // Subscribe increments ref count and establishes connection if needed
@@ -230,10 +271,7 @@ func (f *FIB) monitorUpstream(streamID types.StreamID, currentUpstream types.Nod
 
 				if !hasAlternatives {
 					f.logger.Info("No alternatives found, tearing down", "stream_id", streamID)
-					if err := f.rib.StopAdvertise(streamID); err != nil {
-						f.logger.Error("Failed to stop advertise", "stream_id", streamID, "error", err)
-					}
-					f.teardownUpstream(streamID, currentUpstream)
+					go f.teardownUpstream(streamID, currentUpstream)
 					return
 				}
 
@@ -275,6 +313,11 @@ func (f *FIB) handleFailover(streamID types.StreamID, failedUpstream types.NodeI
 		f.mu.Unlock()
 		return
 	}
+
+	// Disconnect old pipe
+	if f.DisconnectPipe != nil {
+		f.DisconnectPipe(streamID, entry.PipeID, entry.UpstreamNode)
+	}
 	f.mu.Unlock()
 
 	f.logger.Info("Attempting to reroute stream", "stream_id", streamID)
@@ -307,10 +350,6 @@ func (f *FIB) handleFailover(streamID types.StreamID, failedUpstream types.NodeI
 	if err != nil {
 		f.logger.Error("Reroute failed", "stream_id", streamID, "error", err)
 
-		// Force stop advertising
-		f.rib.StopAdvertise(streamID)
-
-		// Disconnect broken pipe
 		f.teardownUpstream(streamID, failedUpstream)
 		return
 	}
@@ -325,11 +364,6 @@ func (f *FIB) handleFailover(streamID types.StreamID, failedUpstream types.NodeI
 		// Only update if we haven't already switched to this node
 		if entry.UpstreamNode != newRoute.Node {
 			f.logger.Info("Reroute successful", "from", failedUpstream, "to", newRoute.Node)
-
-			// Disconnect old pipe
-			if f.DisconnectPipe != nil {
-				f.DisconnectPipe(streamID, entry.PipeID, entry.UpstreamNode)
-			}
 
 			entry.UpstreamNode = newRoute.Node
 			entry.UpstreamIsOrigin = newRoute.IsOrigin
@@ -361,12 +395,7 @@ func (f *FIB) teardownUpstream(streamID types.StreamID, expectedUpstream types.N
 	defer f.mu.Unlock()
 
 	if ent, ok := f.entries[streamID]; ok && ent.UpstreamNode == expectedUpstream {
-		if f.DisconnectPipe != nil {
-			f.DisconnectPipe(streamID, ent.PipeID, ent.UpstreamNode)
-		}
-		// Clear state to avoid duplicate disconnects
-		ent.UpstreamNode = ""
-		ent.PipeID = ""
+		f.teardownLocked(streamID)
 	}
 }
 
@@ -409,9 +438,9 @@ func (f *FIB) scheduleTeardown(streamID types.StreamID) {
 	}
 
 	entry.State = "lingering"
-	f.logger.Info("Stream entered lingering state", "stream_id", streamID, "duration", LingerDuration)
+	f.logger.Info("Stream entered lingering state", "stream_id", streamID, "duration", f.LingerDuration)
 
-	entry.TeardownTimer = time.AfterFunc(LingerDuration, func() {
+	entry.TeardownTimer = time.AfterFunc(f.LingerDuration, func() {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 

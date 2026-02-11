@@ -161,15 +161,25 @@ func (r *RIB) dispatchUpdate(sw *streamWatcher, entry store.Entry) {
 	}
 
 	sw.mu.RLock()
-	defer sw.mu.RUnlock()
+	// Copy callbacks to avoid holding lock during execution (prevents deadlocks)
+	subs := make([]func(types.RouteKVValue, bool), 0, len(sw.subscribers))
+	for _, cb := range sw.subscribers {
+		subs = append(subs, cb)
+	}
+
+	dss := make([]func(types.NodeID, bool), 0, len(sw.downstreams))
+	for _, cb := range sw.downstreams {
+		dss = append(dss, cb)
+	}
+	sw.mu.RUnlock()
 
 	// 1. Notify Subscribers
-	for _, cb := range sw.subscribers {
+	for _, cb := range subs {
 		cb(val, isDelete)
 	}
 
 	// 2. Notify Downstreams
-	for _, cb := range sw.downstreams {
+	for _, cb := range dss {
 		// Ignore updates about ourselves
 		if val.Node == r.local.ID {
 			continue

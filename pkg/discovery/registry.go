@@ -132,13 +132,7 @@ func (r *Registry) WatchNodes(cb func(nodeID types.NodeID, isDelete bool)) error
 						}
 					}
 
-					// Clone to ensure we own the data
-					// Although in most cases string(newValue) would also allocate
-					// bytes.Clone is cleaner if available (Go 1.20+)
-					// Or manual copy
-					cloned := make([]byte, len(newValue))
-					copy(cloned, newValue)
-					lastSeen[nodeID] = cloned
+					lastSeen[nodeID] = newValue
 
 					cb(nodeID, false)
 				}

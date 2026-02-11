@@ -214,9 +214,6 @@ func TestNatsStore_TTL(t *testing.T) {
 	}
 
 	// 6. Verify Watch receives Delete (due to TTL)
-	// Note: In some test environments (embedded nats-server), TTL expiration might not
-	// reliably trigger a Watcher event within the timeout, even though the key is gone.
-	// We log it but don't fail the test to avoid flakiness if this is an env issue.
 	select {
 	case e := <-w.Updates():
 		if e == nil {
@@ -228,6 +225,6 @@ func TestNatsStore_TTL(t *testing.T) {
 		}
 		t.Logf("Received TTL expiration event for key %s", key)
 	case <-time.After(2 * time.Second): // Reduced timeout
-		t.Log("Timeout waiting for Delete event (TTL) - skipping strict check")
+		t.Error("Timeout waiting for Delete event (TTL) - skipping strict check")
 	}
 }

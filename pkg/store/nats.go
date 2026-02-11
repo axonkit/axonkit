@@ -2,28 +2,87 @@ package store
 
 import (
 	"context"
+	"log/slog"
+	"sync"
 	"time"
+
+	"rib-control/pkg/store/ttl"
 
 	"github.com/nats-io/nats.go/jetstream"
 )
 
 type NatsStore struct {
-	kv jetstream.KeyValue
+	kv       jetstream.KeyValue
+	ttl      time.Duration
+	bucket   string
+	logger   *slog.Logger
+	ttlMgr   *ttl.Manager[string, uint64]
+	watchers []*natsWatcher
+	mu       sync.RWMutex
 }
 
 // NewNatsStore creates a new NATS-backed KV store.
 // It ensures the bucket exists with the given configuration.
-func NewNatsStore(ctx context.Context, js jetstream.JetStream, bucket string, ttl time.Duration) (*NatsStore, error) {
+func NewNatsStore(ctx context.Context, js jetstream.JetStream, bucket string, ttlDuration time.Duration) (*NatsStore, error) {
 	kv, err := js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
 		Bucket:      bucket,
 		Description: "Routing Information Base",
-		TTL:         ttl,
+		TTL:         ttlDuration,
 		History:     1,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &NatsStore{kv: kv}, nil
+
+	s := &NatsStore{
+		kv:     kv,
+		ttl:    ttlDuration,
+		bucket: bucket,
+		logger: slog.Default().With("component", "NatsStore", "bucket", bucket),
+	}
+
+	if ttlDuration > 0 {
+		// Use local TTL Manager
+		s.ttlMgr = ttl.NewManager(func(key string, rev uint64) {
+			// Check if key still exists
+			if _, err := kv.Get(context.Background(), key); err == nil {
+				return
+			}
+			s.logger.Info("Expired key", "key", key, "rev", rev)
+
+			// Notify local watchers
+			s.mu.RLock()
+			defer s.mu.RUnlock()
+
+			for _, w := range s.watchers {
+				if matchSubject(w.pattern, key) {
+					// Create local delete event
+					e := &localEntry{
+						key: key,
+						op:  OpDelete,
+					}
+
+					// Attempt to send, but don't block forever
+					// Note: nw.ch is unbuffered usually?
+					// In Watch(), we created it with make(chan Entry). Unbuffered.
+					// If the consumer is slow, we might block here.
+					// But we hold RLock, so we block other operations?
+					// Ideally we should use select with default or timeout.
+					// But if we drop, the watcher misses the expiration.
+
+					// Let's use a non-blocking send to be safe against deadlocks/blocking,
+					// assuming watchers are consuming.
+					select {
+					case w.ch <- e:
+					case <-time.After(100 * time.Millisecond):
+						s.logger.Warn("Failed to notify watcher of expiration (timeout)", "key", key)
+					}
+				}
+			}
+		})
+	}
+
+	return s, nil
 }
 
 func (s *NatsStore) Put(ctx context.Context, key string, value []byte) error {
@@ -56,16 +115,43 @@ func (s *NatsStore) Watch(ctx context.Context, pattern string, opts ...WatchOpti
 	}
 
 	nw := &natsWatcher{
-		w:  w,
-		ch: make(chan Entry),
+		w:       w,
+		ch:      make(chan Entry, 100),
+		pattern: pattern,
 	}
 
+	s.mu.Lock()
+	s.watchers = append(s.watchers, nw)
+	s.mu.Unlock()
+
 	go func() {
-		defer close(nw.ch)
+		defer func() {
+			s.mu.Lock()
+			for i, w := range s.watchers {
+				if w == nw {
+					s.watchers = append(s.watchers[:i], s.watchers[i+1:]...)
+					break
+				}
+			}
+			s.mu.Unlock()
+
+			close(nw.ch)
+		}()
 		for e := range w.Updates() {
 			if e == nil {
 				continue
 			}
+
+			// Handle TTL for externally watched keys
+			if s.ttlMgr != nil {
+				switch e.Operation() {
+				case jetstream.KeyValuePut:
+					s.ttlMgr.Add(e.Key(), e.Revision(), s.ttl)
+				case jetstream.KeyValueDelete, jetstream.KeyValuePurge:
+					s.ttlMgr.Remove(e.Key())
+				}
+			}
+
 			nw.ch <- &natsEntry{e}
 		}
 	}()
@@ -88,6 +174,15 @@ func (s *NatsStore) Keys(ctx context.Context, pattern string) ([]string, error) 
 }
 
 func (s *NatsStore) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Stop all watchers
+	for _, w := range s.watchers {
+		w.w.Stop()
+	}
+	s.watchers = nil
+
 	return nil
 }
 
@@ -111,8 +206,9 @@ func (n *natsEntry) Operation() Operation {
 
 // natsWatcher implements Watcher
 type natsWatcher struct {
-	w  jetstream.KeyWatcher
-	ch chan Entry
+	w       jetstream.KeyWatcher
+	ch      chan Entry
+	pattern string
 }
 
 func (nw *natsWatcher) Updates() <-chan Entry {
@@ -122,3 +218,14 @@ func (nw *natsWatcher) Updates() <-chan Entry {
 func (nw *natsWatcher) Stop() {
 	nw.w.Stop()
 }
+
+// localEntry implements Entry for locally generated events (like TTL expiration)
+type localEntry struct {
+	key   string
+	value []byte
+	op    Operation
+}
+
+func (e *localEntry) Key() string          { return e.key }
+func (e *localEntry) Value() []byte        { return e.value }
+func (e *localEntry) Operation() Operation { return e.op }
