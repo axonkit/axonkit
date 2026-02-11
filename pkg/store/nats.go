@@ -46,6 +46,7 @@ func NewNatsStore(ctx context.Context, js jetstream.JetStream, bucket string, tt
 		s.ttlMgr = ttl.NewManager(func(key string, rev uint64) {
 			// Check if key still exists
 			if _, err := kv.Get(context.Background(), key); err == nil {
+				s.logger.Warn("Key still exists, ignore expiration", "key", key, "rev", rev)
 				return
 			}
 			s.logger.Info("Expired key", "key", key, "rev", rev)
@@ -146,7 +147,7 @@ func (s *NatsStore) Watch(ctx context.Context, pattern string, opts ...WatchOpti
 			if s.ttlMgr != nil {
 				switch e.Operation() {
 				case jetstream.KeyValuePut:
-					s.ttlMgr.Add(e.Key(), e.Revision(), s.ttl)
+					s.ttlMgr.Add(e.Key(), e.Revision(), s.ttl+time.Second)
 				case jetstream.KeyValueDelete, jetstream.KeyValuePurge:
 					s.ttlMgr.Remove(e.Key())
 				}
