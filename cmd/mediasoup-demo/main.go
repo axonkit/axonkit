@@ -81,7 +81,7 @@ func main() {
 		slog.Info("Configured LinkDB: US-A -> CN (200ms)")
 	}
 
-	finder := discovery.NewFinder(rib, linkDB, myNode.ID)
+	finder := discovery.NewFinder(rib, linkDB, myNode)
 	fib := routing.NewFIB(rib, myNode.ID)
 
 	// 3. Init Media Manager

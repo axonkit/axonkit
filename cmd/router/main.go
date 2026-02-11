@@ -68,7 +68,7 @@ func main() {
 	rib := routing.NewRIB(kv, myNode)
 
 	linkDB := routing.NewLinkDB()
-	finder := discovery.NewFinder(rib, linkDB, myNode.ID)
+	finder := discovery.NewFinder(rib, linkDB, myNode)
 	fib := routing.NewFIB(rib, myNode.ID)
 
 	// Mock Pipe Callbacks

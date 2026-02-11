@@ -7,16 +7,16 @@ import (
 )
 
 type Finder struct {
-	rib         *routing.RIB
-	linkDB      *routing.LinkDB
-	localNodeID types.NodeID
+	rib       *routing.RIB
+	linkDB    *routing.LinkDB
+	localNode types.NodeInfo
 }
 
-func NewFinder(rib *routing.RIB, linkDB *routing.LinkDB, localNodeID types.NodeID) *Finder {
+func NewFinder(rib *routing.RIB, linkDB *routing.LinkDB, localNode types.NodeInfo) *Finder {
 	return &Finder{
-		rib:         rib,
-		linkDB:      linkDB,
-		localNodeID: localNodeID,
+		rib:       rib,
+		linkDB:    linkDB,
+		localNode: localNode,
 	}
 }
 
@@ -42,7 +42,7 @@ func (f *Finder) FindPath(streamID types.StreamID) (*types.RouteKVValue, error) 
 		// 1. Loop detection
 		hasLoop := false
 		for _, node := range c.PathVector {
-			if node == f.localNodeID {
+			if node == f.localNode.ID {
 				hasLoop = true
 				break
 			}
@@ -86,7 +86,25 @@ func (f *Finder) FindPath(streamID types.StreamID) (*types.RouteKVValue, error) 
 
 	// Sort by score (ascending)
 	sort.Slice(scored, func(i, j int) bool {
-		return scored[i].Score < scored[j].Score
+		a := scored[i]
+		b := scored[j]
+
+		// 1. Same Cluster Priority
+		aInCluster := a.Candidate.Cluster == f.localNode.Cluster
+		bInCluster := b.Candidate.Cluster == f.localNode.Cluster
+		if aInCluster != bInCluster {
+			return aInCluster
+		}
+
+		// 2. Same Region Priority
+		aInRegion := a.Candidate.Region == f.localNode.Region
+		bInRegion := b.Candidate.Region == f.localNode.Region
+		if aInRegion != bInRegion {
+			return aInRegion
+		}
+
+		// 3. Score (Lower is better)
+		return a.Score < b.Score
 	})
 
 	return &scored[0].Candidate, nil
