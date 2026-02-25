@@ -67,7 +67,7 @@ func main() {
 
 	rib := routing.NewRIB(kv, myNode)
 
-	linkDB := routing.NewLinkDB(nc, myNode)
+	linkDB := routing.NewLinkDB(myNode)
 	finder := discovery.NewFinder(rib, linkDB, myNode)
 	fib := routing.NewFIB(rib, myNode.ID)
 

@@ -69,7 +69,7 @@ func main() {
 	}
 	rib := routing.NewRIB(kv, myNode)
 
-	linkDB := routing.NewLinkDB(nc, myNode)
+	linkDB := routing.NewLinkDB(myNode)
 	// Demo Setup: Pre-populate LinkDB
 	// Note: We use ClusterID for LinkDB now
 	switch *clusterID {
@@ -100,6 +100,7 @@ func main() {
 		slog.Error("Failed to start MediaManager", "error", err)
 		os.Exit(1)
 	}
+	linkDB.SetRTTProvider(mediaMgr.ProbeRTT)
 
 	// Wire FIB to Media Manager
 	fib.ConnectPipe = mediaMgr.ConnectPipe
@@ -142,22 +143,17 @@ func main() {
 
 	// 5. HTTP API
 	http.HandleFunc("/publish", func(w http.ResponseWriter, r *http.Request) {
-		streamID := r.URL.Query().Get("stream")
-		if streamID == "" {
-			http.Error(w, "missing stream", 400)
-			return
-		}
-
 		// 1. Create Producer on MediaRouter
-		if err := mediaMgr.Publish(types.StreamID(streamID)); err != nil {
+		streamID, err := mediaMgr.Publish()
+		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
 
 		// 2. Advertise to RIB
 		// Origin advertising (Cost 0)
-		err := rib.StartAdvertise(routing.AdvertiseOptions{
-			StreamID:    types.StreamID(streamID),
+		err = rib.StartAdvertise(routing.AdvertiseOptions{
+			StreamID:    streamID,
 			BaseCost:    0,
 			PathVector:  []types.NodeID{myNode.ID},
 			RttToOrigin: 0,

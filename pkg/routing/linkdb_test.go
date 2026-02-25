@@ -2,51 +2,18 @@ package routing
 
 import (
 	"context"
-	"github.com/jiyeyuran/omnistream/pkg/types"
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats-server/v2/server"
-	natsserver "github.com/nats-io/nats-server/v2/test"
-	"github.com/nats-io/nats.go"
+	"github.com/jiyeyuran/omnistream/pkg/types"
 )
 
-func setupNATS(t *testing.T) *server.Server {
-	t.Helper()
-	opts := natsserver.DefaultTestOptions
-	opts.Port = -1
-	opts.JetStream = true
-	opts.StoreDir = t.TempDir()
-	srv := natsserver.RunServer(&opts)
-	return srv
-}
-
 func TestLinkDB_Probing(t *testing.T) {
-	// 1. Setup NATS Server
-	srv := setupNATS(t)
-	defer srv.Shutdown()
-
-	// 2. Setup Client A (Local Node)
-	ncA, err := nats.Connect(srv.ClientURL())
-	if err != nil {
-		t.Fatalf("Connect failed: %v", err)
-	}
-	defer ncA.Close()
-
 	localNode := types.NodeInfo{
 		ID:      "node-a",
 		Region:  "region-1",
 		Cluster: "cluster-1",
 	}
-
-	linkDB := NewLinkDB(ncA, localNode, WithProbeInterval(500*time.Millisecond))
-
-	// 3. Setup Client B (Remote Node in different cluster)
-	ncB, err := nats.Connect(srv.ClientURL())
-	if err != nil {
-		t.Fatalf("Connect failed: %v", err)
-	}
-	defer ncB.Close()
 
 	remoteNode := types.NodeInfo{
 		ID:      "node-b",
@@ -54,11 +21,19 @@ func TestLinkDB_Probing(t *testing.T) {
 		Cluster: "cluster-2",
 	}
 
-	// Create LinkDB for Remote Node (to auto-start Ping Handler)
-	linkDB_Remote := NewLinkDB(ncB, remoteNode)
-	ctxB, cancelB := context.WithCancel(context.Background())
-	defer cancelB()
-	linkDB_Remote.StartProbing(ctxB)
+	probeCalled := make(chan struct{}, 1)
+	rttProvider := func(nodeID types.NodeID) (int64, bool) {
+		if nodeID != remoteNode.ID {
+			return 0, false
+		}
+		select {
+		case probeCalled <- struct{}{}:
+		default:
+		}
+		return 25, true
+	}
+
+	linkDB := NewLinkDB(localNode, WithProbeInterval(200*time.Millisecond), WithRTTProvider(rttProvider))
 
 	// 5. Add Remote Node to LinkDB
 	linkDB.AddNode(remoteNode)
@@ -68,8 +43,12 @@ func TestLinkDB_Probing(t *testing.T) {
 	defer cancel()
 	linkDB.StartProbing(ctx)
 
-	// 7. Wait for probe to happen (ticker 500ms)
-	time.Sleep(1 * time.Second)
+	// 7. Wait for probe to happen
+	select {
+	case <-probeCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Probe did not happen")
+	}
 
 	// 8. Verify Stats Updated
 	stats := linkDB.GetLink(remoteNode.Cluster, "")
@@ -85,7 +64,7 @@ func TestLinkDB_Probing(t *testing.T) {
 }
 
 func TestLinkDB_Fallback(t *testing.T) {
-	db := NewLinkDB(nil, types.NodeInfo{})
+	db := NewLinkDB(types.NodeInfo{})
 
 	cluster := types.ClusterID("cluster-1")
 	region := types.RegionID("region-1")

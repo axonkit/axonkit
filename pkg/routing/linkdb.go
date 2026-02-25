@@ -4,11 +4,10 @@ import (
 	"context"
 	"log/slog"
 	"math/rand"
-	"github.com/jiyeyuran/omnistream/pkg/types"
 	"sync"
 	"time"
 
-	"github.com/nats-io/nats.go"
+	"github.com/jiyeyuran/omnistream/pkg/types"
 )
 
 // LinkDB stores local perspective of link quality to other clusters and regions
@@ -17,16 +16,17 @@ type LinkDB struct {
 	regionStats  map[types.RegionID]types.LinkStats
 	mu           sync.RWMutex
 
-	// Probing
-	nc            *nats.Conn
 	localNode     types.NodeInfo
 	clusterNodes  map[types.ClusterID][]types.NodeID
 	nodesMu       sync.RWMutex
 	logger        *slog.Logger
 	probeInterval time.Duration
+	rttProvider   RTTProvider
 }
 
 type LinkDBOption func(*LinkDB)
+
+type RTTProvider func(nodeID types.NodeID) (int64, bool)
 
 func WithProbeInterval(d time.Duration) LinkDBOption {
 	return func(db *LinkDB) {
@@ -34,11 +34,16 @@ func WithProbeInterval(d time.Duration) LinkDBOption {
 	}
 }
 
-func NewLinkDB(nc *nats.Conn, localNode types.NodeInfo, opts ...LinkDBOption) *LinkDB {
+func WithRTTProvider(provider RTTProvider) LinkDBOption {
+	return func(db *LinkDB) {
+		db.rttProvider = provider
+	}
+}
+
+func NewLinkDB(localNode types.NodeInfo, opts ...LinkDBOption) *LinkDB {
 	db := &LinkDB{
 		clusterStats:  make(map[types.ClusterID]types.LinkStats),
 		regionStats:   make(map[types.RegionID]types.LinkStats),
-		nc:            nc,
 		localNode:     localNode,
 		clusterNodes:  make(map[types.ClusterID][]types.NodeID),
 		logger:        slog.Default().With("component", "LinkDB"),
@@ -50,6 +55,10 @@ func NewLinkDB(nc *nats.Conn, localNode types.NodeInfo, opts ...LinkDBOption) *L
 	}
 
 	return db
+}
+
+func (db *LinkDB) SetRTTProvider(provider RTTProvider) {
+	db.rttProvider = provider
 }
 
 // UpdateClusterLink updates stats for a cluster
@@ -138,19 +147,6 @@ func (db *LinkDB) RemoveNode(nodeID types.NodeID) {
 
 // StartProbing starts the background probing loop
 func (db *LinkDB) StartProbing(ctx context.Context) {
-	// Start Ping Handler
-	sub, err := db.nc.Subscribe("probe.ping."+string(db.localNode.ID), func(msg *nats.Msg) {
-		msg.Respond([]byte("pong"))
-	})
-	if err != nil {
-		db.logger.Error("Failed to subscribe to ping", "error", err)
-	} else {
-		db.logger.Info("Started Ping Handler", "subject", sub.Subject)
-		// Cleanup subscription on context done?
-		// NATS client handles cleanup on close, or we can track it.
-		// For simplicity, we leave it.
-	}
-
 	go func() {
 		// Probe immediately on start
 		db.probeAllClusters()
@@ -183,6 +179,10 @@ func (db *LinkDB) probeAllClusters() {
 }
 
 func (db *LinkDB) probeCluster(cluster types.ClusterID) {
+	if db.rttProvider == nil {
+		return
+	}
+
 	// Pick random node
 	db.nodesMu.RLock()
 	nodes := db.clusterNodes[cluster]
@@ -193,10 +193,8 @@ func (db *LinkDB) probeCluster(cluster types.ClusterID) {
 	target := nodes[rand.Intn(len(nodes))]
 	db.nodesMu.RUnlock()
 
-	// Ping
-	rtt, err := db.pingNode(target)
-	if err != nil {
-		db.logger.Debug("Probe failed", "target", target, "error", err)
+	rtt, ok := db.rttProvider(target)
+	if !ok {
 		return
 	}
 
@@ -210,16 +208,4 @@ func (db *LinkDB) probeCluster(cluster types.ClusterID) {
 
 	db.UpdateClusterLink(cluster, newRTT, 0, oldStats.CostFactor)
 	db.logger.Debug("Probed cluster", "cluster", cluster, "target", target, "rtt", rtt, "avg_rtt", newRTT)
-}
-
-func (db *LinkDB) pingNode(nodeID types.NodeID) (int64, error) {
-	start := time.Now()
-	msg, err := db.nc.Request("probe.ping."+string(nodeID), nil, 1*time.Second)
-	if err != nil {
-		return 0, err
-	}
-	if string(msg.Data) != "pong" {
-		return 0, context.DeadlineExceeded
-	}
-	return time.Since(start).Milliseconds(), nil
 }

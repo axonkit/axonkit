@@ -1,8 +1,32 @@
 package types
 
-import "time"
+import (
+	"strings"
+	"time"
+
+	"github.com/jiyeyuran/mediasoup-go/v2"
+)
 
 type StreamID string
+
+func NewStreamID(routerId string, producerId string) StreamID {
+	return StreamID(routerId + "." + producerId)
+}
+
+func (s StreamID) IsDataProducer() bool {
+	return strings.HasPrefix(s.ProducerID(), mediasoup.DataProducerIDPrefix)
+}
+
+func (s StreamID) RouterID() string {
+	parts := strings.Split(string(s), ".")
+	return parts[0]
+}
+
+func (s StreamID) ProducerID() string {
+	parts := strings.Split(string(s), ".")
+	return parts[len(parts)-1]
+}
+
 type NodeID string
 type RegionID string
 type ClusterID string
