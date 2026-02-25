@@ -844,6 +844,39 @@ func (m *Manager) request(node types.NodeID, req PipeRequest) (*PipeResponse, er
 	return &resp, nil
 }
 
+func (m *Manager) notifyPipeProducerState(remoteNode types.NodeID, streamID types.StreamID, pipeConsumerId string, paused bool) {
+	command := "ResumePipeProducer"
+	if paused {
+		command = "PausePipeProducer"
+	}
+	_, err := m.request(remoteNode, PipeRequest{
+		Command:        command,
+		StreamID:       streamID,
+		PipeConsumerId: pipeConsumerId,
+	})
+	if err != nil {
+		m.logger.Error("Notify pipe producer state failed", "error", err, "remote_node", remoteNode, "stream_id", streamID, "paused", paused)
+	}
+}
+
+func (m *Manager) notifyPipeClose(remoteNode types.NodeID, streamID types.StreamID, pipeConsumerId string) {
+	req := PipeRequest{
+		Command:        "ClosePipe",
+		StreamID:       streamID,
+		RequesterNode:  m.nodeID,
+		PipeConsumerId: pipeConsumerId,
+	}
+	go func() {
+		if _, err := m.request(remoteNode, req); err != nil {
+			if errors.Is(err, nats.ErrNoResponders) {
+				m.logger.Info("ClosePipe signaling skipped (node offline)", "upstream", remoteNode)
+			} else {
+				m.logger.Warn("Failed to send ClosePipe signaling", "upstream", remoteNode, "error", err)
+			}
+		}
+	}()
+}
+
 func (m *Manager) handleEstablishPipe(req PipeRequest) PipeResponse {
 	resp := PipeResponse{}
 
@@ -895,6 +928,15 @@ func (m *Manager) handleEstablishPipe(req PipeRequest) PipeResponse {
 			StreamID:   req.StreamID,
 		}
 		m.servingDataMu.Unlock()
+		dataConsumer.OnClose(func(ctx context.Context) {
+			m.notifyPipeClose(req.RequesterNode, req.StreamID, dataConsumer.Id())
+		})
+		dataConsumer.OnPause(func(ctx context.Context) {
+			m.notifyPipeProducerState(req.RequesterNode, req.StreamID, dataConsumer.Id(), true)
+		})
+		dataConsumer.OnResume(func(ctx context.Context) {
+			m.notifyPipeProducerState(req.RequesterNode, req.StreamID, dataConsumer.Id(), false)
+		})
 	} else {
 		if lp.Producer == nil {
 			resp.Error = "Producer not found"
@@ -916,6 +958,15 @@ func (m *Manager) handleEstablishPipe(req PipeRequest) PipeResponse {
 			StreamID:   req.StreamID,
 		}
 		m.servingMu.Unlock()
+		consumer.OnClose(func(ctx context.Context) {
+			m.notifyPipeClose(req.RequesterNode, req.StreamID, consumer.Id())
+		})
+		consumer.OnPause(func(ctx context.Context) {
+			m.notifyPipeProducerState(req.RequesterNode, req.StreamID, consumer.Id(), true)
+		})
+		consumer.OnResume(func(ctx context.Context) {
+			m.notifyPipeProducerState(req.RequesterNode, req.StreamID, consumer.Id(), false)
+		})
 	}
 
 	if consumer != nil {
@@ -1011,6 +1062,47 @@ func (m *Manager) handleClosePipe(req PipeRequest) {
 	m.servingDataMu.Unlock()
 }
 
+func (m *Manager) handlePipeProducerState(req PipeRequest, paused bool) PipeResponse {
+	resp := PipeResponse{}
+	m.producersMu.RLock()
+	lp, ok := m.producers[req.StreamID]
+	m.producersMu.RUnlock()
+	if !ok {
+		resp.Error = "Stream not found"
+		return resp
+	}
+	if req.PipeConsumerId != "" && lp.UpstreamConsumerId != "" && lp.UpstreamConsumerId != req.PipeConsumerId {
+		resp.Error = "Pipe consumer mismatch"
+		return resp
+	}
+	var err error
+	if req.StreamID.IsDataProducer() {
+		if lp.DataProducer == nil {
+			resp.Error = "DataProducer not found"
+			return resp
+		}
+		if paused {
+			err = lp.DataProducer.Pause()
+		} else {
+			err = lp.DataProducer.Resume()
+		}
+	} else {
+		if lp.Producer == nil {
+			resp.Error = "Producer not found"
+			return resp
+		}
+		if paused {
+			err = lp.Producer.Pause()
+		} else {
+			err = lp.Producer.Resume()
+		}
+	}
+	if err != nil {
+		resp.Error = err.Error()
+	}
+	return resp
+}
+
 func (m *Manager) handleSignaling(msg *nats.Msg) {
 	var req PipeRequest
 	json.Unmarshal(msg.Data, &req)
@@ -1025,6 +1117,12 @@ func (m *Manager) handleSignaling(msg *nats.Msg) {
 
 	case "ClosePipe":
 		m.handleClosePipe(req)
+
+	case "PausePipeProducer":
+		resp = m.handlePipeProducerState(req, true)
+
+	case "ResumePipeProducer":
+		resp = m.handlePipeProducerState(req, false)
 	}
 
 	data, _ := json.Marshal(resp)
@@ -1175,25 +1273,6 @@ func (m *Manager) DisconnectPipe(streamID types.StreamID, pipeID string, upstrea
 		m.logger.Info("Disconnected pipe", "stream_id", streamID, "pipe_id", pipeID)
 	}
 
-	// Signaling Remote
-	if upstreamNode != m.nodeID {
-		req := PipeRequest{
-			Command:        "ClosePipe",
-			StreamID:       streamID,
-			RequesterNode:  m.nodeID,
-			PipeConsumerId: pipeID,
-		}
-		// Send async to avoid blocking lock/caller
-		go func() {
-			if _, err := m.request(upstreamNode, req); err != nil {
-				if errors.Is(err, nats.ErrNoResponders) {
-					m.logger.Info("ClosePipe signaling skipped (node offline)", "upstream", upstreamNode)
-				} else {
-					m.logger.Warn("Failed to send ClosePipe signaling", "upstream", upstreamNode, "error", err)
-				}
-			}
-		}()
-	}
 	return nil
 }
 
