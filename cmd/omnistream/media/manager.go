@@ -99,6 +99,7 @@ type LocalProducer struct {
 
 type PingChannel struct {
 	remoteNode   types.NodeID
+	routerId     string
 	producer     *mediasoup.DataProducer
 	consumer     *mediasoup.DataConsumer
 	pipeProducer *mediasoup.DataProducer
@@ -238,7 +239,7 @@ func (m *Manager) launchWorker(index int) error {
 			return
 		}
 		m.logger.Error("Worker died, cleaning up and restarting...", "index", index, "pid", worker.Pid())
-		m.cleanupWorkerResources(router)
+		m.cleanupWorkerResources(router.Id())
 		go m.restartWorker(index)
 	})
 
@@ -579,6 +580,7 @@ func (m *Manager) ensurePingChannelOnPipe(remoteNode types.NodeID, router *media
 			return nil, err
 		}
 		ch.producer = producer
+		ch.routerId = router.Id()
 	}
 	if ch.pipeConsumer == nil {
 		pipeConsumer, err := pipe.ConsumeData(&mediasoup.DataConsumerOptions{
@@ -1215,8 +1217,7 @@ func (m *Manager) Unsubscribe(clientID string, streamID types.StreamID) error {
 	return nil
 }
 
-func (m *Manager) cleanupWorkerResources(deadRouter *mediasoup.Router) {
-	deadRouterID := deadRouter.Id()
+func (m *Manager) cleanupWorkerResources(deadRouterID string) {
 	m.logger.Info("Cleaning up worker resources", "router_id", deadRouterID)
 
 	// 1. Clean Producers
@@ -1242,6 +1243,29 @@ func (m *Manager) cleanupWorkerResources(deadRouter *mediasoup.Router) {
 	delete(m.directTransports, deadRouterID)
 	m.directMu.Unlock()
 
+	m.pingMu.Lock()
+	for node, ch := range m.pingChannels {
+		ch.mu.Lock()
+		routerId := ch.routerId
+		ch.mu.Unlock()
+		if routerId == deadRouterID {
+			if ch.producer != nil {
+				ch.producer.Close()
+			}
+			if ch.consumer != nil {
+				ch.consumer.Close()
+			}
+			if ch.pipeProducer != nil {
+				ch.pipeProducer.Close()
+			}
+			if ch.pipeConsumer != nil {
+				ch.pipeConsumer.Close()
+			}
+			delete(m.pingChannels, node)
+		}
+	}
+	m.pingMu.Unlock()
+
 	// 4. Clean Clients
 	m.clientsMu.Lock()
 	for clientID, ctx := range m.clients {
@@ -1252,5 +1276,25 @@ func (m *Manager) cleanupWorkerResources(deadRouter *mediasoup.Router) {
 	}
 	m.clientsMu.Unlock()
 
-	// 4. Serving Consumers: Cleaned up by their own OnClose handlers
+	// 5. Clean serving Consumers
+	m.servingMu.Lock()
+	for id, info := range m.servingConsumers {
+		if info.StreamID.RouterID() == deadRouterID {
+			delete(m.servingConsumers, id)
+			info.Consumer.Close()
+			m.logger.Info("Cleaned up serving consumer for dead router", "consumer_id", id, "router_id", deadRouterID)
+		}
+	}
+	m.servingMu.Unlock()
+
+	// 6. Clean serving Data Consumers
+	m.servingDataMu.Lock()
+	for id, info := range m.servingDataConsumers {
+		if info.StreamID.RouterID() == deadRouterID {
+			delete(m.servingDataConsumers, id)
+			info.Consumer.Close()
+			m.logger.Info("Cleaned up serving data consumer for dead router", "consumer_id", id, "router_id", deadRouterID)
+		}
+	}
+	m.servingDataMu.Unlock()
 }
