@@ -897,29 +897,8 @@ func (m *Manager) notifyPipeCleanup(remoteNode types.NodeID, deadRouterID string
 		RequesterRouterId: deadRouterID,
 	})
 	if err != nil {
-		if errors.Is(err, nats.ErrNoResponders) {
-			m.logger.Info("Pipe cleanup signaling skipped (node offline)", "remote_node", remoteNode, "router_id", deadRouterID)
-		} else {
-			m.logger.Warn("Failed to send pipe cleanup signaling", "remote_node", remoteNode, "router_id", deadRouterID, "error", err)
-		}
+		m.logger.Error("Failed to send pipe cleanup signaling", "remote_node", remoteNode, "router_id", deadRouterID, "error", err)
 	}
-}
-
-func (m *Manager) handlePipeCleanup(req PipeRequest) PipeResponse {
-	resp := PipeResponse{}
-	if req.RequesterRouterId == "" {
-		resp.Error = "deadRouterId is required"
-		return resp
-	}
-	m.pipeMu.Lock()
-	for _, pipes := range m.pipeTransports {
-		if pipe, ok := pipes[req.RequesterRouterId]; ok {
-			pipe.Close()
-			delete(pipes, req.RequesterRouterId)
-		}
-	}
-	m.pipeMu.Unlock()
-	return resp
 }
 
 func (m *Manager) notifyPipeProducerState(remoteNode types.NodeID, streamID types.StreamID, pipeConsumerId string, paused bool) {
@@ -944,15 +923,30 @@ func (m *Manager) notifyPipeClose(remoteNode types.NodeID, streamID types.Stream
 		RequesterNode:  m.nodeID,
 		PipeConsumerId: pipeConsumerId,
 	}
-	go func() {
-		if _, err := m.request(remoteNode, req); err != nil {
-			if errors.Is(err, nats.ErrNoResponders) {
-				m.logger.Info("ClosePipe signaling skipped (node offline)", "upstream", remoteNode)
-			} else {
-				m.logger.Warn("Failed to send ClosePipe signaling", "upstream", remoteNode, "error", err)
-			}
+	if _, err := m.request(remoteNode, req); err != nil {
+		if errors.Is(err, nats.ErrNoResponders) {
+			m.logger.Info("ClosePipe signaling skipped (node offline)", "upstream", remoteNode)
+		} else {
+			m.logger.Warn("Failed to send ClosePipe signaling", "upstream", remoteNode, "error", err)
 		}
-	}()
+	}
+}
+
+func (m *Manager) handlePipeCleanup(req PipeRequest) PipeResponse {
+	resp := PipeResponse{}
+	if req.RequesterRouterId == "" {
+		resp.Error = "deadRouterId is required"
+		return resp
+	}
+	m.pipeMu.Lock()
+	for _, pipes := range m.pipeTransports {
+		if pipe, ok := pipes[req.RequesterRouterId]; ok {
+			pipe.Close()
+			delete(pipes, req.RequesterRouterId)
+		}
+	}
+	m.pipeMu.Unlock()
+	return resp
 }
 
 func (m *Manager) handleEstablishPipe(req PipeRequest) PipeResponse {
@@ -1008,15 +1002,15 @@ func (m *Manager) handleEstablishPipe(req PipeRequest) PipeResponse {
 		m.servingDataMu.Unlock()
 		dataConsumer.OnClose(func(ctx context.Context) {
 			m.logger.Info("Pipe data consumer closed", "remote_node", req.RequesterNode, "stream_id", req.StreamID, "consumer_id", dataConsumer.Id())
-			m.notifyPipeClose(req.RequesterNode, req.StreamID, dataConsumer.Id())
+			go m.notifyPipeClose(req.RequesterNode, req.StreamID, dataConsumer.Id())
 		})
 		dataConsumer.OnPause(func(ctx context.Context) {
 			m.logger.Info("Pipe data consumer paused", "remote_node", req.RequesterNode, "stream_id", req.StreamID, "consumer_id", dataConsumer.Id())
-			m.notifyPipeProducerState(req.RequesterNode, req.StreamID, dataConsumer.Id(), true)
+			go m.notifyPipeProducerState(req.RequesterNode, req.StreamID, dataConsumer.Id(), true)
 		})
 		dataConsumer.OnResume(func(ctx context.Context) {
 			m.logger.Info("Pipe data consumer resumed", "remote_node", req.RequesterNode, "stream_id", req.StreamID, "consumer_id", dataConsumer.Id())
-			m.notifyPipeProducerState(req.RequesterNode, req.StreamID, dataConsumer.Id(), false)
+			go m.notifyPipeProducerState(req.RequesterNode, req.StreamID, dataConsumer.Id(), false)
 		})
 	} else {
 		if lp.Producer == nil {
@@ -1041,15 +1035,15 @@ func (m *Manager) handleEstablishPipe(req PipeRequest) PipeResponse {
 		m.servingMu.Unlock()
 		consumer.OnClose(func(ctx context.Context) {
 			m.logger.Info("Pipe consumer closed", "remote_node", req.RequesterNode, "stream_id", req.StreamID, "consumer_id", consumer.Id())
-			m.notifyPipeClose(req.RequesterNode, req.StreamID, consumer.Id())
+			go m.notifyPipeClose(req.RequesterNode, req.StreamID, consumer.Id())
 		})
 		consumer.OnPause(func(ctx context.Context) {
 			m.logger.Info("Pipe consumer paused", "remote_node", req.RequesterNode, "stream_id", req.StreamID, "consumer_id", consumer.Id())
-			m.notifyPipeProducerState(req.RequesterNode, req.StreamID, consumer.Id(), true)
+			go m.notifyPipeProducerState(req.RequesterNode, req.StreamID, consumer.Id(), true)
 		})
 		consumer.OnResume(func(ctx context.Context) {
 			m.logger.Info("Pipe consumer resumed", "remote_node", req.RequesterNode, "stream_id", req.StreamID, "consumer_id", consumer.Id())
-			m.notifyPipeProducerState(req.RequesterNode, req.StreamID, consumer.Id(), false)
+			go m.notifyPipeProducerState(req.RequesterNode, req.StreamID, consumer.Id(), false)
 		})
 	}
 
@@ -1406,7 +1400,7 @@ func (m *Manager) cleanupWorkerResources(deadRouterID string) {
 		if lp.RouterId == deadRouterID {
 			delete(m.producers, streamID)
 			if m.OnStreamClosed != nil {
-				m.OnStreamClosed(streamID)
+				go m.OnStreamClosed(streamID)
 			}
 			m.logger.Info("Cleaned up producer", "stream_id", streamID)
 		}
