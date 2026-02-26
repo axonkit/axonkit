@@ -488,6 +488,56 @@ func TestManager_HandlePingPayload(t *testing.T) {
 	mA.HandlePingPayload("node-b", pongData)
 }
 
+func TestManager_PipeCleanupSignaling(t *testing.T) {
+	srv, ncA := setupNats(t)
+	defer srv.Shutdown()
+	defer ncA.Close()
+
+	ncB, err := nats.Connect(srv.ClientURL())
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer ncB.Close()
+
+	mA := setupManager(t, "node-a", ncA)
+	defer mA.Close()
+	mB := setupManager(t, "node-b", ncB)
+	defer mB.Close()
+
+	streamID, err := mA.Publish()
+	if err != nil {
+		t.Fatalf("Publish failed: %v", err)
+	}
+	if _, err := mB.ConnectPipe(streamID, "node-a"); err != nil {
+		t.Fatalf("ConnectPipe failed: %v", err)
+	}
+
+	deadRouterID := mA.routers[0].Id()
+	waitUntil(t, func() bool {
+		mB.pipeMu.RLock()
+		defer mB.pipeMu.RUnlock()
+		for _, pipes := range mB.pipeTransports {
+			if _, ok := pipes[deadRouterID]; ok {
+				return true
+			}
+		}
+		return false
+	})
+
+	mA.workers[0].Close()
+
+	waitUntil(t, func() bool {
+		mB.pipeMu.RLock()
+		defer mB.pipeMu.RUnlock()
+		for _, pipes := range mB.pipeTransports {
+			if _, ok := pipes[deadRouterID]; ok {
+				return false
+			}
+		}
+		return true
+	})
+}
+
 func TestManager_HandleEnsurePingChannelInvalid(t *testing.T) {
 	srv, nc := setupNats(t)
 	defer srv.Shutdown()
