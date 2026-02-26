@@ -2,6 +2,30 @@ package media
 
 import "github.com/jiyeyuran/mediasoup-go/v2"
 
+var rtpCodecCapabilities = []*mediasoup.RtpCodecCapability{
+	{
+		Kind:      mediasoup.MediaKindAudio,
+		MimeType:  "audio/opus",
+		ClockRate: 48000,
+		Channels:  2,
+	},
+	{
+		Kind:      mediasoup.MediaKindVideo,
+		MimeType:  "video/VP8",
+		ClockRate: 90000,
+	},
+	{
+		Kind:      mediasoup.MediaKindVideo,
+		MimeType:  "video/H264",
+		ClockRate: 90000,
+		Parameters: mediasoup.RtpCodecSpecificParameters{
+			LevelAsymmetryAllowed: 1,
+			PacketizationMode:     1,
+			ProfileLevelId:        "4d0032",
+		},
+	},
+}
+
 var consumerDeviceCapabilities = &mediasoup.RtpCapabilities{
 	Codecs: []*mediasoup.RtpCodecCapability{
 		{

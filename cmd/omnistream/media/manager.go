@@ -26,10 +26,11 @@ type pipeTransport struct {
 }
 
 type Manager struct {
-	nodeID    types.NodeID
-	nc        *nats.Conn
-	workerBin string
-	logger    *slog.Logger
+	nodeID      types.NodeID
+	nc          *nats.Conn
+	workerBin   string
+	logger      *slog.Logger
+	workerCount int
 
 	workers  []*mediasoup.Worker
 	routers  []*mediasoup.Router
@@ -65,6 +66,14 @@ type Manager struct {
 	closed atomic.Bool
 
 	OnStreamClosed func(streamID types.StreamID)
+}
+
+type ManagerOption func(*Manager)
+
+func WithWorkerCount(count int) ManagerOption {
+	return func(m *Manager) {
+		m.workerCount = count
+	}
 }
 
 type ServingConsumerInfo struct {
@@ -124,8 +133,8 @@ func (lp *LocalProducer) Id() string {
 	return ""
 }
 
-func NewManager(nodeID types.NodeID, nc *nats.Conn, workerBin string) *Manager {
-	return &Manager{
+func NewManager(nodeID types.NodeID, nc *nats.Conn, workerBin string, opts ...ManagerOption) *Manager {
+	m := &Manager{
 		nodeID:               nodeID,
 		nc:                   nc,
 		workerBin:            workerBin,
@@ -138,10 +147,17 @@ func NewManager(nodeID types.NodeID, nc *nats.Conn, workerBin string) *Manager {
 		pingChannels:         make(map[types.NodeID]*PingChannel),
 		directTransports:     make(map[string]*mediasoup.Transport),
 	}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
 }
 
 func (m *Manager) Start() error {
-	numWorkers := runtime.NumCPU()
+	numWorkers := m.workerCount
+	if numWorkers <= 0 {
+		numWorkers = runtime.NumCPU()
+	}
 	m.logger.Info("Starting mediasoup workers", "count", numWorkers, "bin", m.workerBin)
 
 	m.workers = make([]*mediasoup.Worker, numWorkers)
@@ -197,29 +213,7 @@ func (m *Manager) launchWorker(index int) error {
 	}
 
 	router, err := worker.CreateRouter(&mediasoup.RouterOptions{
-		MediaCodecs: []*mediasoup.RtpCodecCapability{
-			{
-				Kind:      mediasoup.MediaKindAudio,
-				MimeType:  "audio/opus",
-				ClockRate: 48000,
-				Channels:  2,
-			},
-			{
-				Kind:      mediasoup.MediaKindVideo,
-				MimeType:  "video/VP8",
-				ClockRate: 90000,
-			},
-			{
-				Kind:      mediasoup.MediaKindVideo,
-				MimeType:  "video/H264",
-				ClockRate: 90000,
-				Parameters: mediasoup.RtpCodecSpecificParameters{
-					LevelAsymmetryAllowed: 1,
-					PacketizationMode:     1,
-					ProfileLevelId:        "4d0032",
-				},
-			},
-		},
+		MediaCodecs: rtpCodecCapabilities,
 	})
 	if err != nil {
 		worker.Close()
@@ -238,7 +232,7 @@ func (m *Manager) launchWorker(index int) error {
 		if m.closed.Load() {
 			return
 		}
-		m.logger.Error("Worker died, cleaning up and restarting...", "index", index, "pid", worker.Pid())
+		m.logger.Error("Worker died, cleaning up and restarting...", "index", index, "pid", worker.Pid(), "error", worker.Err())
 		m.cleanupWorkerResources(router.Id())
 		go m.restartWorker(index)
 	})
@@ -344,6 +338,43 @@ func (m *Manager) Publish() (types.StreamID, error) {
 	return streamID, nil
 }
 
+func (m *Manager) PublishData() (types.StreamID, error) {
+	idx := int(time.Now().UnixNano() % int64(len(m.routers)))
+	if idx < 0 {
+		idx = -idx
+	}
+	router := m.routers[idx]
+
+	direct, err := m.getOrCreateDirectTransport(router)
+	if err != nil {
+		return "", err
+	}
+	streamId := uint16(time.Now().UnixNano() % 65535)
+	dataProducer, err := direct.ProduceData(&mediasoup.DataProducerOptions{
+		Label: "data",
+		SctpStreamParameters: &mediasoup.SctpStreamParameters{
+			StreamId: streamId,
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+
+	streamID := types.NewStreamID(router.Id(), dataProducer.Id())
+	m.producersMu.Lock()
+	m.producers[streamID] = &LocalProducer{
+		StreamID:     streamID,
+		RouterIdx:    idx,
+		DataProducer: dataProducer,
+		RouterId:     router.Id(),
+		UpstreamNode: m.nodeID,
+	}
+	m.producersMu.Unlock()
+
+	m.logger.Info("Published data stream", "stream_id", streamID, "router_idx", idx)
+	return streamID, nil
+}
+
 // ConnectPipe (FIB Callback)
 func (m *Manager) ConnectPipe(streamID types.StreamID, upstreamNode types.NodeID) (string, error) {
 	// Optimization: If upstream is local
@@ -416,9 +447,11 @@ func (m *Manager) ConnectPipe(streamID types.StreamID, upstreamNode types.NodeID
 		m.logger.Info("Pipe Connected", "upstream", upstreamNode)
 
 		if streamID.IsDataProducer() {
-			dataProducer, err := pipe.ProduceData(&mediasoup.DataProducerOptions{
-				Id: remoteProducerId,
-			})
+			if resp.DataProducerInfo == nil {
+				return nil, fmt.Errorf("missing data producer info")
+			}
+			resp.DataProducerInfo.Id = remoteProducerId
+			dataProducer, err := pipe.ProduceData(resp.DataProducerInfo)
 			if err != nil {
 				m.logger.Error("Pipe ProduceData failed", "error", err)
 				return nil, err
@@ -718,6 +751,10 @@ func (m *Manager) ProbeRTT(remoteNode types.NodeID) (int64, bool) {
 		ch.mu.Unlock()
 		return 0, false
 	}
+}
+
+func (m *Manager) HandlePingPayload(remoteNode types.NodeID, payload []byte) {
+	m.handlePingMessage(remoteNode, payload)
 }
 
 func (m *Manager) getOrCreateLocalPipe(localRouter *mediasoup.Router, remoteRouterId string, remoteNode types.NodeID) (*pipeTransport, error) {
@@ -1221,7 +1258,12 @@ func (m *Manager) Unpublish(streamID types.StreamID) error {
 	m.producersMu.Lock()
 	if lp, ok := m.producers[streamID]; ok {
 		delete(m.producers, streamID)
-		lp.Producer.Close()
+		if lp.Producer != nil {
+			lp.Producer.Close()
+		}
+		if lp.DataProducer != nil {
+			lp.DataProducer.Close()
+		}
 		m.logger.Info("Unpublished stream", "stream_id", streamID)
 	}
 	m.producersMu.Unlock()
@@ -1317,7 +1359,7 @@ func (m *Manager) cleanupWorkerResources(deadRouterID string) {
 	delete(m.pipeTransports, deadRouterID)
 	m.pipeMu.Unlock()
 
-	// 3. Clean Direct Transports
+	// 3. Clean Direct Transports and Ping Channels
 	m.directMu.Lock()
 	delete(m.directTransports, deadRouterID)
 	m.directMu.Unlock()

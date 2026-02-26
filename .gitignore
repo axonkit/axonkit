@@ -22,3 +22,4 @@ go.work
 /omnistream
 /mediasoup-*
 /bin
+.vscode/
