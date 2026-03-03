@@ -10,9 +10,10 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/jiyeyuran/omnistream/cmd/omnistream/media"
 	"github.com/jiyeyuran/omnistream/pkg/discovery"
+	"github.com/jiyeyuran/omnistream/pkg/media"
 	"github.com/jiyeyuran/omnistream/pkg/routing"
+	"github.com/jiyeyuran/omnistream/pkg/server"
 	"github.com/jiyeyuran/omnistream/pkg/store"
 	"github.com/jiyeyuran/omnistream/pkg/types"
 
@@ -142,90 +143,13 @@ func main() {
 	linkDB.StartProbing(context.Background())
 
 	// 5. HTTP API
-	http.HandleFunc("/publish", func(w http.ResponseWriter, r *http.Request) {
-		// 1. Create Producer on MediaRouter
-		streamID, err := mediaMgr.Publish()
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-
-		// 2. Advertise to RIB
-		// Origin advertising (Cost 0)
-		err = rib.StartAdvertise(routing.AdvertiseOptions{
-			StreamID:    streamID,
-			BaseCost:    0,
-			PathVector:  []types.NodeID{myNode.ID},
-			RttToOrigin: 0,
-			IsOrigin:    true,
-		})
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-
-		fmt.Fprintf(w, "Published & Advertised %s\n", streamID)
-		slog.Info("Published & Advertised", "stream_id", streamID)
-	})
-
-	http.HandleFunc("/subscribe", func(w http.ResponseWriter, r *http.Request) {
-		streamID := r.URL.Query().Get("stream")
-		clientID := r.URL.Query().Get("client")
-		if streamID == "" || clientID == "" {
-			http.Error(w, "missing stream or client", 400)
-			return
-		}
-
-		// FIB Subscribe -> Calls ConnectPipe -> MediaManager ConnectPipe
-		// pipeID is the ID available on local router (either pipe consumer or original producer)
-		pipeID, upstream, err := fib.Subscribe(types.StreamID(streamID), finder.FindPath)
-
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Subscribe failed: %v", err), 500)
-			return
-		}
-
-		// Create Client Consumer
-		consumer, err := mediaMgr.Consume(clientID, types.StreamID(streamID))
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Consume failed: %v", err), 500)
-			return
-		}
-
-		fmt.Fprintf(w, "Subscribed %s via %s (Consumer: %s, Pipe: %s)\n", streamID, upstream, consumer.Id(), pipeID)
-	})
-
-	http.HandleFunc("/unpublish", func(w http.ResponseWriter, r *http.Request) {
-		streamID := r.URL.Query().Get("stream")
-		if streamID == "" {
-			http.Error(w, "missing stream", 400)
-			return
-		}
-
-		_ = mediaMgr.Unpublish(types.StreamID(streamID))
-		_ = rib.StopAdvertise(types.StreamID(streamID))
-
-		fmt.Fprintf(w, "Unpublished %s\n", streamID)
-	})
-
-	http.HandleFunc("/unsubscribe", func(w http.ResponseWriter, r *http.Request) {
-		streamID := r.URL.Query().Get("stream")
-		clientID := r.URL.Query().Get("client")
-		if streamID == "" || clientID == "" {
-			http.Error(w, "missing stream or client", 400)
-			return
-		}
-
-		_ = mediaMgr.Unsubscribe(clientID, types.StreamID(streamID))
-		fib.Unsubscribe(types.StreamID(streamID))
-
-		fmt.Fprintf(w, "Unsubscribed %s\n", streamID)
-	})
+	mux := http.NewServeMux()
+	server.RegisterHTTPRoutes(mux, mediaMgr, rib, fib, finder, myNode)
 
 	go func() {
 		addr := fmt.Sprintf(":%d", *httpPort)
 		slog.Info("HTTP server listening", "addr", addr)
-		if err := http.ListenAndServe(addr, nil); err != nil {
+		if err := http.ListenAndServe(addr, server.WithLogging(mux)); err != nil {
 			slog.Error("HTTP server failed", "error", err)
 			os.Exit(1)
 		}
