@@ -22,4 +22,5 @@ const (
 	ErrCodeNotReady             ErrorCode = "NOT_READY"
 	ErrCodeAlreadyJoined        ErrorCode = "ALREADY_JOINED"
 	ErrCodeNotFound             ErrorCode = "NOT_FOUND"
+	ErrCodeSessionNotFound      ErrorCode = "SESSION_NOT_FOUND"
 )

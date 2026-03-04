@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jiyeyuran/omnistream/pkg/config"
 	"github.com/jiyeyuran/omnistream/pkg/types"
 
 	"github.com/jiyeyuran/mediasoup-go/v2"
@@ -26,16 +27,18 @@ type pipeTransport struct {
 }
 
 type Manager struct {
-	nodeID types.NodeID
-	nc     *nats.Conn
-	logger *slog.Logger
+	nodeID   types.NodeID
+	nc       *nats.Conn
+	webRtcCfg config.WebRtcConfig
+	logger   *slog.Logger
 
 	workerBin   string
 	workerCount int
 
-	workers  []*mediasoup.Worker
-	routers  []*mediasoup.Router
-	workerMu sync.RWMutex
+	workers       []*mediasoup.Worker
+	routers       []*mediasoup.Router
+	webRtcServers []*mediasoup.WebRtcServer
+	workerMu      sync.RWMutex
 
 	// Pipe Reuse: map[LocalRouterID]map[RemoteRouterID]*pipeTransport
 	pipeTransports map[string]map[string]*pipeTransport
@@ -131,11 +134,12 @@ func (lp *LocalProducer) Id() string {
 	return ""
 }
 
-func NewManager(nodeID types.NodeID, nc *nats.Conn, workerBin string, opts ...ManagerOption) *Manager {
+func NewManager(nodeID types.NodeID, nc *nats.Conn, workerBin string, webRtcCfg config.WebRtcConfig, opts ...ManagerOption) *Manager {
 	m := &Manager{
 		nodeID:               nodeID,
 		nc:                   nc,
 		workerBin:            workerBin,
+		webRtcCfg:            webRtcCfg,
 		logger:               slog.Default().With("component", "MediaManager"),
 		pipeTransports:       make(map[string]map[string]*pipeTransport),
 		producers:            make(map[types.StreamID]*LocalProducer),
@@ -155,6 +159,13 @@ func (m *Manager) Routers() []*mediasoup.Router {
 	m.workerMu.RLock()
 	defer m.workerMu.RUnlock()
 	return m.routers
+}
+
+// WebRtcServers returns the WebRtcServers managed by this Manager (one per worker).
+func (m *Manager) WebRtcServers() []*mediasoup.WebRtcServer {
+	m.workerMu.RLock()
+	defer m.workerMu.RUnlock()
+	return m.webRtcServers
 }
 
 // RegisterProducer registers a local producer (from a participant) so the
@@ -211,6 +222,7 @@ func (m *Manager) Start() error {
 
 	m.workers = make([]*mediasoup.Worker, numWorkers)
 	m.routers = make([]*mediasoup.Router, numWorkers)
+	m.webRtcServers = make([]*mediasoup.WebRtcServer, numWorkers)
 
 	for i := 0; i < numWorkers; i++ {
 		if err := m.launchWorker(i); err != nil {
@@ -252,6 +264,28 @@ func (m *Manager) Close() {
 	}
 }
 
+func (m *Manager) buildWebRtcServerListenInfos() []*mediasoup.TransportListenInfo {
+	cfg := m.webRtcCfg
+	ip := cfg.ListenIP
+	if ip == "" {
+		ip = "0.0.0.0"
+	}
+
+	base := mediasoup.TransportListenInfo{
+		Ip:               ip,
+		AnnouncedAddress: cfg.AnnouncedIP,
+	}
+	if cfg.MinPort > 0 && cfg.MaxPort > 0 {
+		base.PortRange = mediasoup.TransportPortRange{Min: cfg.MinPort, Max: cfg.MaxPort}
+	}
+
+	udp := base
+	udp.Protocol = mediasoup.TransportProtocolUDP
+	tcp := base
+	tcp.Protocol = mediasoup.TransportProtocolTCP
+	return []*mediasoup.TransportListenInfo{&udp, &tcp}
+}
+
 func (m *Manager) launchWorker(index int) error {
 	m.logger.Info("Launching worker", "index", index)
 	worker, err := mediasoup.NewWorker(m.workerBin, func(o *mediasoup.WorkerSettings) {
@@ -269,9 +303,20 @@ func (m *Manager) launchWorker(index int) error {
 		return err
 	}
 
+	listenInfos := m.buildWebRtcServerListenInfos()
+	webRtcServer, err := worker.CreateWebRtcServer(&mediasoup.WebRtcServerOptions{
+		ListenInfos: listenInfos,
+	})
+	if err != nil {
+		router.Close()
+		worker.Close()
+		return fmt.Errorf("webrtc server: %w", err)
+	}
+
 	m.workerMu.Lock()
 	m.workers[index] = worker
 	m.routers[index] = router
+	m.webRtcServers[index] = webRtcServer
 	m.workerMu.Unlock()
 
 	m.logger.Info("Worker started", "index", index, "pid", worker.Pid())

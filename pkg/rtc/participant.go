@@ -119,6 +119,7 @@ type Participant struct {
 	pingInterval time.Duration
 
 	autoSubscribe bool
+	reconnecting  bool
 
 	mu     sync.RWMutex
 	logger *slog.Logger
@@ -289,6 +290,14 @@ func (p *Participant) SetSignal(
 }
 
 func (p *Participant) handleIceStateChange(state mediasoup.IceState) {
+	p.mu.RLock()
+	reconnecting := p.reconnecting
+	p.mu.RUnlock()
+
+	if reconnecting {
+		return
+	}
+
 	p.logger.Info("ICE state changed", "state", state)
 
 	switch state {
@@ -977,6 +986,80 @@ func (p *Participant) UpdateMetadata(metadata, name *string, attributes map[stri
 		p.room.BroadcastNotification(proto.MethodParticipantUpdated,
 			&proto.ParticipantUpdatedNotification{Participant: p.ToProto()}, "")
 	}
+}
+
+// ============================================================
+// Reconnect
+// ============================================================
+
+// Reconnect replaces the participant's transports and signal channels without
+// destroying the session (published tracks, subscriptions, room membership).
+// This is used when a client's ICE/DTLS connection breaks and it needs to
+// re-establish connectivity to the same mediasoup worker.
+func (p *Participant) Reconnect(send, recv, direct *mediasoup.Transport,
+	outProducer *mediasoup.DataProducer,
+	outConsumer *mediasoup.DataConsumer,
+	inProducer *mediasoup.DataProducer,
+	inConsumer *mediasoup.DataConsumer,
+) error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return fmt.Errorf("participant is closed")
+	}
+	p.reconnecting = true
+
+	// Snapshot old resources to close after releasing the lock.
+	oldSend := p.sendTransport
+	oldRecv := p.recvTransport
+	oldDirect := p.directTransport
+	oldSigInConsumer := p.signalInConsumer
+	oldSigOutConsumer := p.signalOutConsumer
+	oldSigInProducer := p.signalInProducer
+	oldSigOutProducer := p.signalOutProducer
+
+	// Abort pending RPCs — callers will get a nil response.
+	for _, ch := range p.pendingRPC {
+		close(ch)
+	}
+	p.pendingRPC = make(map[string]chan *proto.Message)
+
+	p.state = proto.ParticipantInfo_JOINING
+	p.mu.Unlock()
+
+	// Close old resources outside the lock. Order: signal → transports.
+	if oldSigInConsumer != nil {
+		oldSigInConsumer.Close()
+	}
+	if oldSigOutConsumer != nil {
+		oldSigOutConsumer.Close()
+	}
+	if oldSigInProducer != nil {
+		oldSigInProducer.Close()
+	}
+	if oldSigOutProducer != nil {
+		oldSigOutProducer.Close()
+	}
+	if oldSend != nil {
+		oldSend.Close()
+	}
+	if oldRecv != nil {
+		oldRecv.Close()
+	}
+	if oldDirect != nil {
+		oldDirect.Close()
+	}
+
+	// Install new resources.
+	p.mu.Lock()
+	p.reconnecting = false
+	p.mu.Unlock()
+
+	p.SetTransports(send, recv, direct)
+	p.SetSignal(outProducer, outConsumer, inProducer, inConsumer)
+
+	p.logger.Info("Participant reconnected")
+	return nil
 }
 
 // ============================================================

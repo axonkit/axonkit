@@ -6,11 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jiyeyuran/omnistream/pkg/config"
 	"github.com/jiyeyuran/omnistream/pkg/types"
 	"github.com/nats-io/nats-server/v2/server"
 	natsserver "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
-
 	"github.com/jiyeyuran/mediasoup-go/v2"
 )
 
@@ -32,7 +32,7 @@ func setupManager(t *testing.T, nodeID types.NodeID, nc *nats.Conn) *Manager {
 	if workerBin == "" {
 		t.Skip("MEDIASOUP_WORKER_BIN not set")
 	}
-	m := NewManager(nodeID, nc, workerBin, WithWorkerCount(1))
+	m := NewManager(nodeID, nc, workerBin, config.WebRtcConfig{ListenIP: "127.0.0.1"}, WithWorkerCount(1))
 	if err := m.Start(); err != nil {
 		t.Fatalf("Start failed: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestManager_StartInvalidWorkerBin(t *testing.T) {
 	defer srv.Shutdown()
 	defer nc.Close()
 
-	m := NewManager("node-invalid", nc, "/invalid/worker", WithWorkerCount(1))
+	m := NewManager("node-invalid", nc, "/invalid/worker", config.WebRtcConfig{ListenIP: "127.0.0.1"}, WithWorkerCount(1))
 	if err := m.Start(); err == nil {
 		t.Fatalf("expected error for invalid worker bin")
 	}
@@ -178,7 +178,7 @@ func TestManager_StartWithWorkerCount(t *testing.T) {
 	if workerBin == "" {
 		t.Skip("MEDIASOUP_WORKER_BIN not set")
 	}
-	m := NewManager("node-count", nc, workerBin, WithWorkerCount(1))
+	m := NewManager("node-count", nc, workerBin, config.WebRtcConfig{ListenIP: "127.0.0.1"}, WithWorkerCount(1))
 	if err := m.Start(); err != nil {
 		t.Fatalf("Start failed: %v", err)
 	}

@@ -335,3 +335,17 @@ type DataSubscriptionClosedNotification struct {
 type DisconnectNotification struct {
 	Reason DisconnectReason `json:"reason"`
 }
+
+// ============================================================
+// Inter-node RPC (via NATS)
+// ============================================================
+
+type NodeRPCRequest struct {
+	Action  string          `json:"action"`
+	Payload json.RawMessage `json:"payload"`
+}
+
+type NodeRPCResponse struct {
+	Status  int             `json:"status"`
+	Payload json.RawMessage `json:"payload"`
+}

@@ -100,7 +100,7 @@ func main() {
 	fib := routing.NewFIB(rib, myNode.ID)
 
 	// 3. Init Media Manager
-	mediaMgr := media.NewManager(myNode.ID, nc, cfg.Media.WorkerBin)
+	mediaMgr := media.NewManager(myNode.ID, nc, cfg.Media.WorkerBin, cfg.Media.WebRtc)
 	mediaMgr.OnStreamClosed = func(streamID types.StreamID) {
 		if err := rib.StopAdvertise(streamID); err != nil {
 			slog.Error("Failed to stop advertise", "stream_id", streamID, "error", err)
@@ -144,24 +144,41 @@ func main() {
 
 	linkDB.StartProbing(context.Background())
 
-	// 5. Init Room Manager
+	// 5. Init Session Registry
+	sessionStore, err := store.NewNatsStore(context.Background(), js, discovery.SessionBucketName, discovery.SessionTTL)
+	if err != nil {
+		slog.Error("Failed to init Session Store", "error", err)
+		os.Exit(1)
+	}
+	sessionRegistry := discovery.NewSessionRegistry(sessionStore, myNode.ID)
+
+	// 6. Init Room Manager
 	roomManager := rtc.NewRoomManager(rtc.RoomManagerParams{
 		Config: cfg.Room,
 		FIB:    fib,
 		Finder: finder,
 	})
 
-	// 6. Init Token Verifier
+	// 7. Init Token Verifier
 	verifier := auth.NewTokenVerifier(cfg.Auth.APIKey, cfg.Auth.APISecret)
 
-	// 7. HTTP API
+	// 8. HTTP API + NATS RPC
 	srv := server.NewServer(server.ServerParams{
-		Config:      cfg,
-		RoomManager: roomManager,
-		Verifier:    verifier,
-		Node:        myNode,
-		Routers:     mediaMgr.Routers(),
+		Config:        cfg,
+		RoomManager:   roomManager,
+		Verifier:      verifier,
+		Node:          myNode,
+		NC:            nc,
+		Sessions:      sessionRegistry,
+		Routers:       mediaMgr.Routers(),
+		WebRtcServers: mediaMgr.WebRtcServers(),
 	})
+
+	_, err = nc.Subscribe(fmt.Sprintf("rtc.rpc.%s", myNode.ID), srv.HandleNodeRPC)
+	if err != nil {
+		slog.Error("Failed to subscribe NATS RPC", "error", err)
+		os.Exit(1)
+	}
 
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
@@ -185,6 +202,7 @@ func main() {
 	rib.Close()
 	roomManager.Close()
 	mediaMgr.Close()
+	sessionRegistry.Close()
 	registry.Close()
 
 	slog.Info("Bye!")

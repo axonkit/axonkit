@@ -11,9 +11,11 @@ import (
 	"github.com/jiyeyuran/mediasoup-go/v2"
 	"github.com/jiyeyuran/omnistream/pkg/auth"
 	"github.com/jiyeyuran/omnistream/pkg/config"
+	"github.com/jiyeyuran/omnistream/pkg/discovery"
 	"github.com/jiyeyuran/omnistream/pkg/proto"
 	"github.com/jiyeyuran/omnistream/pkg/rtc"
 	"github.com/jiyeyuran/omnistream/pkg/types"
+	"github.com/nats-io/nats.go"
 	"github.com/rs/xid"
 )
 
@@ -62,28 +64,37 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 }
 
 type Server struct {
-	cfg         *config.Config
-	roomManager *rtc.RoomManager
-	verifier    *auth.TokenVerifier
-	node        types.NodeInfo
-	routers     []*mediasoup.Router
+	cfg           *config.Config
+	roomManager   *rtc.RoomManager
+	verifier      *auth.TokenVerifier
+	node          types.NodeInfo
+	nc            *nats.Conn
+	sessions      *discovery.SessionRegistry
+	routers       []*mediasoup.Router
+	webRtcServers []*mediasoup.WebRtcServer
 }
 
 type ServerParams struct {
-	Config      *config.Config
-	RoomManager *rtc.RoomManager
-	Verifier    *auth.TokenVerifier
-	Node        types.NodeInfo
-	Routers     []*mediasoup.Router
+	Config        *config.Config
+	RoomManager   *rtc.RoomManager
+	Verifier      *auth.TokenVerifier
+	Node          types.NodeInfo
+	NC            *nats.Conn
+	Sessions      *discovery.SessionRegistry
+	Routers       []*mediasoup.Router
+	WebRtcServers []*mediasoup.WebRtcServer
 }
 
 func NewServer(params ServerParams) *Server {
 	return &Server{
-		cfg:         params.Config,
-		roomManager: params.RoomManager,
-		verifier:    params.Verifier,
-		node:        params.Node,
-		routers:     params.Routers,
+		cfg:           params.Config,
+		roomManager:   params.RoomManager,
+		verifier:      params.Verifier,
+		node:          params.Node,
+		nc:            params.NC,
+		sessions:      params.Sessions,
+		routers:       params.Routers,
+		webRtcServers: params.WebRtcServers,
 	}
 }
 
@@ -99,6 +110,12 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, proto.ErrorResponse{
 			Code: proto.ErrCodeInvalidRequest, Error: err.Error()})
+		return
+	}
+
+	// ---- Reconnect branch ----
+	if req.Reconnect && req.ParticipantSid != "" {
+		s.handleReconnect(w, &req, logId)
 		return
 	}
 
@@ -151,6 +168,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		routerIdx = -routerIdx
 	}
 	router := s.routers[routerIdx]
+	webRtcServer := s.webRtcServers[routerIdx]
 	participantSid := xid.New().String()
 
 	identity := claims.Identity()
@@ -176,7 +194,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		PingTimeout:   time.Duration(s.cfg.PingTimeout()) * time.Second,
 	})
 
-	sendTransport, recvTransport, directTransport, err := s.createTransports(router)
+	sendTransport, recvTransport, directTransport, err := s.createTransports(router, webRtcServer)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, proto.ErrorResponse{
 			Code: proto.ErrCodeInternal, Error: "transport creation failed: " + err.Error()})
@@ -242,6 +260,14 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		RtpCapabilities:  router.RtpCapabilities(),
 	}
 
+	if s.sessions != nil {
+		_ = s.sessions.Register(participantSid, discovery.SessionInfo{
+			NodeID:   s.node.ID,
+			RoomName: req.Room.Name,
+			Identity: identity,
+		})
+	}
+
 	w.Header().Set("X-Node-Id", string(s.node.ID))
 	w.Header().Set("X-Log-Id", logId)
 
@@ -255,20 +281,14 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 // Transport Helpers
 // ============================================================
 
-func (s *Server) createTransports(router *mediasoup.Router) (send, recv, direct *mediasoup.Transport, err error) {
+func (s *Server) createTransports(router *mediasoup.Router, webRtcServer *mediasoup.WebRtcServer) (send, recv, direct *mediasoup.Transport, err error) {
 	enableUdp := true
 	webRtcOpts := &mediasoup.WebRtcTransportOptions{
-		ListenInfos: []mediasoup.TransportListenInfo{
-			{
-				Ip:               s.cfg.Media.WebRtc.ListenIP,
-				AnnouncedAddress: s.cfg.Media.WebRtc.AnnouncedIP,
-				Protocol:         mediasoup.TransportProtocolUDP,
-			},
-		},
-		EnableUdp:  &enableUdp,
-		EnableTcp:  true,
-		PreferUdp:  true,
-		EnableSctp: true,
+		WebRtcServer: webRtcServer,
+		EnableUdp:    &enableUdp,
+		EnableTcp:    true,
+		PreferUdp:    true,
+		EnableSctp:   true,
 		NumSctpStreams: &mediasoup.NumSctpStreams{
 			OS:  1024,
 			MIS: 1024,
@@ -403,11 +423,24 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	participant := s.roomManager.GetParticipantBySid(req.ParticipantSid)
 	if participant == nil {
+		// Not on this node — try forwarding via session registry.
+		if s.sessions != nil && s.nc != nil {
+			sess, err := s.sessions.Lookup(req.ParticipantSid)
+			if err == nil && sess.NodeID != s.node.ID {
+				payload, _ := json.Marshal(req)
+				s.forwardViaNATS(w, sess.NodeID, "connect", payload)
+				return
+			}
+		}
 		writeJSON(w, http.StatusNotFound, proto.ErrorResponse{
 			Code: proto.ErrCodeNotFound, Error: "participant not found"})
 		return
 	}
 
+	s.handleConnectLocal(w, &req, participant, logId)
+}
+
+func (s *Server) handleConnectLocal(w http.ResponseWriter, req *proto.ConnectRequest, participant *rtc.Participant, logId string) {
 	for _, tc := range req.Transports {
 		transport := participant.GetTransportBySid(tc.TransportSid)
 		if transport == nil {
@@ -428,4 +461,237 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Log-Id", logId)
 
 	writeJSON(w, http.StatusOK, proto.ConnectResponse{})
+}
+
+// ============================================================
+// Reconnect
+// ============================================================
+
+func (s *Server) handleReconnect(w http.ResponseWriter, req *proto.JoinRequest, logId string) {
+	if s.sessions == nil {
+		writeJSON(w, http.StatusServiceUnavailable, proto.ErrorResponse{
+			Code: proto.ErrCodeInternal, Error: "session registry not available"})
+		return
+	}
+
+	sess, err := s.sessions.Lookup(req.ParticipantSid)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, proto.ErrorResponse{
+			Code: proto.ErrCodeSessionNotFound, Error: "session not found, please do a fresh join"})
+		return
+	}
+
+	if sess.NodeID != s.node.ID {
+		// Forward to the owning node via NATS.
+		payload, _ := json.Marshal(req)
+		s.forwardViaNATS(w, sess.NodeID, "reconnect", payload)
+		return
+	}
+
+	s.handleReconnectLocal(w, req, logId)
+}
+
+func (s *Server) handleReconnectLocal(w http.ResponseWriter, req *proto.JoinRequest, logId string) {
+	participant := s.roomManager.GetParticipantBySid(req.ParticipantSid)
+	if participant == nil {
+		writeJSON(w, http.StatusNotFound, proto.ErrorResponse{
+			Code: proto.ErrCodeSessionNotFound, Error: "participant session expired"})
+		return
+	}
+
+	routerIdx := int(time.Now().UnixNano() % int64(len(s.routers)))
+	if routerIdx < 0 {
+		routerIdx = -routerIdx
+	}
+	router := s.routers[routerIdx]
+	webRtcServer := s.webRtcServers[routerIdx]
+
+	sendTransport, recvTransport, directTransport, err := s.createTransports(router, webRtcServer)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, proto.ErrorResponse{
+			Code: proto.ErrCodeInternal, Error: "transport creation failed: " + err.Error()})
+		return
+	}
+
+	if req.ConnectionSettings != nil && len(req.ConnectionSettings.DtlsFingerprints) > 0 {
+		dtlsParams := &mediasoup.DtlsParameters{
+			Role:         mediasoup.DtlsRoleClient,
+			Fingerprints: req.ConnectionSettings.DtlsFingerprints,
+		}
+		for _, t := range []*mediasoup.Transport{sendTransport, recvTransport} {
+			if err := t.Connect(&mediasoup.TransportConnectOptions{DtlsParameters: dtlsParams}); err != nil {
+				sendTransport.Close()
+				recvTransport.Close()
+				directTransport.Close()
+				writeJSON(w, http.StatusInternalServerError, proto.ErrorResponse{
+					Code: proto.ErrCodeInternal, Error: "transport connect failed: " + err.Error()})
+				return
+			}
+		}
+	}
+
+	sig, err := s.createSignalChannels(sendTransport, recvTransport, directTransport)
+	if err != nil {
+		sendTransport.Close()
+		recvTransport.Close()
+		directTransport.Close()
+		writeJSON(w, http.StatusInternalServerError, proto.ErrorResponse{
+			Code: proto.ErrCodeInternal, Error: "signal channel failed: " + err.Error()})
+		return
+	}
+
+	if err := participant.Reconnect(
+		sendTransport, recvTransport, directTransport,
+		sig.outProducer, sig.outConsumer, sig.inProducer, sig.inConsumer,
+	); err != nil {
+		sendTransport.Close()
+		recvTransport.Close()
+		directTransport.Close()
+		writeJSON(w, http.StatusInternalServerError, proto.ErrorResponse{
+			Code: proto.ErrCodeInternal, Error: "reconnect failed: " + err.Error()})
+		return
+	}
+
+	room := participant.Room()
+	var roomProto *proto.Room
+	if room != nil {
+		roomProto = room.ToProto()
+	}
+
+	resp := proto.JoinResponse{
+		Room:        roomProto,
+		Participant: participant.ToProto(),
+		PingTimeout:  s.cfg.PingTimeout(),
+		PingInterval: s.cfg.PingInterval(),
+		ServerInfo: &proto.ServerInfo{
+			NodeId:   string(s.node.ID),
+			Region:   string(s.node.Region),
+			Protocol: 1,
+		},
+		SendTransport:    s.transportToProto(sendTransport),
+		ReceiveTransport: s.transportToProto(recvTransport),
+		Signal:           sig.info,
+		RtpCapabilities:  router.RtpCapabilities(),
+	}
+
+	w.Header().Set("X-Node-Id", string(s.node.ID))
+	w.Header().Set("X-Log-Id", logId)
+
+	writeJSON(w, http.StatusOK, resp)
+
+	slog.Info("Participant reconnected", "sid", req.ParticipantSid, "logId", logId)
+}
+
+// ============================================================
+// NATS RPC Forwarding
+// ============================================================
+
+func (s *Server) forwardViaNATS(w http.ResponseWriter, targetNode types.NodeID, action string, payload json.RawMessage) {
+	rpcReq := proto.NodeRPCRequest{Action: action, Payload: payload}
+	data, _ := json.Marshal(rpcReq)
+
+	subject := fmt.Sprintf("rtc.rpc.%s", targetNode)
+	msg, err := s.nc.Request(subject, data, 5*time.Second)
+	if err != nil {
+		slog.Error("NATS forward failed", "target", targetNode, "action", action, "error", err)
+		writeJSON(w, http.StatusBadGateway, proto.ErrorResponse{
+			Code: proto.ErrCodeInternal, Error: "failed to reach target node"})
+		return
+	}
+
+	var rpcResp proto.NodeRPCResponse
+	if err := json.Unmarshal(msg.Data, &rpcResp); err != nil {
+		writeJSON(w, http.StatusBadGateway, proto.ErrorResponse{
+			Code: proto.ErrCodeInternal, Error: "invalid response from target node"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Node-Id", string(targetNode))
+	w.WriteHeader(rpcResp.Status)
+	_, _ = w.Write(rpcResp.Payload)
+}
+
+// HandleNodeRPC processes forwarded requests from other nodes via NATS.
+// Each node subscribes to "rtc.rpc.<nodeID>".
+func (s *Server) HandleNodeRPC(msg *nats.Msg) {
+	var req proto.NodeRPCRequest
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		resp := proto.NodeRPCResponse{Status: http.StatusBadRequest}
+		resp.Payload, _ = json.Marshal(proto.ErrorResponse{
+			Code: proto.ErrCodeInvalidRequest, Error: err.Error()})
+		data, _ := json.Marshal(resp)
+		_ = msg.Respond(data)
+		return
+	}
+
+	rec := &responseRecorder{}
+
+	switch req.Action {
+	case "reconnect":
+		var joinReq proto.JoinRequest
+		if err := json.Unmarshal(req.Payload, &joinReq); err != nil {
+			rec.status = http.StatusBadRequest
+			rec.body, _ = json.Marshal(proto.ErrorResponse{
+				Code: proto.ErrCodeInvalidRequest, Error: err.Error()})
+		} else {
+			s.handleReconnectLocal(rec, &joinReq, "")
+		}
+
+	case "connect":
+		var connReq proto.ConnectRequest
+		if err := json.Unmarshal(req.Payload, &connReq); err != nil {
+			rec.status = http.StatusBadRequest
+			rec.body, _ = json.Marshal(proto.ErrorResponse{
+				Code: proto.ErrCodeInvalidRequest, Error: err.Error()})
+		} else {
+			participant := s.roomManager.GetParticipantBySid(connReq.ParticipantSid)
+			if participant == nil {
+				rec.status = http.StatusNotFound
+				rec.body, _ = json.Marshal(proto.ErrorResponse{
+					Code: proto.ErrCodeNotFound, Error: "participant not found"})
+			} else {
+				s.handleConnectLocal(rec, &connReq, participant, "")
+			}
+		}
+
+	default:
+		rec.status = http.StatusBadRequest
+		rec.body, _ = json.Marshal(proto.ErrorResponse{
+			Code: proto.ErrCodeInvalidRequest, Error: "unknown action: " + req.Action})
+	}
+
+	if rec.status == 0 {
+		rec.status = http.StatusOK
+	}
+	rpcResp := proto.NodeRPCResponse{Status: rec.status, Payload: rec.body}
+	data, _ := json.Marshal(rpcResp)
+	_ = msg.Respond(data)
+}
+
+// responseRecorder captures the status and body from handler methods so they
+// can be relayed over NATS instead of HTTP.
+type responseRecorder struct {
+	headers http.Header
+	status  int
+	body    json.RawMessage
+}
+
+func (r *responseRecorder) Header() http.Header {
+	if r.headers == nil {
+		r.headers = make(http.Header)
+	}
+	return r.headers
+}
+
+func (r *responseRecorder) WriteHeader(status int) {
+	r.status = status
+}
+
+func (r *responseRecorder) Write(data []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	r.body = data
+	return len(data), nil
 }
