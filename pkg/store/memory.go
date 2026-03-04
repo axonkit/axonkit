@@ -92,7 +92,7 @@ func (s *MemoryStore) Put(ctx context.Context, key string, value []byte) error {
 	copy(valCopy, value)
 	s.data[key] = valCopy
 
-	go s.notify(key, valCopy, OpPut)
+	s.notify(key, valCopy, OpPut)
 	return nil
 }
 
@@ -125,7 +125,7 @@ func (s *MemoryStore) Delete(ctx context.Context, key string) error {
 	}
 	delete(s.data, key)
 
-	go s.notify(key, nil, OpDelete)
+	s.notify(key, nil, OpDelete)
 	return nil
 }
 
@@ -158,27 +158,18 @@ func (s *MemoryStore) Watch(ctx context.Context, pattern string, opts ...WatchOp
 
 	s.watchers = append(s.watchers, w)
 
-	// Initial state (NATS watchers usually send current state)
-	// Iterate all data and match asynchronously to avoid blocking
-	go func() {
-		s.mu.RLock()
-
-		for k, v := range s.data {
-			if matchSubject(pattern, k) {
-				// Send copy
-				valCopy := make([]byte, len(v))
-				copy(valCopy, v)
-
-				select {
-				case w.ch <- &memoryEntry{key: k, value: valCopy, op: OpPut}:
-				case <-w.stopCh:
-					s.mu.RUnlock()
-					return
-				}
+	// Deliver initial state synchronously under the lock so that it is
+	// guaranteed to arrive before any subsequent Put/Delete notifications.
+	for k, v := range s.data {
+		if matchSubject(pattern, k) {
+			valCopy := make([]byte, len(v))
+			copy(valCopy, v)
+			select {
+			case w.ch <- &memoryEntry{key: k, value: valCopy, op: OpPut}:
+			default:
 			}
 		}
-		s.mu.RUnlock()
-	}()
+	}
 
 	return w, nil
 }
