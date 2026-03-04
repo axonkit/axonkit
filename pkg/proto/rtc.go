@@ -47,10 +47,20 @@ type CreateRoomRequest struct {
 	Metadata         string `json:"metadata,omitempty"`
 }
 
+// SyncState is sent by the client during reconnection to describe its
+// last-known view of the room. The server uses this to compute a diff and
+// notify the client of any tracks that appeared or disappeared while
+// the connection was broken.
 type SyncState struct {
-	RemoteTrackSids     []string           `json:"remoteTrackSids,omitempty"`
-	RemoteDataTrackSids []string           `json:"remoteDataTrackSids,omitempty"`
-	DataReceiveStates   []DataReceiveState `json:"dataReceiveStates,omitempty"`
+	// TrackSids the client was subscribed to (by published track sid).
+	SubscribedTrackSids []string `json:"subscribedTrackSids,omitempty"`
+	// DataTrackSids the client was subscribed to.
+	SubscribedDataTrackSids []string `json:"subscribedDataTrackSids,omitempty"`
+	// PublishedTrackSids the client had published itself (for server to verify).
+	PublishedTrackSids []string `json:"publishedTrackSids,omitempty"`
+	// DataReceiveStates records the last sequence number the client received
+	// for each data track, enabling future replay-based catch-up.
+	DataReceiveStates []DataReceiveState `json:"dataReceiveStates,omitempty"`
 }
 
 type DataReceiveState struct {

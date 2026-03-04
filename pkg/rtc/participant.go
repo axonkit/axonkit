@@ -118,8 +118,9 @@ type Participant struct {
 	pingTimeout  time.Duration
 	pingInterval time.Duration
 
-	autoSubscribe bool
-	reconnecting  bool
+	autoSubscribe    bool
+	reconnecting     bool
+	pendingSyncState *proto.SyncState
 
 	mu     sync.RWMutex
 	logger *slog.Logger
@@ -1001,6 +1002,7 @@ func (p *Participant) Reconnect(send, recv, direct *mediasoup.Transport,
 	outConsumer *mediasoup.DataConsumer,
 	inProducer *mediasoup.DataProducer,
 	inConsumer *mediasoup.DataConsumer,
+	syncState *proto.SyncState,
 ) error {
 	p.mu.Lock()
 	if p.closed {
@@ -1008,6 +1010,7 @@ func (p *Participant) Reconnect(send, recv, direct *mediasoup.Transport,
 		return fmt.Errorf("participant is closed")
 	}
 	p.reconnecting = true
+	p.pendingSyncState = syncState
 
 	// Snapshot old resources to close after releasing the lock.
 	oldSend := p.sendTransport
@@ -1023,6 +1026,10 @@ func (p *Participant) Reconnect(send, recv, direct *mediasoup.Transport,
 		close(ch)
 	}
 	p.pendingRPC = make(map[string]chan *proto.Message)
+
+	// Clear dead subscriptions — old consumers die with the old recvTransport.
+	p.subscriptions = make(map[string]*Subscription)
+	p.dataSubscriptions = make(map[string]*DataSubscription)
 
 	p.state = proto.ParticipantInfo_JOINING
 	p.mu.Unlock()

@@ -543,6 +543,7 @@ func (s *Server) handleReconnectLocal(w http.ResponseWriter, req *proto.JoinRequ
 	if err := participant.Reconnect(
 		sendTransport, recvTransport, directTransport,
 		sig.outProducer, sig.outConsumer, sig.inProducer, sig.inConsumer,
+		req.SyncState,
 	); err != nil {
 		sendTransport.Close()
 		recvTransport.Close()
