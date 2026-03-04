@@ -163,6 +163,13 @@ func NewManager(nodeID types.NodeID, nc *nats.Conn, workerBin string, opts ...Ma
 	return m
 }
 
+// Routers returns the mediasoup routers managed by this Manager.
+func (m *Manager) Routers() []*mediasoup.Router {
+	m.workerMu.RLock()
+	defer m.workerMu.RUnlock()
+	return m.routers
+}
+
 func (m *Manager) Start() error {
 	numWorkers := m.workerCount
 	if numWorkers <= 0 {

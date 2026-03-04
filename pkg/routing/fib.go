@@ -2,8 +2,8 @@ package routing
 
 import (
 	"fmt"
-	"log/slog"
 	"github.com/jiyeyuran/omnistream/pkg/types"
+	"log/slog"
 	"sync"
 	"time"
 

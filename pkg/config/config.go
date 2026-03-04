@@ -1,0 +1,94 @@
+package config
+
+import "time"
+
+type Config struct {
+	Node  NodeConfig  `json:"node"`
+	Room  RoomConfig  `json:"room"`
+	Media MediaConfig `json:"media"`
+	Auth  AuthConfig  `json:"auth"`
+	Nats  NatsConfig  `json:"nats"`
+	Debug bool        `json:"debug"`
+}
+
+type NodeConfig struct {
+	ID      string `json:"id"`
+	Region  string `json:"region"`
+	Cluster string `json:"cluster"`
+	Port    int    `json:"port"`
+}
+
+type RoomConfig struct {
+	EmptyTimeout     time.Duration `json:"emptyTimeout"`
+	DepartureTimeout time.Duration `json:"departureTimeout"`
+	MaxParticipants  int           `json:"maxParticipants"`
+	AutoSubscribe    bool          `json:"autoSubscribe"`
+	// Dynacast: only forward layers that have active subscribers.
+	// When enabled, the server tracks which layers each subscriber needs
+	// and pauses/resumes producer layers accordingly.
+	Dynacast bool `json:"dynacast"`
+}
+
+type MediaConfig struct {
+	WorkerBin   string       `json:"workerBin"`
+	WorkerCount int          `json:"workerCount"`
+	WebRtc      WebRtcConfig `json:"webRtc"`
+}
+
+type WebRtcConfig struct {
+	ListenIP    string `json:"listenIp"`
+	AnnouncedIP string `json:"announcedIp"`
+	MinPort     uint16 `json:"minPort"`
+	MaxPort     uint16 `json:"maxPort"`
+}
+
+type AuthConfig struct {
+	APIKey    string        `json:"apiKey"`
+	APISecret string        `json:"apiSecret"`
+	TokenTTL  time.Duration `json:"tokenTtl"`
+}
+
+type NatsConfig struct {
+	URL string `json:"url"`
+}
+
+func DefaultConfig() *Config {
+	return &Config{
+		Node: NodeConfig{
+			ID:      "node-1",
+			Region:  "default-region",
+			Cluster: "default-cluster",
+			Port:    8080,
+		},
+		Room: RoomConfig{
+			EmptyTimeout:     5 * time.Minute,
+			DepartureTimeout: 20 * time.Second,
+			MaxParticipants:  100,
+			AutoSubscribe:    true,
+			Dynacast:         true,
+		},
+		Media: MediaConfig{
+			WorkerBin: "mediasoup-worker",
+			WebRtc: WebRtcConfig{
+				ListenIP:    "0.0.0.0",
+				AnnouncedIP: "",
+				MinPort:     40000,
+				MaxPort:     49999,
+			},
+		},
+		Auth: AuthConfig{
+			TokenTTL: 6 * time.Hour,
+		},
+		Nats: NatsConfig{
+			URL: "nats://localhost:4222",
+		},
+		Debug: false,
+	}
+}
+
+// PingInterval returns the ping interval in seconds for client heartbeat.
+func (c *Config) PingInterval() int32 { return 5 }
+
+// PingTimeout returns the ping timeout in seconds. If no ping is received
+// within this duration, the participant is considered disconnected.
+func (c *Config) PingTimeout() int32 { return 15 }

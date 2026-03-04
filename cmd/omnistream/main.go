@@ -10,9 +10,12 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/jiyeyuran/omnistream/pkg/auth"
+	"github.com/jiyeyuran/omnistream/pkg/config"
 	"github.com/jiyeyuran/omnistream/pkg/discovery"
 	"github.com/jiyeyuran/omnistream/pkg/media"
 	"github.com/jiyeyuran/omnistream/pkg/routing"
+	"github.com/jiyeyuran/omnistream/pkg/rtc"
 	"github.com/jiyeyuran/omnistream/pkg/server"
 	"github.com/jiyeyuran/omnistream/pkg/store"
 	"github.com/jiyeyuran/omnistream/pkg/types"
@@ -28,28 +31,41 @@ var (
 	natsURL   = flag.String("nats", nats.DefaultURL, "NATS URL")
 	httpPort  = flag.Int("port", 8080, "HTTP Port")
 	workerBin = flag.String("worker", "mediasoup-worker", "Path to mediasoup-worker binary")
+	apiKey    = flag.String("api-key", "", "API key for token verification")
+	apiSecret = flag.String("api-secret", "", "API secret for token signing")
+	debug     = flag.Bool("debug", false, "Debug mode (skip token verification)")
 )
 
 func main() {
 	flag.Parse()
 
-	// Initialize structured logger
-	opts := &slog.HandlerOptions{
-		Level: slog.LevelDebug,
-	}
+	opts := &slog.HandlerOptions{Level: slog.LevelDebug}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, opts))
 	slog.SetDefault(logger)
 
+	cfg := config.DefaultConfig()
+	cfg.Node.ID = *nodeID
+	cfg.Node.Region = *regionID
+	cfg.Node.Cluster = *clusterID
+	cfg.Node.Port = *httpPort
+	cfg.Media.WorkerBin = *workerBin
+	cfg.Nats.URL = *natsURL
+	cfg.Auth.APIKey = *apiKey
+	cfg.Auth.APISecret = *apiSecret
+	cfg.Debug = *debug
+
 	myNode := types.NodeInfo{
-		ID:      types.NodeID(*nodeID),
-		Region:  types.RegionID(*regionID),
-		Cluster: types.ClusterID(*clusterID),
+		ID:      types.NodeID(cfg.Node.ID),
+		Region:  types.RegionID(cfg.Node.Region),
+		Cluster: types.ClusterID(cfg.Node.Cluster),
 	}
 
-	slog.Info("Starting Mediasoup Demo Node", "id", myNode.ID, "region", myNode.Region, "cluster", myNode.Cluster)
+	slog.Info("Starting OmniStream Node",
+		"id", myNode.ID, "region", myNode.Region, "cluster", myNode.Cluster,
+		"debug", cfg.Debug)
 
 	// 1. Connect to NATS
-	nc, err := nats.Connect(*natsURL)
+	nc, err := nats.Connect(cfg.Nats.URL)
 	if err != nil {
 		slog.Error("Failed to connect to NATS", "error", err)
 		os.Exit(1)
@@ -71,30 +87,24 @@ func main() {
 	rib := routing.NewRIB(kv, myNode)
 
 	linkDB := routing.NewLinkDB(myNode)
-	// Demo Setup: Pre-populate LinkDB
-	// Note: We use ClusterID for LinkDB now
 	switch *clusterID {
-	case "SanFrancisco": // US-B
+	case "SanFrancisco":
 		linkDB.UpdateClusterLink("Beijing", 200, 0, 100)
 		linkDB.UpdateClusterLink("NewYork", 30, 0, 10)
-		// Fallback region link
 		linkDB.UpdateRegionLink("CN", 180, 0, 90)
-		slog.Info("Configured LinkDB: SanFrancisco -> Beijing (200ms), Region CN (180ms)")
-	case "NewYork": // US-A
+	case "NewYork":
 		linkDB.UpdateClusterLink("Beijing", 200, 0, 100)
-		slog.Info("Configured LinkDB: NewYork -> Beijing (200ms)")
 	}
 
 	finder := discovery.NewFinder(rib, linkDB, myNode)
+	_ = finder // TODO: wire into RTC subscription path for cross-node routing
 	fib := routing.NewFIB(rib, myNode.ID)
 
 	// 3. Init Media Manager
-	mediaMgr := media.NewManager(myNode.ID, nc, *workerBin)
+	mediaMgr := media.NewManager(myNode.ID, nc, cfg.Media.WorkerBin)
 	mediaMgr.OnStreamClosed = func(streamID types.StreamID) {
 		if err := rib.StopAdvertise(streamID); err != nil {
-			slog.Error("Failed to stop advertise closed stream", "stream_id", streamID, "error", err)
-		} else {
-			slog.Info("Stop advertise closed stream", "stream_id", streamID)
+			slog.Error("Failed to stop advertise", "stream_id", streamID, "error", err)
 		}
 	}
 	if err := mediaMgr.Start(); err != nil {
@@ -103,11 +113,10 @@ func main() {
 	}
 	linkDB.SetRTTProvider(mediaMgr.ProbeRTT)
 
-	// Wire FIB to Media Manager
 	fib.ConnectPipe = mediaMgr.ConnectPipe
 	fib.DisconnectPipe = mediaMgr.DisconnectPipe
 
-	// 4. Init Node Registry (Discovery & Heartbeat)
+	// 4. Init Node Registry
 	nodeStore, err := store.NewNatsStore(context.Background(), js, discovery.NodeBucketName, discovery.NodeTTL)
 	if err != nil {
 		slog.Error("Failed to init Node Store", "error", err)
@@ -119,19 +128,14 @@ func main() {
 		slog.Error("Failed to start Node Registry", "error", err)
 		os.Exit(1)
 	}
-	// Note: We don't defer registry.Close() here because it might delete the node record immediately
-	// while we want it to expire naturally if we crash.
-	// But for graceful shutdown we can call it at the end.
 
-	// Watch for node offline events to cleanup resources
 	err = registry.WatchNodes(func(node types.NodeInfo, isDelete bool) {
 		if isDelete {
-			slog.Info("Detected node offline, cleaning up resources", "node_id", node.ID)
+			slog.Info("Node offline, cleaning up", "node_id", node.ID)
 			mediaMgr.CleanUpNode(node.ID)
 			linkDB.RemoveNode(node.ID)
 		} else {
-			// Node Added/Updated
-			slog.Debug("Detected node online", "node_id", node.ID, "cluster", node.Cluster)
+			slog.Debug("Node online", "node_id", node.ID, "cluster", node.Cluster)
 			linkDB.AddNode(node)
 		}
 	})
@@ -139,15 +143,28 @@ func main() {
 		slog.Error("Failed to start node watcher", "error", err)
 	}
 
-	// Start Probing & Ping Handler
 	linkDB.StartProbing(context.Background())
 
-	// 5. HTTP API
+	// 5. Init Room Manager
+	roomManager := rtc.NewRoomManager(cfg.Room)
+
+	// 6. Init Token Verifier
+	verifier := auth.NewTokenVerifier(cfg.Auth.APIKey, cfg.Auth.APISecret)
+
+	// 7. HTTP API
+	srv := server.NewServer(server.ServerParams{
+		Config:      cfg,
+		RoomManager: roomManager,
+		Verifier:    verifier,
+		Node:        myNode,
+		Routers:     mediaMgr.Routers(),
+	})
+
 	mux := http.NewServeMux()
-	server.RegisterHTTPRoutes(mux, mediaMgr, rib, fib, finder, myNode)
+	srv.RegisterRoutes(mux)
 
 	go func() {
-		addr := fmt.Sprintf(":%d", *httpPort)
+		addr := fmt.Sprintf(":%d", cfg.Node.Port)
 		slog.Info("HTTP server listening", "addr", addr)
 		if err := http.ListenAndServe(addr, server.WithLogging(mux)); err != nil {
 			slog.Error("HTTP server failed", "error", err)
@@ -163,6 +180,7 @@ func main() {
 
 	fib.Close()
 	rib.Close()
+	roomManager.Close()
 	mediaMgr.Close()
 	registry.Close()
 
