@@ -48,10 +48,6 @@ type Manager struct {
 	producers   map[types.StreamID]*LocalProducer
 	producersMu sync.RWMutex
 
-	// Clients: ClientID -> Context
-	clients   map[string]*ClientContext
-	clientsMu sync.RWMutex
-
 	// Singleflight
 	sf singleflight.Group
 
@@ -87,14 +83,6 @@ type ServingDataConsumerInfo struct {
 	Consumer   *mediasoup.DataConsumer
 	RemoteNode types.NodeID
 	StreamID   types.StreamID
-}
-
-type ClientContext struct {
-	ClientID  string
-	Transport *mediasoup.Transport
-	Router    *mediasoup.Router
-	Consumers map[types.StreamID]*mediasoup.Consumer
-	Mu        sync.Mutex
 }
 
 type LocalProducer struct {
@@ -151,7 +139,6 @@ func NewManager(nodeID types.NodeID, nc *nats.Conn, workerBin string, opts ...Ma
 		logger:               slog.Default().With("component", "MediaManager"),
 		pipeTransports:       make(map[string]map[string]*pipeTransport),
 		producers:            make(map[types.StreamID]*LocalProducer),
-		clients:              make(map[string]*ClientContext),
 		servingConsumers:     make(map[string]*ServingConsumerInfo),
 		servingDataConsumers: make(map[string]*ServingDataConsumerInfo),
 		pingChannels:         make(map[types.NodeID]*PingChannel),
@@ -168,6 +155,51 @@ func (m *Manager) Routers() []*mediasoup.Router {
 	m.workerMu.RLock()
 	defer m.workerMu.RUnlock()
 	return m.routers
+}
+
+// RegisterProducer registers a local producer (from a participant) so the
+// pipe system can find it when a remote node requests the stream.
+func (m *Manager) RegisterProducer(streamID types.StreamID, lp *LocalProducer) {
+	m.producersMu.Lock()
+	m.producers[streamID] = lp
+	m.producersMu.Unlock()
+	m.logger.Info("Producer registered", "streamId", streamID)
+}
+
+// UnregisterProducer removes a producer and cleans up any downstream pipe
+// consumers that were serving the stream to remote nodes.
+func (m *Manager) UnregisterProducer(streamID types.StreamID) {
+	m.producersMu.Lock()
+	delete(m.producers, streamID)
+	m.producersMu.Unlock()
+
+	m.servingMu.Lock()
+	for id, info := range m.servingConsumers {
+		if info.StreamID == streamID {
+			delete(m.servingConsumers, id)
+			info.Consumer.Close()
+		}
+	}
+	m.servingMu.Unlock()
+
+	m.servingDataMu.Lock()
+	for id, info := range m.servingDataConsumers {
+		if info.StreamID == streamID {
+			delete(m.servingDataConsumers, id)
+			info.Consumer.Close()
+		}
+	}
+	m.servingDataMu.Unlock()
+
+	m.logger.Info("Producer unregistered", "streamId", streamID)
+}
+
+// GetLocalProducer looks up a producer by StreamID. It returns piped producers
+// (from ConnectPipe) as well as locally registered participant producers.
+func (m *Manager) GetLocalProducer(streamID types.StreamID) *LocalProducer {
+	m.producersMu.RLock()
+	defer m.producersMu.RUnlock()
+	return m.producers[streamID]
 }
 
 func (m *Manager) Start() error {
@@ -269,127 +301,6 @@ func (m *Manager) restartWorker(index int) {
 		}
 		m.logger.Error("Restart failed, retrying...", "index", index)
 	}
-}
-
-// Publish simulates a client publishing a stream
-func (m *Manager) Publish() (types.StreamID, error) {
-	idx := int(time.Now().UnixNano() % int64(len(m.routers)))
-	if idx < 0 {
-		idx = -idx
-	}
-	router := m.routers[idx]
-
-	transport, err := router.CreatePlainTransport(&mediasoup.PlainTransportOptions{
-		ListenInfo: mediasoup.TransportListenInfo{
-			Ip:       "127.0.0.1",
-			Protocol: mediasoup.TransportProtocolUDP,
-		},
-	})
-	if err != nil {
-		return "", err
-	}
-
-	producer, err := transport.Produce(&mediasoup.ProducerOptions{
-		RtpParameters: &mediasoup.RtpParameters{
-			Mid: "VIDEO",
-			Codecs: []*mediasoup.RtpCodecParameters{
-				{
-					MimeType:    "video/h264",
-					PayloadType: 112,
-					ClockRate:   90000,
-					Parameters: mediasoup.RtpCodecSpecificParameters{
-						PacketizationMode: 1,
-						ProfileLevelId:    "4d0032",
-					},
-					RtcpFeedback: []*mediasoup.RtcpFeedback{
-						{Type: "nack", Parameter: ""},
-						{Type: "nack", Parameter: "pli"},
-						{Type: "goog-remb", Parameter: ""},
-					},
-				},
-				{
-					MimeType:    "video/rtx",
-					PayloadType: 113,
-					ClockRate:   90000,
-					Parameters:  mediasoup.RtpCodecSpecificParameters{Apt: 112},
-				},
-			},
-			HeaderExtensions: []*mediasoup.RtpHeaderExtensionParameters{
-				{
-					Uri: "urn:ietf:params:rtp-hdrext:sdes:mid",
-					Id:  10,
-				},
-				{
-					Uri: "urn:3gpp:video-orientation",
-					Id:  13,
-				},
-			},
-			Encodings: []*mediasoup.RtpEncodingParameters{
-				{Ssrc: 22222222, Rtx: &mediasoup.RtpEncodingRtx{Ssrc: 22222223}, ScalabilityMode: "L1T5"},
-				{Ssrc: 22222224, Rtx: &mediasoup.RtpEncodingRtx{Ssrc: 22222225}, ScalabilityMode: "L1T5"},
-				{Ssrc: 22222226, Rtx: &mediasoup.RtpEncodingRtx{Ssrc: 22222227}, ScalabilityMode: "L1T5"},
-				{Ssrc: 22222228, Rtx: &mediasoup.RtpEncodingRtx{Ssrc: 22222229}, ScalabilityMode: "L1T5"},
-			},
-			Rtcp: &mediasoup.RtcpParameters{
-				Cname: "video-1",
-			},
-		},
-	})
-	if err != nil {
-		return "", err
-	}
-
-	streamID := types.NewStreamID(router.Id(), producer.Id())
-
-	m.producersMu.Lock()
-	m.producers[streamID] = &LocalProducer{
-		StreamID:     streamID,
-		RouterIdx:    idx,
-		Producer:     producer,
-		RouterId:     router.Id(),
-		UpstreamNode: m.nodeID,
-	}
-	m.producersMu.Unlock()
-
-	m.logger.Info("Published stream", "stream_id", streamID, "router_idx", idx)
-	return streamID, nil
-}
-
-func (m *Manager) PublishData() (types.StreamID, error) {
-	idx := int(time.Now().UnixNano() % int64(len(m.routers)))
-	if idx < 0 {
-		idx = -idx
-	}
-	router := m.routers[idx]
-
-	direct, err := m.getOrCreateDirectTransport(router)
-	if err != nil {
-		return "", err
-	}
-	streamId := uint16(time.Now().UnixNano() % 65535)
-	dataProducer, err := direct.ProduceData(&mediasoup.DataProducerOptions{
-		Label: "data",
-		SctpStreamParameters: &mediasoup.SctpStreamParameters{
-			StreamId: streamId,
-		},
-	})
-	if err != nil {
-		return "", err
-	}
-
-	streamID := types.NewStreamID(router.Id(), dataProducer.Id())
-	m.producersMu.Lock()
-	m.producers[streamID] = &LocalProducer{
-		StreamID:     streamID,
-		RouterIdx:    idx,
-		DataProducer: dataProducer,
-		RouterId:     router.Id(),
-		UpstreamNode: m.nodeID,
-	}
-	m.producersMu.Unlock()
-
-	m.logger.Info("Published data stream", "stream_id", streamID, "router_idx", idx)
-	return streamID, nil
 }
 
 // ConnectPipe (FIB Callback)
@@ -1226,132 +1137,6 @@ func (m *Manager) handleSignaling(msg *nats.Msg) {
 	msg.Respond(data)
 }
 
-// Consume simulates a client consuming the stream
-func (m *Manager) Consume(clientID string, streamID types.StreamID) (*mediasoup.Consumer, error) {
-	// Lookup Router from local state
-	m.producersMu.RLock()
-	lp, ok := m.producers[streamID]
-	m.producersMu.RUnlock()
-
-	if !ok {
-		return nil, fmt.Errorf("stream %s not found locally", streamID)
-	}
-
-	// Get/Create Client Context
-	m.clientsMu.Lock()
-	clientCtx, ok := m.clients[clientID]
-	if !ok {
-		clientCtx = &ClientContext{
-			ClientID:  clientID,
-			Consumers: make(map[types.StreamID]*mediasoup.Consumer),
-		}
-		m.clients[clientID] = clientCtx
-	}
-	m.clientsMu.Unlock()
-
-	clientCtx.Mu.Lock()
-	defer clientCtx.Mu.Unlock()
-
-	var clientRouter *mediasoup.Router
-
-	// Reuse or Create Transport
-	if clientCtx.Transport == nil {
-		// Select Router based on ClientID for Affinity
-		idx := int(crc32.ChecksumIEEE([]byte(clientID))) % len(m.routers)
-		clientRouter = m.routers[idx]
-		clientCtx.Router = clientRouter
-
-		t, err := clientRouter.CreatePlainTransport(&mediasoup.PlainTransportOptions{
-			ListenInfo: mediasoup.TransportListenInfo{
-				Ip:       "127.0.0.1",
-				Protocol: mediasoup.TransportProtocolUDP,
-			},
-		})
-		if err != nil {
-			return nil, err
-		}
-		clientCtx.Transport = t
-		m.logger.Info("Created new transport for client", "client_id", clientID, "router_idx", idx)
-	} else {
-		clientRouter = clientCtx.Router
-	}
-
-	// Check if already consumed (Idempotency)
-	if consumer, exists := clientCtx.Consumers[streamID]; exists {
-		m.logger.Info("Client already consuming stream, returning existing consumer", "client_id", clientID, "stream_id", streamID)
-		return consumer, nil
-	}
-
-	// Check Cross-Router Pipe
-	producerIDToConsume := lp.Id()
-	if lp.RouterId != clientRouter.Id() {
-		sourceRouter := m.routers[lp.RouterIdx]
-		m.logger.Info("Piping cross-router for client", "from", sourceRouter.Id(), "to", clientRouter.Id())
-
-		res, err := sourceRouter.PipeToRouter(&mediasoup.PipeToRouterOptions{
-			ProducerId: lp.Id(),
-			Router:     clientRouter,
-			ListenInfo: mediasoup.TransportListenInfo{Ip: "127.0.0.1", Protocol: mediasoup.TransportProtocolUDP},
-		})
-		if err != nil {
-			return nil, err
-		}
-		producerIDToConsume = res.PipeProducer.Id()
-	}
-
-	// Consume
-	consumer, err := clientCtx.Transport.Consume(&mediasoup.ConsumerOptions{
-		ProducerId:      producerIDToConsume,
-		RtpCapabilities: consumerDeviceCapabilities,
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	clientCtx.Consumers[streamID] = consumer
-	m.logger.Info("Client Consumed Stream", "client_id", clientID, "stream_id", streamID, "consumer_id", consumer.Id())
-	return consumer, nil
-}
-
-func (m *Manager) Unpublish(streamID types.StreamID) error {
-	m.producersMu.Lock()
-	if lp, ok := m.producers[streamID]; ok {
-		delete(m.producers, streamID)
-		if lp.Producer != nil {
-			lp.Producer.Close()
-		}
-		if lp.DataProducer != nil {
-			lp.DataProducer.Close()
-		}
-		m.logger.Info("Unpublished stream", "stream_id", streamID)
-	}
-	m.producersMu.Unlock()
-
-	// Clean up serving consumers (Downstreams)
-	m.servingMu.Lock()
-	for id, info := range m.servingConsumers {
-		if info.StreamID == streamID {
-			delete(m.servingConsumers, id)
-			info.Consumer.Close()
-			m.logger.Info("Closing serving consumer for unpublished stream", "consumer_id", id, "remote_node", info.RemoteNode)
-		}
-	}
-	m.servingMu.Unlock()
-
-	m.servingDataMu.Lock()
-	for id, info := range m.servingDataConsumers {
-		if info.StreamID == streamID {
-			delete(m.servingDataConsumers, id)
-			info.Consumer.Close()
-			m.logger.Info("Closing serving data consumer for unpublished stream", "consumer_id", id, "remote_node", info.RemoteNode)
-		}
-	}
-	m.servingDataMu.Unlock()
-
-	return nil
-}
-
 func (m *Manager) DisconnectPipe(streamID types.StreamID, pipeID string, upstreamNode types.NodeID) error {
 	m.producersMu.Lock()
 	defer m.producersMu.Unlock()
@@ -1375,26 +1160,6 @@ func (m *Manager) DisconnectPipe(streamID types.StreamID, pipeID string, upstrea
 		m.logger.Info("Disconnected pipe", "stream_id", streamID, "pipe_id", pipeID)
 	}
 
-	return nil
-}
-
-func (m *Manager) Unsubscribe(clientID string, streamID types.StreamID) error {
-	m.clientsMu.RLock()
-	clientCtx, ok := m.clients[clientID]
-	m.clientsMu.RUnlock()
-
-	if !ok {
-		return nil
-	}
-
-	clientCtx.Mu.Lock()
-	defer clientCtx.Mu.Unlock()
-
-	if consumer, ok := clientCtx.Consumers[streamID]; ok {
-		consumer.Close()
-		delete(clientCtx.Consumers, streamID)
-		m.logger.Info("Unsubscribed stream", "client_id", clientID, "stream_id", streamID)
-	}
 	return nil
 }
 
@@ -1458,17 +1223,7 @@ func (m *Manager) cleanupWorkerResources(deadRouterID string) {
 	}
 	m.pingMu.Unlock()
 
-	// 4. Clean Clients
-	m.clientsMu.Lock()
-	for clientID, ctx := range m.clients {
-		if ctx.Router.Id() == deadRouterID {
-			delete(m.clients, clientID)
-			m.logger.Info("Cleaned up client", "client_id", clientID)
-		}
-	}
-	m.clientsMu.Unlock()
-
-	// 5. Clean serving Consumers
+	// 4. Clean serving Consumers
 	m.servingMu.Lock()
 	for id, info := range m.servingConsumers {
 		if info.StreamID.RouterID() == deadRouterID {
@@ -1479,7 +1234,7 @@ func (m *Manager) cleanupWorkerResources(deadRouterID string) {
 	}
 	m.servingMu.Unlock()
 
-	// 6. Clean serving Data Consumers
+	// 5. Clean serving Data Consumers
 	m.servingDataMu.Lock()
 	for id, info := range m.servingDataConsumers {
 		if info.StreamID.RouterID() == deadRouterID {

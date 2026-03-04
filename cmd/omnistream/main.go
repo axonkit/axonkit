@@ -97,7 +97,6 @@ func main() {
 	}
 
 	finder := discovery.NewFinder(rib, linkDB, myNode)
-	_ = finder // TODO: wire into RTC subscription path for cross-node routing
 	fib := routing.NewFIB(rib, myNode.ID)
 
 	// 3. Init Media Manager
@@ -146,7 +145,11 @@ func main() {
 	linkDB.StartProbing(context.Background())
 
 	// 5. Init Room Manager
-	roomManager := rtc.NewRoomManager(cfg.Room)
+	roomManager := rtc.NewRoomManager(rtc.RoomManagerParams{
+		Config: cfg.Room,
+		FIB:    fib,
+		Finder: finder,
+	})
 
 	// 6. Init Token Verifier
 	verifier := auth.NewTokenVerifier(cfg.Auth.APIKey, cfg.Auth.APISecret)

@@ -10,6 +10,8 @@ import (
 	"github.com/nats-io/nats-server/v2/server"
 	natsserver "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
+
+	"github.com/jiyeyuran/mediasoup-go/v2"
 )
 
 func setupNats(t *testing.T) (*server.Server, *nats.Conn) {
@@ -49,6 +51,113 @@ func waitUntil(t *testing.T, cond func() bool) {
 	t.Fatalf("timeout")
 }
 
+// testPublish creates a producer via PlainTransport and registers it.
+func testPublish(t *testing.T, m *Manager) types.StreamID {
+	t.Helper()
+	idx := int(time.Now().UnixNano() % int64(len(m.routers)))
+	if idx < 0 {
+		idx = -idx
+	}
+	router := m.routers[idx]
+
+	transport, err := router.CreatePlainTransport(&mediasoup.PlainTransportOptions{
+		ListenInfo: mediasoup.TransportListenInfo{
+			Ip:       "127.0.0.1",
+			Protocol: mediasoup.TransportProtocolUDP,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreatePlainTransport failed: %v", err)
+	}
+
+	producer, err := transport.Produce(&mediasoup.ProducerOptions{
+		RtpParameters: &mediasoup.RtpParameters{
+			Mid: "VIDEO",
+			Codecs: []*mediasoup.RtpCodecParameters{
+				{
+					MimeType:    "video/h264",
+					PayloadType: 112,
+					ClockRate:   90000,
+					Parameters: mediasoup.RtpCodecSpecificParameters{
+						PacketizationMode: 1,
+						ProfileLevelId:    "4d0032",
+					},
+					RtcpFeedback: []*mediasoup.RtcpFeedback{
+						{Type: "nack", Parameter: ""},
+						{Type: "nack", Parameter: "pli"},
+						{Type: "goog-remb", Parameter: ""},
+					},
+				},
+				{
+					MimeType:    "video/rtx",
+					PayloadType: 113,
+					ClockRate:   90000,
+					Parameters:  mediasoup.RtpCodecSpecificParameters{Apt: 112},
+				},
+			},
+			HeaderExtensions: []*mediasoup.RtpHeaderExtensionParameters{
+				{Uri: "urn:ietf:params:rtp-hdrext:sdes:mid", Id: 10},
+				{Uri: "urn:3gpp:video-orientation", Id: 13},
+			},
+			Encodings: []*mediasoup.RtpEncodingParameters{
+				{Ssrc: 22222222, Rtx: &mediasoup.RtpEncodingRtx{Ssrc: 22222223}, ScalabilityMode: "L1T5"},
+				{Ssrc: 22222224, Rtx: &mediasoup.RtpEncodingRtx{Ssrc: 22222225}, ScalabilityMode: "L1T5"},
+				{Ssrc: 22222226, Rtx: &mediasoup.RtpEncodingRtx{Ssrc: 22222227}, ScalabilityMode: "L1T5"},
+				{Ssrc: 22222228, Rtx: &mediasoup.RtpEncodingRtx{Ssrc: 22222229}, ScalabilityMode: "L1T5"},
+			},
+			Rtcp: &mediasoup.RtcpParameters{Cname: "video-1"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Produce failed: %v", err)
+	}
+
+	streamID := types.NewStreamID(router.Id(), producer.Id())
+	m.RegisterProducer(streamID, &LocalProducer{
+		StreamID:     streamID,
+		RouterIdx:    idx,
+		Producer:     producer,
+		RouterId:     router.Id(),
+		UpstreamNode: m.nodeID,
+	})
+	return streamID
+}
+
+// testPublishData creates a data producer via DirectTransport and registers it.
+func testPublishData(t *testing.T, m *Manager) types.StreamID {
+	t.Helper()
+	idx := int(time.Now().UnixNano() % int64(len(m.routers)))
+	if idx < 0 {
+		idx = -idx
+	}
+	router := m.routers[idx]
+
+	direct, err := m.getOrCreateDirectTransport(router)
+	if err != nil {
+		t.Fatalf("getOrCreateDirectTransport failed: %v", err)
+	}
+	sctpStreamId := uint16(time.Now().UnixNano() % 65535)
+	dataProducer, err := direct.ProduceData(&mediasoup.DataProducerOptions{
+		Label: "data",
+		SctpStreamParameters: &mediasoup.SctpStreamParameters{
+			StreamId: sctpStreamId,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ProduceData failed: %v", err)
+	}
+
+	streamID := types.NewStreamID(router.Id(), dataProducer.Id())
+	m.RegisterProducer(streamID, &LocalProducer{
+		StreamID:     streamID,
+		RouterIdx:    idx,
+		DataProducer: dataProducer,
+		RouterId:     router.Id(),
+		UpstreamNode: m.nodeID,
+	})
+	return streamID
+}
+
 func TestManager_StartInvalidWorkerBin(t *testing.T) {
 	srv, nc := setupNats(t)
 	defer srv.Shutdown()
@@ -79,7 +188,7 @@ func TestManager_StartWithWorkerCount(t *testing.T) {
 	m.Close()
 }
 
-func TestManager_PublishConsumeLifecycle(t *testing.T) {
+func TestManager_RegisterUnregisterProducer(t *testing.T) {
 	srv, nc := setupNats(t)
 	defer srv.Shutdown()
 	defer nc.Close()
@@ -87,47 +196,15 @@ func TestManager_PublishConsumeLifecycle(t *testing.T) {
 	m := setupManager(t, "node-1", nc)
 	defer m.Close()
 
-	streamID, err := m.Publish()
-	if err != nil {
-		t.Fatalf("Publish failed: %v", err)
-	}
-	m.producersMu.RLock()
-	lp := m.producers[streamID]
-	m.producersMu.RUnlock()
+	streamID := testPublish(t, m)
+	lp := m.GetLocalProducer(streamID)
 	if lp == nil || lp.Id() == "" {
 		t.Fatalf("expected producer id")
 	}
-	consumer, err := m.Consume("client-1", streamID)
-	if err != nil {
-		t.Fatalf("Consume failed: %v", err)
-	}
-	if consumer == nil {
-		t.Fatalf("expected consumer")
-	}
-	if err := m.Unsubscribe("client-1", streamID); err != nil {
-		t.Fatalf("Unsubscribe failed: %v", err)
-	}
-	if err := m.Unpublish(streamID); err != nil {
-		t.Fatalf("Unpublish failed: %v", err)
-	}
 
-	m.producersMu.RLock()
-	_, ok := m.producers[streamID]
-	m.producersMu.RUnlock()
-	if ok {
+	m.UnregisterProducer(streamID)
+	if m.GetLocalProducer(streamID) != nil {
 		t.Fatalf("expected producer removed")
-	}
-
-	m.clientsMu.RLock()
-	ctx, ok := m.clients["client-1"]
-	m.clientsMu.RUnlock()
-	if ok {
-		ctx.Mu.Lock()
-		count := len(ctx.Consumers)
-		ctx.Mu.Unlock()
-		if count != 0 {
-			t.Fatalf("expected client consumers empty")
-		}
 	}
 }
 
@@ -137,10 +214,8 @@ func TestManager_CloseInvokesOnStreamClosed(t *testing.T) {
 	defer nc.Close()
 
 	m := setupManager(t, "node-close", nc)
-	streamID, err := m.Publish()
-	if err != nil {
-		t.Fatalf("Publish failed: %v", err)
-	}
+	streamID := testPublish(t, m)
+
 	closed := make(chan types.StreamID, 1)
 	m.OnStreamClosed = func(s types.StreamID) {
 		closed <- s
@@ -156,30 +231,6 @@ func TestManager_CloseInvokesOnStreamClosed(t *testing.T) {
 	}
 }
 
-func TestManager_ConsumeMissingStream(t *testing.T) {
-	srv, nc := setupNats(t)
-	defer srv.Shutdown()
-	defer nc.Close()
-
-	m := setupManager(t, "node-missing", nc)
-	defer m.Close()
-
-	if _, err := m.Consume("client-1", "missing.stream"); err == nil {
-		t.Fatalf("expected error for missing stream")
-	}
-}
-
-func TestManager_UnsubscribeMissingClient(t *testing.T) {
-	srv, nc := setupNats(t)
-	defer srv.Shutdown()
-	defer nc.Close()
-
-	m := NewManager("node-unsub", nc, "")
-	if err := m.Unsubscribe("missing-client", "missing.stream"); err != nil {
-		t.Fatalf("Unsubscribe failed: %v", err)
-	}
-}
-
 func TestManager_ConnectPipeLocal(t *testing.T) {
 	srv, nc := setupNats(t)
 	defer srv.Shutdown()
@@ -188,10 +239,7 @@ func TestManager_ConnectPipeLocal(t *testing.T) {
 	m := setupManager(t, "node-local", nc)
 	defer m.Close()
 
-	streamID, err := m.Publish()
-	if err != nil {
-		t.Fatalf("Publish failed: %v", err)
-	}
+	streamID := testPublish(t, m)
 	pipeID, err := m.ConnectPipe(streamID, m.nodeID)
 	if err != nil {
 		t.Fatalf("ConnectPipe failed: %v", err)
@@ -199,9 +247,7 @@ func TestManager_ConnectPipeLocal(t *testing.T) {
 	if pipeID == "" {
 		t.Fatalf("expected pipe id")
 	}
-	if err := m.Unpublish(streamID); err != nil {
-		t.Fatalf("Unpublish failed: %v", err)
-	}
+	m.UnregisterProducer(streamID)
 }
 
 func TestManager_ConnectPipeInvalidStream(t *testing.T) {
@@ -246,10 +292,7 @@ func TestManager_PipeBetweenManagersPauseResume(t *testing.T) {
 	mB := setupManager(t, "node-b", ncB)
 	defer mB.Close()
 
-	streamID, err := mA.Publish()
-	if err != nil {
-		t.Fatalf("Publish failed: %v", err)
-	}
+	streamID := testPublish(t, mA)
 	pipeID, err := mB.ConnectPipe(streamID, "node-a")
 	if err != nil {
 		t.Fatalf("ConnectPipe failed: %v", err)
@@ -284,9 +327,7 @@ func TestManager_PipeBetweenManagersPauseResume(t *testing.T) {
 	if err := mB.DisconnectPipe(streamID, pipeID, "node-a"); err != nil {
 		t.Fatalf("DisconnectPipe failed: %v", err)
 	}
-	if err := mA.Unpublish(streamID); err != nil {
-		t.Fatalf("Unpublish failed: %v", err)
-	}
+	mA.UnregisterProducer(streamID)
 }
 
 func TestManager_PipeProducerStateMismatch(t *testing.T) {
@@ -305,10 +346,7 @@ func TestManager_PipeProducerStateMismatch(t *testing.T) {
 	mB := setupManager(t, "node-b", ncB)
 	defer mB.Close()
 
-	streamID, err := mA.Publish()
-	if err != nil {
-		t.Fatalf("Publish failed: %v", err)
-	}
+	streamID := testPublish(t, mA)
 	pipeID, err := mB.ConnectPipe(streamID, "node-a")
 	if err != nil {
 		t.Fatalf("ConnectPipe failed: %v", err)
@@ -329,33 +367,7 @@ func TestManager_PipeProducerStateMismatch(t *testing.T) {
 	if err := mB.DisconnectPipe(streamID, pipeID, "node-a"); err != nil {
 		t.Fatalf("DisconnectPipe failed: %v", err)
 	}
-	if err := mA.Unpublish(streamID); err != nil {
-		t.Fatalf("Unpublish failed: %v", err)
-	}
-}
-
-func TestManager_PublishDataLifecycle(t *testing.T) {
-	srv, nc := setupNats(t)
-	defer srv.Shutdown()
-	defer nc.Close()
-
-	m := setupManager(t, "node-data", nc)
-	defer m.Close()
-
-	streamID, err := m.PublishData()
-	if err != nil {
-		t.Fatalf("PublishData failed: %v", err)
-	}
-	if err := m.Unpublish(streamID); err != nil {
-		t.Fatalf("Unpublish failed: %v", err)
-	}
-
-	m.producersMu.RLock()
-	_, ok := m.producers[streamID]
-	m.producersMu.RUnlock()
-	if ok {
-		t.Fatalf("expected data producer removed")
-	}
+	mA.UnregisterProducer(streamID)
 }
 
 func TestManager_PublishDataPipeBetweenManagers(t *testing.T) {
@@ -374,10 +386,7 @@ func TestManager_PublishDataPipeBetweenManagers(t *testing.T) {
 	mB := setupManager(t, "node-b", ncB)
 	defer mB.Close()
 
-	streamID, err := mA.PublishData()
-	if err != nil {
-		t.Fatalf("PublishData failed: %v", err)
-	}
+	streamID := testPublishData(t, mA)
 	pipeID, err := mB.ConnectPipe(streamID, "node-a")
 	if err != nil {
 		t.Fatalf("ConnectPipe failed: %v", err)
@@ -412,9 +421,7 @@ func TestManager_PublishDataPipeBetweenManagers(t *testing.T) {
 	if err := mB.DisconnectPipe(streamID, pipeID, "node-a"); err != nil {
 		t.Fatalf("DisconnectPipe failed: %v", err)
 	}
-	if err := mA.Unpublish(streamID); err != nil {
-		t.Fatalf("Unpublish failed: %v", err)
-	}
+	mA.UnregisterProducer(streamID)
 }
 
 func TestManager_HandleClosePipeRequest(t *testing.T) {
@@ -433,10 +440,7 @@ func TestManager_HandleClosePipeRequest(t *testing.T) {
 	mB := setupManager(t, "node-b", ncB)
 	defer mB.Close()
 
-	streamID, err := mA.Publish()
-	if err != nil {
-		t.Fatalf("Publish failed: %v", err)
-	}
+	streamID := testPublish(t, mA)
 	pipeID, err := mB.ConnectPipe(streamID, "node-a")
 	if err != nil {
 		t.Fatalf("ConnectPipe failed: %v", err)
@@ -452,9 +456,7 @@ func TestManager_HandleClosePipeRequest(t *testing.T) {
 		mA.servingMu.Unlock()
 		return count == 0
 	})
-	if err := mA.Unpublish(streamID); err != nil {
-		t.Fatalf("Unpublish failed: %v", err)
-	}
+	mA.UnregisterProducer(streamID)
 }
 
 func TestManager_HandlePingPayload(t *testing.T) {
@@ -504,10 +506,7 @@ func TestManager_PipeCleanupSignaling(t *testing.T) {
 	mB := setupManager(t, "node-b", ncB)
 	defer mB.Close()
 
-	streamID, err := mA.Publish()
-	if err != nil {
-		t.Fatalf("Publish failed: %v", err)
-	}
+	streamID := testPublish(t, mA)
 	if _, err := mB.ConnectPipe(streamID, "node-a"); err != nil {
 		t.Fatalf("ConnectPipe failed: %v", err)
 	}
@@ -593,10 +592,7 @@ func TestManager_PipeReuseBetweenManagers(t *testing.T) {
 	mB := setupManager(t, "node-b", ncB)
 	defer mB.Close()
 
-	streamID, err := mA.Publish()
-	if err != nil {
-		t.Fatalf("Publish failed: %v", err)
-	}
+	streamID := testPublish(t, mA)
 	pipeID1, err := mB.ConnectPipe(streamID, "node-a")
 	if err != nil {
 		t.Fatalf("ConnectPipe failed: %v", err)
@@ -617,9 +613,7 @@ func TestManager_PipeReuseBetweenManagers(t *testing.T) {
 	if err := mB.DisconnectPipe(streamID, pipeID1, "node-a"); err != nil {
 		t.Fatalf("DisconnectPipe failed: %v", err)
 	}
-	if err := mA.Unpublish(streamID); err != nil {
-		t.Fatalf("Unpublish failed: %v", err)
-	}
+	mA.UnregisterProducer(streamID)
 }
 
 func TestManager_ProbeRTTAndCleanUpNode(t *testing.T) {
@@ -691,20 +685,11 @@ func TestManager_WorkerCloseCleanup(t *testing.T) {
 	mA := setupManager(t, "node-a", ncA)
 	mB := setupManager(t, "node-b", ncB)
 
-	streamID, err := mA.Publish()
-	if err != nil {
-		t.Fatalf("Publish failed: %v", err)
-	}
-	if _, err := mA.Consume("client-1", streamID); err != nil {
-		t.Fatalf("Consume failed: %v", err)
-	}
+	streamID := testPublish(t, mA)
 	if _, err := mB.ConnectPipe(streamID, "node-a"); err != nil {
 		t.Fatalf("ConnectPipe failed: %v", err)
 	}
-	dataStreamID, err := mA.PublishData()
-	if err != nil {
-		t.Fatalf("PublishData failed: %v", err)
-	}
+	dataStreamID := testPublishData(t, mA)
 	if _, err := mB.ConnectPipe(dataStreamID, "node-a"); err != nil {
 		t.Fatalf("ConnectPipe failed: %v", err)
 	}
@@ -722,9 +707,6 @@ func TestManager_WorkerCloseCleanup(t *testing.T) {
 		mA.producersMu.RLock()
 		producersEmpty := len(mA.producers) == 0
 		mA.producersMu.RUnlock()
-		mA.clientsMu.RLock()
-		clientsEmpty := len(mA.clients) == 0
-		mA.clientsMu.RUnlock()
 		mA.servingMu.Lock()
 		servingEmpty := len(mA.servingConsumers) == 0
 		mA.servingMu.Unlock()
@@ -743,7 +725,7 @@ func TestManager_WorkerCloseCleanup(t *testing.T) {
 			}
 		}
 		mA.pipeMu.RUnlock()
-		if producersEmpty && clientsEmpty && servingEmpty && servingDataEmpty && directEmpty && pipeEmpty {
+		if producersEmpty && servingEmpty && servingDataEmpty && directEmpty && pipeEmpty {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -751,9 +733,6 @@ func TestManager_WorkerCloseCleanup(t *testing.T) {
 	mA.producersMu.RLock()
 	producersCount := len(mA.producers)
 	mA.producersMu.RUnlock()
-	mA.clientsMu.RLock()
-	clientsCount := len(mA.clients)
-	mA.clientsMu.RUnlock()
 	mA.servingMu.Lock()
 	servingCount := len(mA.servingConsumers)
 	mA.servingMu.Unlock()
@@ -769,8 +748,8 @@ func TestManager_WorkerCloseCleanup(t *testing.T) {
 		pipeCount += len(pipes)
 	}
 	mA.pipeMu.RUnlock()
-	if producersCount != 0 || clientsCount != 0 || servingCount != 0 || servingDataCount != 0 || directCount != 0 || pipeCount != 0 {
-		t.Fatalf("cleanup incomplete: producers=%d clients=%d serving=%d serving_data=%d direct=%d pipe=%d", producersCount, clientsCount, servingCount, servingDataCount, directCount, pipeCount)
+	if producersCount != 0 || servingCount != 0 || servingDataCount != 0 || directCount != 0 || pipeCount != 0 {
+		t.Fatalf("cleanup incomplete: producers=%d serving=%d serving_data=%d direct=%d pipe=%d", producersCount, servingCount, servingDataCount, directCount, pipeCount)
 	}
 
 	mA.Close()

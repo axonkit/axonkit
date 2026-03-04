@@ -5,6 +5,8 @@ import (
 	"sync"
 
 	"github.com/jiyeyuran/omnistream/pkg/config"
+	"github.com/jiyeyuran/omnistream/pkg/discovery"
+	"github.com/jiyeyuran/omnistream/pkg/routing"
 	"github.com/rs/xid"
 )
 
@@ -16,14 +18,26 @@ type RoomManager struct {
 	roomsBySid map[string]*Room // sid -> room
 	mu         sync.RWMutex
 	config     config.RoomConfig
-	logger     *slog.Logger
+
+	fib    *routing.FIB
+	finder *discovery.Finder
+
+	logger *slog.Logger
 }
 
-func NewRoomManager(cfg config.RoomConfig) *RoomManager {
+type RoomManagerParams struct {
+	Config config.RoomConfig
+	FIB    *routing.FIB
+	Finder *discovery.Finder
+}
+
+func NewRoomManager(params RoomManagerParams) *RoomManager {
 	return &RoomManager{
 		rooms:      make(map[string]*Room),
 		roomsBySid: make(map[string]*Room),
-		config:     cfg,
+		config:     params.Config,
+		fib:        params.FIB,
+		finder:     params.Finder,
 		logger:     slog.Default().With("component", "RoomManager"),
 	}
 }
