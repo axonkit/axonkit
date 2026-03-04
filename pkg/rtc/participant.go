@@ -2,7 +2,6 @@ package rtc
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -109,7 +108,7 @@ type Participant struct {
 	dataSubscriptions   map[string]*DataSubscription
 
 	// RPC request/response correlation
-	pendingRPC map[string]chan *proto.RPCMessage
+	pendingRPC map[string]chan *proto.Message
 
 	// Heartbeat
 	lastPing     time.Time
@@ -153,7 +152,7 @@ func NewParticipant(params ParticipantParams) *Participant {
 		dataPublishedTracks: make(map[string]*DataPublishedTrack),
 		subscriptions:       make(map[string]*Subscription),
 		dataSubscriptions:   make(map[string]*DataSubscription),
-		pendingRPC:          make(map[string]chan *proto.RPCMessage),
+		pendingRPC:          make(map[string]chan *proto.Message),
 		autoSubscribe:       params.AutoSubscribe,
 		pingInterval:        params.PingInterval,
 		pingTimeout:         params.PingTimeout,
@@ -561,9 +560,9 @@ func (p *Participant) Subscribe(track *PublishedTrack, publisher *Participant) e
 		return fmt.Errorf("subscription RPC failed: %w", err)
 	}
 
-	if resp.Header.Status != proto.StatusOK {
+	if resp.Status != proto.StatusOK {
 		consumer.Close()
-		return fmt.Errorf("client rejected subscription: %s", resp.Header.Error)
+		return fmt.Errorf("client rejected subscription: %s", resp.Error())
 	}
 
 	if err := consumer.Resume(); err != nil {
@@ -643,9 +642,9 @@ func (p *Participant) SubscribeData(track *DataPublishedTrack, publisher *Partic
 		return fmt.Errorf("data subscription RPC failed: %w", err)
 	}
 
-	if resp.Header.Status != proto.StatusOK {
+	if resp.Status != proto.StatusOK {
 		dataConsumer.Close()
-		return fmt.Errorf("client rejected data subscription: %s", resp.Header.Error)
+		return fmt.Errorf("client rejected data subscription: %s", resp.Error())
 	}
 
 	p.mu.Lock()
@@ -756,7 +755,7 @@ func (p *Participant) CloseDataSubscription(dataSub string) error {
 
 // SendNotification sends a one-way message to the client (no response expected).
 func (p *Participant) SendNotification(method string, body any) error {
-	msg, err := proto.NewNotification(method, body)
+	msg, err := proto.NewJSONNotification(method, body)
 	if err != nil {
 		return err
 	}
@@ -766,14 +765,14 @@ func (p *Participant) SendNotification(method string, body any) error {
 // Request sends an RPC request to the client and waits for the response.
 // This is used for server-initiated RPCs like subscription.create where
 // the server needs the client to acknowledge before proceeding.
-func (p *Participant) Request(method string, body any) (*proto.RPCMessage, error) {
+func (p *Participant) Request(method string, body any) (*proto.Message, error) {
 	logId := xid.New().String()
-	msg, err := proto.NewRequest(method, logId, body)
+	msg, err := proto.NewJSONRequest(method, logId, body)
 	if err != nil {
 		return nil, err
 	}
 
-	ch := make(chan *proto.RPCMessage, 1)
+	ch := make(chan *proto.Message, 1)
 	p.mu.Lock()
 	p.pendingRPC[logId] = ch
 	p.mu.Unlock()
@@ -796,7 +795,7 @@ func (p *Participant) Request(method string, body any) (*proto.RPCMessage, error
 	}
 }
 
-func (p *Participant) sendMessage(msg *proto.RPCMessage) error {
+func (p *Participant) sendMessage(msg *proto.Message) error {
 	p.mu.RLock()
 	producer := p.signalOutProducer
 	p.mu.RUnlock()
@@ -805,7 +804,7 @@ func (p *Participant) sendMessage(msg *proto.RPCMessage) error {
 		return fmt.Errorf("signal channel not established")
 	}
 
-	data, err := json.Marshal(msg)
+	data, err := msg.Encode()
 	if err != nil {
 		return err
 	}
@@ -814,23 +813,23 @@ func (p *Participant) sendMessage(msg *proto.RPCMessage) error {
 }
 
 func (p *Participant) handleIncomingMessage(payload []byte) {
-	var msg proto.RPCMessage
-	if err := json.Unmarshal(payload, &msg); err != nil {
+	msg, err := proto.DecodeMessage(payload)
+	if err != nil {
 		p.logger.Warn("Invalid RPC message", "error", err)
 		return
 	}
 
-	if msg.Header.IsReply {
+	if msg.IsResponse() {
 		p.mu.RLock()
-		ch, ok := p.pendingRPC[msg.Header.LogId]
+		ch, ok := p.pendingRPC[msg.LogId]
 		p.mu.RUnlock()
 		if ok {
-			ch <- &msg
+			ch <- msg
 		}
 		return
 	}
 
-	go p.dispatchRPC(&msg)
+	go p.dispatchRPC(msg)
 }
 
 // ============================================================
@@ -941,7 +940,7 @@ func (p *Participant) Close(reason proto.DisconnectReason) {
 	for _, ch := range p.pendingRPC {
 		close(ch)
 	}
-	p.pendingRPC = make(map[string]chan *proto.RPCMessage)
+	p.pendingRPC = make(map[string]chan *proto.Message)
 	p.mu.Unlock()
 
 	_ = p.SendNotification(proto.MethodDisconnect, &proto.DisconnectNotification{
