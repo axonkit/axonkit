@@ -253,6 +253,16 @@ func (p *Participant) SetTransports(send, recv, direct *mediasoup.Transport) {
 	p.sendTransport = send
 	p.recvTransport = recv
 	p.directTransport = direct
+
+	iceHandler := func(state mediasoup.IceState) {
+		p.handleIceStateChange(state)
+	}
+	if send != nil {
+		send.OnIceStateChange(iceHandler)
+	}
+	if recv != nil {
+		recv.OnIceStateChange(iceHandler)
+	}
 }
 
 // SetSignal sets all four signal datachannel resources at once.
@@ -269,13 +279,32 @@ func (p *Participant) SetSignal(
 	p.signalOutConsumer = outConsumer
 	p.signalInProducer = inProducer
 	p.signalInConsumer = inConsumer
-	p.state = proto.ParticipantInfo_ACTIVE
 	p.mu.Unlock()
 
 	if inConsumer != nil {
 		inConsumer.OnMessage(func(payload []byte, ppid mediasoup.SctpPayloadType) {
 			p.handleIncomingMessage(payload)
 		})
+	}
+}
+
+func (p *Participant) handleIceStateChange(state mediasoup.IceState) {
+	p.logger.Info("ICE state changed", "state", state)
+
+	switch state {
+	case mediasoup.IceStateConnected, mediasoup.IceStateCompleted:
+		p.mu.Lock()
+		if p.state == proto.ParticipantInfo_JOINING {
+			p.state = proto.ParticipantInfo_ACTIVE
+		}
+		p.mu.Unlock()
+
+	case mediasoup.IceStateDisconnected:
+		p.logger.Warn("ICE disconnected")
+
+	case mediasoup.IceStateClosed:
+		p.logger.Warn("ICE closed, disconnecting participant")
+		p.Close(proto.DisconnectReason_CONNECTION_TIMEOUT)
 	}
 }
 
