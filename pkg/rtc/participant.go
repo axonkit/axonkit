@@ -109,6 +109,8 @@ type Participant struct {
 
 	// RPC request/response correlation
 	pendingRPC map[string]chan *proto.Message
+	msgCh      chan *proto.Message // bounded inbound message queue
+	done       chan struct{}       // closed on Close() to stop messageLoop
 
 	// Heartbeat
 	lastPing     time.Time
@@ -137,6 +139,8 @@ type ParticipantParams struct {
 	PingTimeout   time.Duration
 }
 
+const msgQueueSize = 256
+
 func NewParticipant(params ParticipantParams) *Participant {
 	p := &Participant{
 		sid:                 params.Sid,
@@ -153,6 +157,8 @@ func NewParticipant(params ParticipantParams) *Participant {
 		subscriptions:       make(map[string]*Subscription),
 		dataSubscriptions:   make(map[string]*DataSubscription),
 		pendingRPC:          make(map[string]chan *proto.Message),
+		msgCh:               make(chan *proto.Message, msgQueueSize),
+		done:                make(chan struct{}),
 		autoSubscribe:       params.AutoSubscribe,
 		pingInterval:        params.PingInterval,
 		pingTimeout:         params.PingTimeout,
@@ -160,6 +166,7 @@ func NewParticipant(params ParticipantParams) *Participant {
 			"identity", params.Identity, "sid", params.Sid),
 	}
 	p.permission = p.permissionFromGrants()
+	go p.messageLoop()
 	return p
 }
 
@@ -819,6 +826,7 @@ func (p *Participant) handleIncomingMessage(payload []byte) {
 		return
 	}
 
+	// Responses bypass the queue — deliver directly to the waiting caller.
 	if msg.IsResponse() {
 		p.mu.RLock()
 		ch, ok := p.pendingRPC[msg.LogId]
@@ -829,7 +837,29 @@ func (p *Participant) handleIncomingMessage(payload []byte) {
 		return
 	}
 
-	go p.dispatchRPC(msg)
+	// Requests/notifications are queued for ordered, single-goroutine processing.
+	select {
+	case p.msgCh <- msg:
+	case <-p.done:
+	default:
+		p.logger.Warn("Message queue full, dropping message", "method", msg.Method)
+		if msg.IsRequest() {
+			_ = p.sendMessage(proto.NewErrorResponse(msg.LogId, proto.StatusInternalError, "server busy"))
+		}
+	}
+}
+
+// messageLoop drains the inbound message queue in a single goroutine,
+// guaranteeing processing order and bounding concurrency.
+func (p *Participant) messageLoop() {
+	for {
+		select {
+		case msg := <-p.msgCh:
+			p.dispatchRPC(msg)
+		case <-p.done:
+			return
+		}
+	}
 }
 
 // ============================================================
@@ -942,6 +972,8 @@ func (p *Participant) Close(reason proto.DisconnectReason) {
 	}
 	p.pendingRPC = make(map[string]chan *proto.Message)
 	p.mu.Unlock()
+
+	close(p.done)
 
 	_ = p.SendNotification(proto.MethodDisconnect, &proto.DisconnectNotification{
 		Reason: reason,
