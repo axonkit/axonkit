@@ -1,6 +1,10 @@
 package config
 
-import "time"
+import (
+	"time"
+
+	"github.com/rs/xid"
+)
 
 type Config struct {
 	Node  NodeConfig  `json:"node"`
@@ -55,7 +59,7 @@ type NatsConfig struct {
 func DefaultConfig() *Config {
 	return &Config{
 		Node: NodeConfig{
-			ID:      "node-1",
+			ID:      xid.New().String(),
 			Region:  "default-region",
 			Cluster: "default-cluster",
 			Port:    8080,
@@ -68,7 +72,7 @@ func DefaultConfig() *Config {
 			Dynacast:         true,
 		},
 		Media: MediaConfig{
-			WorkerBin: "mediasoup-worker",
+			WorkerBin: "./mediasoup-worker",
 			WebRtc: WebRtcConfig{
 				ListenIP:    "0.0.0.0",
 				AnnouncedIP: "",
@@ -78,9 +82,6 @@ func DefaultConfig() *Config {
 		},
 		Auth: AuthConfig{
 			TokenTTL: 6 * time.Hour,
-		},
-		Nats: NatsConfig{
-			URL: "nats://localhost:4222",
 		},
 		Debug: false,
 	}

@@ -19,7 +19,6 @@ import (
 	"github.com/axonkit/axonkit/pkg/server"
 	"github.com/axonkit/axonkit/pkg/store"
 	"github.com/axonkit/axonkit/pkg/types"
-	"github.com/rs/xid"
 
 	natsserver "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
@@ -27,15 +26,16 @@ import (
 )
 
 var (
-	nodeID    = flag.String("node", xid.New().String(), "Node ID")
-	regionID  = flag.String("region", "default-region", "Region ID")
-	clusterID = flag.String("cluster", "default-cluster", "Cluster ID")
-	natsURL   = flag.String("nats", "", "NATS URL")
-	httpPort  = flag.Int("port", 8080, "HTTP Port")
-	workerBin = flag.String("worker", "./mediasoup-worker", "Path to mediasoup-worker binary")
-	apiKey    = flag.String("api-key", "", "API key for token verification")
-	apiSecret = flag.String("api-secret", "", "API secret for token signing")
-	debug     = flag.Bool("debug", false, "Debug mode (skip token verification)")
+	cfg       = config.DefaultConfig()
+	nodeID    = flag.String("node", cfg.Node.ID, "Node ID")
+	regionID  = flag.String("region", cfg.Node.Region, "Region ID")
+	clusterID = flag.String("cluster", cfg.Node.Cluster, "Cluster ID")
+	natsURL   = flag.String("nats", cfg.Nats.URL, "NATS URL")
+	httpPort  = flag.Int("port", cfg.Node.Port, "HTTP Port")
+	workerBin = flag.String("worker", cfg.Media.WorkerBin, "Path to mediasoup-worker binary")
+	apiKey    = flag.String("api-key", cfg.Auth.APIKey, "API key for token verification")
+	apiSecret = flag.String("api-secret", cfg.Auth.APISecret, "API secret for token signing")
+	debug     = flag.Bool("debug", cfg.Debug, "Debug mode (skip token verification)")
 )
 
 func main() {
@@ -45,7 +45,6 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, opts))
 	slog.SetDefault(logger)
 
-	cfg := config.DefaultConfig()
 	cfg.Node.ID = *nodeID
 	cfg.Node.Region = *regionID
 	cfg.Node.Cluster = *clusterID
