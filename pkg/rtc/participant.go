@@ -26,10 +26,11 @@ type PublishedTrack struct {
 
 	// Dynacast: track which consumers are active and their max spatial layer.
 	// Protected by mu.
-	mu              sync.Mutex
-	activeConsumers map[string]*consumerLayerState // consumerID → state
-	lastQualities   [3]bool                        // [LOW, MEDIUM, HIGH] last notified
-	publisher       *Participant
+	mu                sync.Mutex
+	activeConsumers   map[string]*consumerLayerState // consumerID → state
+	lastQualities     [3]bool                        // [LOW, MEDIUM, HIGH] last notified
+	lastHasSubscriber bool                           // last notified subscription status
+	publisher         *Participant
 }
 
 type consumerLayerState struct {
@@ -100,31 +101,49 @@ func (t *PublishedTrack) updateConsumerPaused(consumerID string, paused bool) {
 	t.recalcLocked()
 }
 
-// recalcLocked computes the max needed quality across all active (non-paused)
-// consumers and notifies the publisher if it changed. Must be called with mu held.
+// recalcLocked computes the aggregate subscription state and notifies the
+// publisher of changes. Must be called with mu held.
+//
+// Two notifications may be sent:
+//   - track.subscriptionStatusChanged: fires for ALL tracks (audio/video) when
+//     the track transitions between "has active subscribers" and "no active subscribers".
+//     The publisher should pause/resume the track accordingly.
+//   - track.subscribedQualityChanged: fires for simulcast VIDEO tracks only,
+//     reporting which quality layers have active subscribers so the publisher
+//     can toggle individual encodings.
 func (t *PublishedTrack) recalcLocked() {
-	// For non-video tracks, dynacast is not applicable.
-	if t.kind != mediasoup.MediaKindVideo {
+	if t.publisher == nil {
 		return
 	}
 
-	// Determine max needed spatial layer across all non-paused consumers.
-	maxNeeded := int32(-1) // -1 means no consumer active
+	activeCount := 0
+	maxNeeded := int32(-1)
 	for _, st := range t.activeConsumers {
 		if st.paused {
 			continue
 		}
+		activeCount++
 		if st.spatialLayer < 0 {
-			// Unset = needs all layers → max possible.
 			maxNeeded = 2
-			break
-		}
-		if st.spatialLayer > maxNeeded {
+		} else if st.spatialLayer > maxNeeded {
 			maxNeeded = st.spatialLayer
 		}
 	}
 
-	// Map max spatial layer to quality flags: LOW=0, MEDIUM=1, HIGH=2.
+	hasSubscriber := activeCount > 0
+	if hasSubscriber != t.lastHasSubscriber {
+		t.lastHasSubscriber = hasSubscriber
+		_ = t.publisher.SendNotification(proto.MethodTrackSubscriptionStatusChanged,
+			&proto.SubscriptionStatusChangedNotification{
+				TrackSid:       t.sid,
+				HasSubscribers: hasSubscriber,
+			})
+	}
+
+	if t.kind != mediasoup.MediaKindVideo {
+		return
+	}
+
 	var q [3]bool
 	for i := int32(0); i <= maxNeeded && i <= 2; i++ {
 		q[i] = true
@@ -134,10 +153,6 @@ func (t *PublishedTrack) recalcLocked() {
 		return
 	}
 	t.lastQualities = q
-
-	if t.publisher == nil {
-		return
-	}
 
 	_ = t.publisher.SendNotification(proto.MethodTrackSubscribedQualityChanged,
 		&proto.SubscribedQualityChangedNotification{
