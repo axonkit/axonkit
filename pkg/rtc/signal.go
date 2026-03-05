@@ -2,6 +2,7 @@ package rtc
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/axonkit/axonkit/pkg/proto"
@@ -15,6 +16,10 @@ func (p *Participant) dispatchRPC(msg *proto.Message) {
 		status int
 		errMsg string
 	)
+
+	if msg.Method != proto.MethodPing {
+		p.logger.Info("dispatchRPC", "method", msg.Method, "log_id", msg.LogId, "data", string(msg.Data))
+	}
 
 	switch msg.Method {
 	case proto.MethodReady:
@@ -83,6 +88,7 @@ func (p *Participant) dispatchRPC(msg *proto.Message) {
 	if msg.IsRequest() {
 		var resp *proto.Message
 		if errMsg != "" {
+			p.logger.Error("dispatchRPC", "method", msg.Method, "log_id", msg.LogId, "status", status, "err_msg", errMsg)
 			resp = proto.NewErrorResponse(msg.LogId, status, errMsg)
 		} else {
 			var err error
@@ -222,7 +228,7 @@ func (p *Participant) handleTokenRefresh(msg *proto.Message) (any, int, string) 
 func (p *Participant) handleTrackPublish(msg *proto.Message) (any, int, string) {
 	var req proto.PublishTrackRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		return nil, proto.StatusBadRequest, "invalid request"
+		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
 	}
 
 	track, err := p.PublishTrack(&req)
@@ -236,7 +242,7 @@ func (p *Participant) handleTrackPublish(msg *proto.Message) (any, int, string) 
 func (p *Participant) handleTrackUnpublish(msg *proto.Message) (any, int, string) {
 	var req proto.UnpublishTrackRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		return nil, proto.StatusBadRequest, "invalid request"
+		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
 	}
 	if err := p.UnpublishTrack(req.TrackSid); err != nil {
 		return nil, proto.StatusNotFound, err.Error()
@@ -247,7 +253,7 @@ func (p *Participant) handleTrackUnpublish(msg *proto.Message) (any, int, string
 func (p *Participant) handleTrackMute(msg *proto.Message) (any, int, string) {
 	var req proto.MuteTrackRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		return nil, proto.StatusBadRequest, "invalid request"
+		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
 	}
 	if err := p.MuteTrack(req.TrackSid, req.Muted); err != nil {
 		return nil, proto.StatusNotFound, err.Error()
@@ -258,7 +264,7 @@ func (p *Participant) handleTrackMute(msg *proto.Message) (any, int, string) {
 func (p *Participant) handleTrackUpdate(msg *proto.Message) (any, int, string) {
 	var req proto.UpdateTrackRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		return nil, proto.StatusBadRequest, "invalid request"
+		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
 	}
 	if err := p.UpdateTrack(&req); err != nil {
 		return nil, proto.StatusNotFound, err.Error()
@@ -269,7 +275,7 @@ func (p *Participant) handleTrackUpdate(msg *proto.Message) (any, int, string) {
 func (p *Participant) handleDataTrackPublish(msg *proto.Message) (any, int, string) {
 	var req proto.PublishDataTrackRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		return nil, proto.StatusBadRequest, "invalid request"
+		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
 	}
 	track, err := p.PublishDataTrack(&req)
 	if err != nil {
@@ -281,7 +287,7 @@ func (p *Participant) handleDataTrackPublish(msg *proto.Message) (any, int, stri
 func (p *Participant) handleDataTrackUnpublish(msg *proto.Message) (any, int, string) {
 	var req proto.UnpublishDataTrackRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		return nil, proto.StatusBadRequest, "invalid request"
+		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
 	}
 	if err := p.UnpublishDataTrack(req.DataTrackSid); err != nil {
 		return nil, proto.StatusNotFound, err.Error()
@@ -292,7 +298,7 @@ func (p *Participant) handleDataTrackUnpublish(msg *proto.Message) (any, int, st
 func (p *Participant) handleSubscriptionPause(msg *proto.Message) (any, int, string) {
 	var req proto.PauseSubscriptionRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		return nil, proto.StatusBadRequest, "invalid request"
+		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
 	}
 	if err := p.PauseSubscription(req.SubscriptionSid); err != nil {
 		return nil, proto.StatusNotFound, err.Error()
@@ -303,7 +309,7 @@ func (p *Participant) handleSubscriptionPause(msg *proto.Message) (any, int, str
 func (p *Participant) handleSubscriptionResume(msg *proto.Message) (any, int, string) {
 	var req proto.ResumeSubscriptionRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		return nil, proto.StatusBadRequest, "invalid request"
+		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
 	}
 	if err := p.ResumeSubscription(req.SubscriptionSid); err != nil {
 		return nil, proto.StatusNotFound, err.Error()
@@ -314,7 +320,7 @@ func (p *Participant) handleSubscriptionResume(msg *proto.Message) (any, int, st
 func (p *Participant) handleSubscriptionSetPreferredLayers(msg *proto.Message) (any, int, string) {
 	var req proto.SetPreferredLayersRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		return nil, proto.StatusBadRequest, "invalid request"
+		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
 	}
 	if err := p.SetPreferredLayers(&req); err != nil {
 		return nil, proto.StatusNotFound, err.Error()
@@ -325,7 +331,7 @@ func (p *Participant) handleSubscriptionSetPreferredLayers(msg *proto.Message) (
 func (p *Participant) handleSubscriptionSetPriority(msg *proto.Message) (any, int, string) {
 	var req proto.SetPriorityRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		return nil, proto.StatusBadRequest, "invalid request"
+		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
 	}
 	if err := p.SetPriority(req.SubscriptionSid, req.Priority); err != nil {
 		return nil, proto.StatusNotFound, err.Error()
@@ -336,7 +342,7 @@ func (p *Participant) handleSubscriptionSetPriority(msg *proto.Message) (any, in
 func (p *Participant) handleSubscriptionRequestKeyFrame(msg *proto.Message) (any, int, string) {
 	var req proto.RequestKeyFrameRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		return nil, proto.StatusBadRequest, "invalid request"
+		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
 	}
 	if err := p.RequestKeyFrame(req.SubscriptionSid); err != nil {
 		return nil, proto.StatusNotFound, err.Error()
@@ -347,7 +353,7 @@ func (p *Participant) handleSubscriptionRequestKeyFrame(msg *proto.Message) (any
 func (p *Participant) handleSubscriptionClose(msg *proto.Message) (any, int, string) {
 	var req proto.CloseSubscriptionRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		return nil, proto.StatusBadRequest, "invalid request"
+		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
 	}
 	if err := p.CloseSubscription(req.SubscriptionSid); err != nil {
 		return nil, proto.StatusNotFound, err.Error()
@@ -358,7 +364,7 @@ func (p *Participant) handleSubscriptionClose(msg *proto.Message) (any, int, str
 func (p *Participant) handleDataSubscriptionClose(msg *proto.Message) (any, int, string) {
 	var req proto.CloseDataSubscriptionRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		return nil, proto.StatusBadRequest, "invalid request"
+		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
 	}
 	if err := p.CloseDataSubscription(req.DataSubscriptionSid); err != nil {
 		return nil, proto.StatusNotFound, err.Error()
@@ -369,7 +375,7 @@ func (p *Participant) handleDataSubscriptionClose(msg *proto.Message) (any, int,
 func (p *Participant) handleTransportGetStats(msg *proto.Message) (any, int, string) {
 	var req proto.GetTransportStatsRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		return nil, proto.StatusBadRequest, "invalid request"
+		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
 	}
 
 	var transport *mediasoup.Transport
@@ -398,7 +404,7 @@ func (p *Participant) handleTransportGetStats(msg *proto.Message) (any, int, str
 func (p *Participant) handleParticipantUpdate(msg *proto.Message) (any, int, string) {
 	var req proto.UpdateParticipantRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		return nil, proto.StatusBadRequest, "invalid request"
+		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
 	}
 
 	if (req.Metadata != nil || len(req.Attributes) > 0) && p.permission != nil && !p.permission.CanUpdateMetadata {

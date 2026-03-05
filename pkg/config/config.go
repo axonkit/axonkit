@@ -1,6 +1,8 @@
 package config
 
 import (
+	"log"
+	"net"
 	"time"
 
 	"github.com/rs/xid"
@@ -75,7 +77,7 @@ func DefaultConfig() *Config {
 			WorkerBin: "./mediasoup-worker",
 			WebRtc: WebRtcConfig{
 				ListenIP:    "0.0.0.0",
-				AnnouncedIP: "",
+				AnnouncedIP: GetOutboundIP().String(),
 				MinPort:     40000,
 				MaxPort:     49999,
 			},
@@ -93,3 +95,16 @@ func (c *Config) PingInterval() int32 { return 5 }
 // PingTimeout returns the ping timeout in seconds. If no ping is received
 // within this duration, the participant is considered disconnected.
 func (c *Config) PingTimeout() int32 { return 15 }
+
+// Get preferred outbound ip of this machine
+func GetOutboundIP() net.IP {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+
+	return localAddr.IP
+}

@@ -40,13 +40,9 @@ type consumerLayerState struct {
 }
 
 func (t *PublishedTrack) ToProto() *proto.TrackInfo {
-	tt := proto.TrackType_AUDIO
-	if t.kind == mediasoup.MediaKindVideo {
-		tt = proto.TrackType_VIDEO
-	}
 	return &proto.TrackInfo{
 		Sid:    t.sid,
-		Type:   tt,
+		Kind:   t.kind,
 		Name:   t.name,
 		Muted:  t.muted,
 		Width:  t.width,
@@ -435,7 +431,8 @@ func (p *Participant) handleIceStateChange(state mediasoup.IceState) {
 		p.mu.Unlock()
 
 	case mediasoup.IceStateDisconnected:
-		p.logger.Warn("ICE disconnected")
+		p.logger.Warn("ICE disconnected, disconnecting participant")
+		p.Close(proto.DisconnectReason_CONNECTION_TIMEOUT)
 
 	case mediasoup.IceStateClosed:
 		p.logger.Warn("ICE closed, disconnecting participant")

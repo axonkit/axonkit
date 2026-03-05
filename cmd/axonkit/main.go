@@ -180,7 +180,7 @@ func main() {
 	go func() {
 		addr := fmt.Sprintf(":%d", cfg.Node.Port)
 		slog.Info("HTTP server listening", "addr", addr)
-		if err := http.ListenAndServe(addr, server.WithLogging(mux)); err != nil {
+		if err := http.ListenAndServe(addr, server.WithLogging(server.WithCORS(mux))); err != nil {
 			slog.Error("HTTP server failed", "error", err)
 			os.Exit(1)
 		}

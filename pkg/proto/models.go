@@ -84,7 +84,7 @@ const (
 // TrackInfo represents a published media track.
 type TrackInfo struct {
 	Sid               string              `json:"sid,omitempty"`
-	Type              TrackType           `json:"type,omitempty"`
+	Kind              mediasoup.MediaKind `json:"kind,omitempty"`
 	Name              string              `json:"name,omitempty"`
 	Muted             bool                `json:"muted,omitempty"`
 	Width             uint32              `json:"width,omitempty"`
@@ -96,22 +96,14 @@ type TrackInfo struct {
 	AppData           map[string]any      `json:"appData,omitempty"`
 }
 
-type TrackType int32
+type TrackSource string
 
 const (
-	TrackType_AUDIO TrackType = 0
-	TrackType_VIDEO TrackType = 1
-	TrackType_DATA  TrackType = 2
-)
-
-type TrackSource int32
-
-const (
-	TrackSource_UNKNOWN            TrackSource = 0
-	TrackSource_CAMERA             TrackSource = 1
-	TrackSource_MICROPHONE         TrackSource = 2
-	TrackSource_SCREEN_SHARE       TrackSource = 3
-	TrackSource_SCREEN_SHARE_AUDIO TrackSource = 4
+	TrackSource_UNKNOWN            TrackSource = "unknown"
+	TrackSource_CAMERA             TrackSource = "camera"
+	TrackSource_MICROPHONE         TrackSource = "microphone"
+	TrackSource_SCREEN_SHARE       TrackSource = "screenShare"
+	TrackSource_SCREEN_SHARE_AUDIO TrackSource = "screenShareAudio"
 )
 
 type AudioTrackFeature int32

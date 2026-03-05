@@ -86,12 +86,12 @@ func TestParticipant_IsPublisher(t *testing.T) {
 
 func TestParticipant_Permissions(t *testing.T) {
 	tests := []struct {
-		name         string
-		grants       *proto.ClaimGrants
-		canPub       bool
-		canSub       bool
-		canPubData   bool
-		canUpdateMd  bool
+		name        string
+		grants      *proto.ClaimGrants
+		canPub      bool
+		canSub      bool
+		canPubData  bool
+		canUpdateMd bool
 	}{
 		{
 			name:       "nil grants defaults to all true",
@@ -487,7 +487,7 @@ func TestPublishedTrack_ToProto(t *testing.T) {
 	if info.Sid != "track-1" || info.Name != "camera" {
 		t.Fatalf("unexpected proto: %+v", info)
 	}
-	if info.Type != proto.TrackType_VIDEO {
+	if info.Kind != "video" {
 		t.Fatal("expected VIDEO type")
 	}
 	if !info.Muted {
@@ -502,7 +502,7 @@ func TestPublishedTrack_ToProto(t *testing.T) {
 		kind: "audio",
 	}
 	audioInfo := audioTrack.ToProto()
-	if audioInfo.Type != proto.TrackType_AUDIO {
+	if audioInfo.Kind != "audio" {
 		t.Fatal("expected AUDIO type")
 	}
 }

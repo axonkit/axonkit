@@ -56,6 +56,22 @@ func WithLogging(next http.Handler) http.Handler {
 	})
 }
 
+func WithCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+		// w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, X-Node-Id")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -97,6 +113,8 @@ func NewServer(params ServerParams) *Server {
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /rtc/join", s.handleJoin)
 	mux.HandleFunc("POST /rtc/connect", s.handleConnect)
+	mux.HandleFunc("OPTIONS /rtc/join", func(w http.ResponseWriter, r *http.Request) {})
+	mux.HandleFunc("OPTIONS /rtc/connect", func(w http.ResponseWriter, r *http.Request) {})
 }
 
 func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
