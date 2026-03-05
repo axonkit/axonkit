@@ -431,12 +431,11 @@ func (p *Participant) handleIceStateChange(state mediasoup.IceState) {
 		p.mu.Unlock()
 
 	case mediasoup.IceStateDisconnected:
-		p.logger.Warn("ICE disconnected, disconnecting participant")
-		p.Close(proto.DisconnectReason_CONNECTION_TIMEOUT)
+		// todo: handle ice disconnected
 
 	case mediasoup.IceStateClosed:
-		p.logger.Warn("ICE closed, disconnecting participant")
-		p.Close(proto.DisconnectReason_CONNECTION_TIMEOUT)
+		p.logger.Warn("ICE closed, closing participant")
+		p.Close(proto.DisconnectReason_SIGNAL_CLOSE)
 	}
 }
 

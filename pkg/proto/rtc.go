@@ -57,14 +57,6 @@ type SyncState struct {
 	SubscribedDataTrackSids []string `json:"subscribedDataTrackSids,omitempty"`
 	// PublishedTrackSids the client had published itself (for server to verify).
 	PublishedTrackSids []string `json:"publishedTrackSids,omitempty"`
-	// DataReceiveStates records the last sequence number the client received
-	// for each data track, enabling future replay-based catch-up.
-	DataReceiveStates []DataReceiveState `json:"dataReceiveStates,omitempty"`
-}
-
-type DataReceiveState struct {
-	DataTrackSid string `json:"dataTrackSid,omitempty"`
-	LastSeq      uint32 `json:"lastSeq,omitempty"`
 }
 
 type JoinResponse struct {
