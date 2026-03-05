@@ -89,3 +89,92 @@ func TestLinkDB_Fallback(t *testing.T) {
 		t.Errorf("Expected cluster stats (20), got %d", stats.AvgRTT)
 	}
 }
+
+func TestLinkDB_SetRTTProvider(t *testing.T) {
+	db := NewLinkDB(types.NodeInfo{ID: "n1", Cluster: "c1"})
+	called := false
+	db.SetRTTProvider(func(nodeID types.NodeID) (int64, bool) {
+		called = true
+		return 10, true
+	})
+	if db.rttProvider == nil {
+		t.Fatal("expected rttProvider to be set")
+	}
+	db.rttProvider("n2")
+	if !called {
+		t.Fatal("expected rttProvider to be called")
+	}
+}
+
+func TestLinkDB_RemoveNode(t *testing.T) {
+	localNode := types.NodeInfo{ID: "n1", Region: "r1", Cluster: "c1"}
+	db := NewLinkDB(localNode)
+
+	db.AddNode(types.NodeInfo{ID: "n2", Region: "r1", Cluster: "c2"})
+	db.AddNode(types.NodeInfo{ID: "n3", Region: "r1", Cluster: "c2"})
+
+	db.nodesMu.RLock()
+	count := len(db.clusterNodes["c2"])
+	db.nodesMu.RUnlock()
+	if count != 2 {
+		t.Fatalf("expected 2 nodes in c2, got %d", count)
+	}
+
+	db.RemoveNode("n2")
+	db.nodesMu.RLock()
+	count = len(db.clusterNodes["c2"])
+	db.nodesMu.RUnlock()
+	if count != 1 {
+		t.Fatalf("expected 1 node after remove, got %d", count)
+	}
+
+	// Remove non-existent node should be no-op
+	db.RemoveNode("n99")
+}
+
+func TestLinkDB_AddNode_Filters(t *testing.T) {
+	localNode := types.NodeInfo{ID: "n1", Region: "r1", Cluster: "c1"}
+	db := NewLinkDB(localNode)
+
+	// Self should be ignored
+	db.AddNode(localNode)
+	db.nodesMu.RLock()
+	count := len(db.clusterNodes)
+	db.nodesMu.RUnlock()
+	if count != 0 {
+		t.Fatal("self node should be ignored")
+	}
+
+	// Same cluster should be ignored
+	db.AddNode(types.NodeInfo{ID: "n2", Region: "r1", Cluster: "c1"})
+	db.nodesMu.RLock()
+	count = len(db.clusterNodes)
+	db.nodesMu.RUnlock()
+	if count != 0 {
+		t.Fatal("same-cluster node should be ignored")
+	}
+
+	// Duplicate add should be idempotent
+	db.AddNode(types.NodeInfo{ID: "n3", Region: "r2", Cluster: "c2"})
+	db.AddNode(types.NodeInfo{ID: "n3", Region: "r2", Cluster: "c2"})
+	db.nodesMu.RLock()
+	count = len(db.clusterNodes["c2"])
+	db.nodesMu.RUnlock()
+	if count != 1 {
+		t.Fatalf("expected 1 node (no duplicates), got %d", count)
+	}
+}
+
+func TestLinkDB_ProbeCluster_NilProvider(t *testing.T) {
+	db := NewLinkDB(types.NodeInfo{ID: "n1", Cluster: "c1"})
+	db.AddNode(types.NodeInfo{ID: "n2", Region: "r2", Cluster: "c2"})
+	// Should not panic with nil rttProvider
+	db.probeCluster("c2")
+}
+
+func TestLinkDB_ProbeCluster_EmptyNodes(t *testing.T) {
+	db := NewLinkDB(types.NodeInfo{ID: "n1", Cluster: "c1"})
+	db.SetRTTProvider(func(nodeID types.NodeID) (int64, bool) { return 10, true })
+	// Probe an empty cluster
+	db.probeCluster("empty-cluster")
+}

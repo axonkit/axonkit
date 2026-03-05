@@ -377,3 +377,18 @@ func (r *Room) Close() {
 
 	r.logger.Info("Room closed")
 }
+
+// TestEnsureStream exposes the cascade EnsureStream callback for integration testing.
+func (r *Room) TestEnsureStream(streamID string) error {
+	if r.cascade.EnsureStream != nil {
+		return r.cascade.EnsureStream(streamID)
+	}
+	return nil
+}
+
+// TestReleaseStream exposes the cascade ReleaseStream callback for integration testing.
+func (r *Room) TestReleaseStream(streamID string) {
+	if r.cascade.ReleaseStream != nil {
+		r.cascade.ReleaseStream(streamID)
+	}
+}

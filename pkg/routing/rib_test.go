@@ -83,3 +83,117 @@ func TestWatchDownstream_SelfExclusion(t *testing.T) {
 		// Passed
 	}
 }
+
+func TestRIB_LocalInfo(t *testing.T) {
+	ms := store.NewMemoryStore(0)
+	nodeInfo := types.NodeInfo{ID: "nodeX", Region: "us-east", Cluster: "c1"}
+	r := NewRIB(ms, nodeInfo)
+	defer r.Close()
+
+	if r.LocalInfo().ID != "nodeX" {
+		t.Fatalf("expected nodeX, got %s", r.LocalInfo().ID)
+	}
+}
+
+func TestRIB_GetCandidates(t *testing.T) {
+	ms := store.NewMemoryStore(0)
+	nodeInfo := types.NodeInfo{ID: "nodeA", Region: "us-east", Cluster: "c1"}
+	r := NewRIB(ms, nodeInfo)
+	defer r.Close()
+
+	streamID := types.StreamID("test-stream")
+
+	candidates, err := r.GetCandidates(streamID)
+	if err != nil {
+		t.Fatalf("GetCandidates error: %v", err)
+	}
+	if len(candidates) != 0 {
+		t.Fatal("expected 0 candidates")
+	}
+
+	r.StartAdvertise(AdvertiseOptions{
+		StreamID: streamID, BaseCost: 5, IsOrigin: true,
+	})
+	time.Sleep(200 * time.Millisecond)
+
+	candidates, err = r.GetCandidates(streamID)
+	if err != nil {
+		t.Fatalf("GetCandidates error: %v", err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("expected 1 candidate, got %d", len(candidates))
+	}
+	if candidates[0].Node != "nodeA" {
+		t.Fatalf("expected nodeA, got %s", candidates[0].Node)
+	}
+}
+
+func TestRIB_StartStopAdvertise(t *testing.T) {
+	ms := store.NewMemoryStore(0)
+	nodeInfo := types.NodeInfo{ID: "nodeA", Region: "us-east", Cluster: "c1"}
+	r := NewRIB(ms, nodeInfo)
+	defer r.Close()
+
+	streamID := types.StreamID("test-adv")
+
+	if err := r.StartAdvertise(AdvertiseOptions{
+		StreamID: streamID, BaseCost: 0, IsOrigin: true,
+	}); err != nil {
+		t.Fatalf("StartAdvertise: %v", err)
+	}
+
+	// Duplicate start should be no-op
+	if err := r.StartAdvertise(AdvertiseOptions{
+		StreamID: streamID, BaseCost: 0, IsOrigin: true,
+	}); err != nil {
+		t.Fatalf("Duplicate StartAdvertise: %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	if err := r.StopAdvertise(streamID); err != nil {
+		t.Fatalf("StopAdvertise: %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	candidates, _ := r.GetCandidates(streamID)
+	if len(candidates) != 0 {
+		t.Fatalf("expected 0 candidates after stop, got %d", len(candidates))
+	}
+}
+
+func TestRIB_SubscribeUpdates(t *testing.T) {
+	ms := store.NewMemoryStore(0)
+	nodeInfo := types.NodeInfo{ID: "nodeA", Region: "us-east", Cluster: "c1"}
+	r := NewRIB(ms, nodeInfo)
+	defer r.Close()
+
+	streamID := types.StreamID("test-updates")
+	updates := make(chan bool, 10)
+
+	r.SubscribeUpdates(streamID, func(val types.RouteKVValue, isDelete bool) {
+		updates <- isDelete
+	})
+	time.Sleep(100 * time.Millisecond)
+
+	// Directly put a route entry (simulating another node advertising)
+	val := types.RouteKVValue{
+		StreamID:   streamID,
+		Node:       "nodeB",
+		PathVector: []types.NodeID{"nodeB"},
+		BaseCost:   0,
+		IsOrigin:   true,
+	}
+	data, _ := json.Marshal(val)
+	key := fmt.Sprintf("route.%s.us-east.c1.nodeB", streamID)
+	ms.Put(context.Background(), key, data)
+
+	select {
+	case isDelete := <-updates:
+		if isDelete {
+			t.Fatal("expected put notification, got delete")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for update notification")
+	}
+}

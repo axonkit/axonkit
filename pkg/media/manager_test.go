@@ -755,3 +755,57 @@ func TestManager_WorkerCloseCleanup(t *testing.T) {
 	mA.Close()
 	mB.Close()
 }
+
+func TestManager_Routers_Empty(t *testing.T) {
+	m := NewManager("node-rt", nil, "", config.WebRtcConfig{})
+	if routers := m.Routers(); len(routers) != 0 {
+		t.Fatalf("expected 0 routers, got %d", len(routers))
+	}
+}
+
+func TestManager_WebRtcServers_Empty(t *testing.T) {
+	m := NewManager("node-wrs", nil, "", config.WebRtcConfig{})
+	if servers := m.WebRtcServers(); len(servers) != 0 {
+		t.Fatalf("expected 0 servers, got %d", len(servers))
+	}
+}
+
+func TestManager_Routers_WithWorker(t *testing.T) {
+	srv, nc := setupNats(t)
+	defer srv.Shutdown()
+	defer nc.Close()
+
+	m := setupManager(t, "node-routers", nc)
+	defer m.Close()
+
+	routers := m.Routers()
+	if len(routers) == 0 {
+		t.Fatal("expected at least 1 router")
+	}
+}
+
+func TestManager_WebRtcServers_WithWorker(t *testing.T) {
+	srv, nc := setupNats(t)
+	defer srv.Shutdown()
+	defer nc.Close()
+
+	m := setupManager(t, "node-wrs2", nc)
+	defer m.Close()
+
+	servers := m.WebRtcServers()
+	if len(servers) == 0 {
+		t.Fatal("expected at least 1 WebRtcServer")
+	}
+}
+
+func TestLocalProducer_Id_AllNil(t *testing.T) {
+	lp := &LocalProducer{}
+	if lp.Id() != "" {
+		t.Fatal("expected empty id for nil producer/dataproducer")
+	}
+}
+
+func TestLocalProducer_Close_AllNil(t *testing.T) {
+	lp := &LocalProducer{}
+	lp.Close() // should not panic
+}
