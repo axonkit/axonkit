@@ -19,18 +19,20 @@ import (
 	"github.com/axonkit/axonkit/pkg/server"
 	"github.com/axonkit/axonkit/pkg/store"
 	"github.com/axonkit/axonkit/pkg/types"
+	"github.com/rs/xid"
 
+	natsserver "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
 var (
-	nodeID    = flag.String("node", "node-1", "Node ID")
+	nodeID    = flag.String("node", xid.New().String(), "Node ID")
 	regionID  = flag.String("region", "default-region", "Region ID")
 	clusterID = flag.String("cluster", "default-cluster", "Cluster ID")
-	natsURL   = flag.String("nats", nats.DefaultURL, "NATS URL")
+	natsURL   = flag.String("nats", "", "NATS URL")
 	httpPort  = flag.Int("port", 8080, "HTTP Port")
-	workerBin = flag.String("worker", "mediasoup-worker", "Path to mediasoup-worker binary")
+	workerBin = flag.String("worker", "./mediasoup-worker", "Path to mediasoup-worker binary")
 	apiKey    = flag.String("api-key", "", "API key for token verification")
 	apiSecret = flag.String("api-secret", "", "API secret for token signing")
 	debug     = flag.Bool("debug", false, "Debug mode (skip token verification)")
@@ -65,7 +67,17 @@ func main() {
 		"debug", cfg.Debug)
 
 	// 1. Connect to NATS
-	nc, err := nats.Connect(cfg.Nats.URL)
+	options := []nats.Option{}
+	if cfg.Nats.URL == "" {
+		slog.Info("NATS URL is empty, using in-process NATS server")
+		opts := natsserver.DefaultTestOptions
+		opts.Port = -1
+		opts.JetStream = true
+		opts.StoreDir = "./.data"
+		srv := natsserver.RunServer(&opts)
+		options = append(options, nats.InProcessServer(srv))
+	}
+	nc, err := nats.Connect(cfg.Nats.URL, options...)
 	if err != nil {
 		slog.Error("Failed to connect to NATS", "error", err)
 		os.Exit(1)
@@ -85,17 +97,7 @@ func main() {
 		os.Exit(1)
 	}
 	rib := routing.NewRIB(kv, myNode)
-
 	linkDB := routing.NewLinkDB(myNode)
-	switch *clusterID {
-	case "SanFrancisco":
-		linkDB.UpdateClusterLink("Beijing", 200, 0, 100)
-		linkDB.UpdateClusterLink("NewYork", 30, 0, 10)
-		linkDB.UpdateRegionLink("CN", 180, 0, 90)
-	case "NewYork":
-		linkDB.UpdateClusterLink("Beijing", 200, 0, 100)
-	}
-
 	finder := discovery.NewFinder(rib, linkDB, myNode)
 	fib := routing.NewFIB(rib, myNode.ID)
 
