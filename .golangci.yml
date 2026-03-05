@@ -47,8 +47,6 @@ linters-settings:
       - diagnostic
       - style
     disabled-checks:
-      - hugeParam
-      - rangeValCopy
       - unnamedResult
       - exitAfterDefer
   misspell:
