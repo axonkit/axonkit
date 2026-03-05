@@ -16,6 +16,28 @@ var (
 	ErrDuplicateIdentity = errors.New("duplicate identity")
 )
 
+// CascadeCallbacks are invoked by Room to integrate with the distributed
+// routing layer (RIB/FIB). They are set by RoomManager at creation time.
+// All stream identifiers use the format "routerID.producerID" (= types.StreamID).
+type CascadeCallbacks struct {
+	// OnTrackPublished advertises the stream via RIB and registers
+	// the producer in media.Manager so remote nodes can pipe it.
+	OnTrackPublished func(streamID string)
+	// OnTrackUnpublished stops the RIB advertisement and unregisters the producer.
+	OnTrackUnpublished func(streamID string)
+	// OnDataTrackPublished advertises a data stream.
+	OnDataTrackPublished func(streamID string)
+	// OnDataTrackUnpublished stops the data stream advertisement.
+	OnDataTrackUnpublished func(streamID string)
+	// EnsureStream is called before subscribing. For remote streams it
+	// triggers fib.Subscribe to pipe the media locally; for local streams
+	// it is a no-op.
+	EnsureStream func(streamID string) error
+	// ReleaseStream is called when a consumer closes. It decrements the
+	// FIB ref-count and tears down the pipe when no consumers remain.
+	ReleaseStream func(streamID string)
+}
+
 type Room struct {
 	sid          string
 	name         string
@@ -26,6 +48,7 @@ type Room struct {
 	participants map[string]*Participant
 	mu           sync.RWMutex
 
+	cascade CascadeCallbacks
 	onClose func(*Room)
 	logger  *slog.Logger
 
@@ -203,6 +226,10 @@ func (r *Room) BroadcastNotification(method string, body any, excludeSid string)
 // OnTrackPublished handles a new track being published.
 // For auto-subscribe rooms, it creates subscriptions for all other participants.
 func (r *Room) OnTrackPublished(publisher *Participant, track *PublishedTrack) {
+	if r.cascade.OnTrackPublished != nil {
+		r.cascade.OnTrackPublished(track.sid)
+	}
+
 	r.BroadcastNotification(proto.MethodTrackPublished, &proto.TrackPublishedNotification{
 		ParticipantSid: publisher.sid,
 		Track:          track.ToProto(),
@@ -228,6 +255,10 @@ func (r *Room) OnTrackPublished(publisher *Participant, track *PublishedTrack) {
 
 // OnTrackUnpublished handles a track being unpublished.
 func (r *Room) OnTrackUnpublished(publisher *Participant, trackSid string) {
+	if r.cascade.OnTrackUnpublished != nil {
+		r.cascade.OnTrackUnpublished(trackSid)
+	}
+
 	r.BroadcastNotification(proto.MethodTrackUnpublished, &proto.TrackUnpublishedNotification{
 		ParticipantSid: publisher.sid,
 		TrackSid:       trackSid,
@@ -245,6 +276,10 @@ func (r *Room) OnTrackMuted(publisher *Participant, trackSid string, muted bool)
 
 // OnDataTrackPublished handles auto-subscribe for data tracks.
 func (r *Room) OnDataTrackPublished(publisher *Participant, track *DataPublishedTrack) {
+	if r.cascade.OnDataTrackPublished != nil {
+		r.cascade.OnDataTrackPublished(track.sid)
+	}
+
 	if !r.config.AutoSubscribe {
 		return
 	}
@@ -260,6 +295,13 @@ func (r *Room) OnDataTrackPublished(publisher *Participant, track *DataPublished
 					"dataTrack", track.sid, "error", err)
 			}
 		}(sub)
+	}
+}
+
+// OnDataTrackUnpublished handles a data track being unpublished.
+func (r *Room) OnDataTrackUnpublished(publisher *Participant, dataTrackSid string) {
+	if r.cascade.OnDataTrackUnpublished != nil {
+		r.cascade.OnDataTrackUnpublished(dataTrackSid)
 	}
 }
 

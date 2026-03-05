@@ -1,12 +1,15 @@
 package rtc
 
 import (
+	"fmt"
 	"log/slog"
 	"sync"
 
 	"github.com/axonkit/axonkit/pkg/config"
 	"github.com/axonkit/axonkit/pkg/discovery"
+	"github.com/axonkit/axonkit/pkg/media"
 	"github.com/axonkit/axonkit/pkg/routing"
+	"github.com/axonkit/axonkit/pkg/types"
 	"github.com/rs/xid"
 )
 
@@ -19,16 +22,20 @@ type RoomManager struct {
 	mu         sync.RWMutex
 	config     config.RoomConfig
 
-	fib    *routing.FIB
-	finder *discovery.Finder
+	rib      *routing.RIB
+	fib      *routing.FIB
+	finder   *discovery.Finder
+	mediaMgr *media.Manager
 
 	logger *slog.Logger
 }
 
 type RoomManagerParams struct {
-	Config config.RoomConfig
-	FIB    *routing.FIB
-	Finder *discovery.Finder
+	Config       config.RoomConfig
+	RIB          *routing.RIB
+	FIB          *routing.FIB
+	Finder       *discovery.Finder
+	MediaManager *media.Manager
 }
 
 func NewRoomManager(params RoomManagerParams) *RoomManager {
@@ -36,8 +43,10 @@ func NewRoomManager(params RoomManagerParams) *RoomManager {
 		rooms:      make(map[string]*Room),
 		roomsBySid: make(map[string]*Room),
 		config:     params.Config,
+		rib:        params.RIB,
 		fib:        params.FIB,
 		finder:     params.Finder,
+		mediaMgr:   params.MediaManager,
 		logger:     slog.Default().With("component", "RoomManager"),
 	}
 }
@@ -63,6 +72,7 @@ func (rm *RoomManager) GetOrCreateRoom(name string, maxParticipants int, metadat
 	room.SetOnClose(func(r *Room) {
 		rm.removeRoom(r)
 	})
+	rm.setupCascadeCallbacks(room)
 
 	rm.rooms[name] = room
 	rm.roomsBySid[sid] = room
@@ -102,6 +112,69 @@ func (rm *RoomManager) GetParticipantBySid(sid string) *Participant {
 		}
 	}
 	return nil
+}
+
+func (rm *RoomManager) setupCascadeCallbacks(room *Room) {
+	advertise := func(sid string) {
+		streamID := types.StreamID(sid)
+		if rm.mediaMgr != nil {
+			rm.mediaMgr.RegisterProducer(streamID, &media.LocalProducer{
+				StreamID: streamID,
+				RouterId: streamID.RouterID(),
+			})
+		}
+		if rm.rib != nil {
+			if err := rm.rib.StartAdvertise(routing.AdvertiseOptions{
+				StreamID: streamID,
+				IsOrigin: true,
+			}); err != nil {
+				rm.logger.Error("Failed to advertise stream", "stream_id", streamID, "error", err)
+			}
+		}
+	}
+	unadvertise := func(sid string) {
+		streamID := types.StreamID(sid)
+		if rm.rib != nil {
+			if err := rm.rib.StopAdvertise(streamID); err != nil {
+				rm.logger.Error("Failed to stop advertise", "stream_id", streamID, "error", err)
+			}
+		}
+		if rm.mediaMgr != nil {
+			rm.mediaMgr.UnregisterProducer(streamID)
+		}
+	}
+
+	room.cascade = CascadeCallbacks{
+		OnTrackPublished:       advertise,
+		OnTrackUnpublished:     unadvertise,
+		OnDataTrackPublished:   advertise,
+		OnDataTrackUnpublished: unadvertise,
+		EnsureStream: func(sid string) error {
+			streamID := types.StreamID(sid)
+			// Local producer — no FIB piping needed
+			if rm.mediaMgr != nil && rm.mediaMgr.GetLocalProducer(streamID) != nil {
+				return nil
+			}
+			if rm.fib == nil || rm.finder == nil {
+				return nil
+			}
+			if _, _, err := rm.fib.Subscribe(streamID, rm.finder.FindPath); err != nil {
+				return fmt.Errorf("fib subscribe failed for %s: %w", streamID, err)
+			}
+			return nil
+		},
+		ReleaseStream: func(sid string) {
+			streamID := types.StreamID(sid)
+			// Only release remote streams managed by FIB
+			if rm.fib == nil {
+				return
+			}
+			if rm.mediaMgr != nil && rm.mediaMgr.GetLocalProducer(streamID) != nil {
+				return
+			}
+			rm.fib.Unsubscribe(streamID)
+		},
+	}
 }
 
 func (rm *RoomManager) Close() {

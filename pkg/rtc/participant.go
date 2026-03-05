@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/axonkit/axonkit/pkg/proto"
+	"github.com/axonkit/axonkit/pkg/types"
 	"github.com/jiyeyuran/mediasoup-go/v2"
 	"github.com/rs/xid"
 )
@@ -476,7 +477,7 @@ func (p *Participant) PublishTrack(req *proto.PublishTrackRequest) (*PublishedTr
 	}
 
 	track := &PublishedTrack{
-		sid:       producer.Id(),
+		sid:       string(types.NewStreamID(p.router.Id(), producer.Id())),
 		name:      req.Name,
 		source:    req.Source,
 		kind:      req.Kind,
@@ -618,7 +619,7 @@ func (p *Participant) PublishDataTrack(req *proto.PublishDataTrackRequest) (*Dat
 	}
 
 	track := &DataPublishedTrack{
-		sid:          dataProducer.Id(),
+		sid:          string(types.NewStreamID(p.router.Id(), dataProducer.Id())),
 		name:         req.Name,
 		dataProducer: dataProducer,
 		appData:      req.AppData,
@@ -655,6 +656,10 @@ func (p *Participant) UnpublishDataTrack(dataTrackSid string) error {
 
 	track.dataProducer.Close()
 
+	if p.room != nil {
+		p.room.OnDataTrackUnpublished(p, dataTrackSid)
+	}
+
 	p.logger.Info("Data track unpublished", "dataTrackSid", dataTrackSid)
 	return nil
 }
@@ -684,6 +689,12 @@ func (p *Participant) Subscribe(track *PublishedTrack, publisher *Participant) e
 
 	if transport == nil || caps == nil {
 		return fmt.Errorf("participant not ready for subscription")
+	}
+
+	if p.room != nil && p.room.cascade.EnsureStream != nil {
+		if err := p.room.cascade.EnsureStream(track.sid); err != nil {
+			return fmt.Errorf("ensure stream failed: %w", err)
+		}
 	}
 
 	producerId := track.producer.Id()
@@ -758,6 +769,10 @@ func (p *Participant) Subscribe(track *PublishedTrack, publisher *Participant) e
 		p.mu.Unlock()
 
 		track.removeConsumer(consumer.Id())
+
+		if p.room != nil && p.room.cascade.ReleaseStream != nil {
+			p.room.cascade.ReleaseStream(track.sid)
+		}
 	})
 
 	consumer.OnLayersChange(func(layers *mediasoup.ConsumerLayers) {
@@ -779,6 +794,12 @@ func (p *Participant) SubscribeData(track *DataPublishedTrack, publisher *Partic
 
 	if transport == nil {
 		return fmt.Errorf("participant not ready for data subscription")
+	}
+
+	if p.room != nil && p.room.cascade.EnsureStream != nil {
+		if err := p.room.cascade.EnsureStream(track.sid); err != nil {
+			return fmt.Errorf("ensure data stream failed: %w", err)
+		}
 	}
 
 	dataProducerId := track.dataProducer.Id()
@@ -841,6 +862,10 @@ func (p *Participant) SubscribeData(track *DataPublishedTrack, publisher *Partic
 		p.mu.Lock()
 		delete(p.dataSubscriptions, sub.sid)
 		p.mu.Unlock()
+
+		if p.room != nil && p.room.cascade.ReleaseStream != nil {
+			p.room.cascade.ReleaseStream(track.sid)
+		}
 	})
 
 	p.logger.Info("Data subscription created", "dataSub", sub.sid,

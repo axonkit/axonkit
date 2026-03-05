@@ -146,9 +146,11 @@ func main() {
 
 	// 5. Init Room Manager
 	roomManager := rtc.NewRoomManager(rtc.RoomManagerParams{
-		Config: cfg.Room,
-		FIB:    fib,
-		Finder: finder,
+		Config:       cfg.Room,
+		RIB:          rib,
+		FIB:          fib,
+		Finder:       finder,
+		MediaManager: mediaMgr,
 	})
 
 	// 6. Init Token Verifier
