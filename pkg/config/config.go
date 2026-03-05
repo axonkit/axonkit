@@ -62,7 +62,7 @@ func DefaultConfig() *Config {
 			ID:      xid.New().String(),
 			Region:  "default-region",
 			Cluster: "default-cluster",
-			Port:    8080,
+			Port:    7990,
 		},
 		Room: RoomConfig{
 			EmptyTimeout:     5 * time.Minute,
