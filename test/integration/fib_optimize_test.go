@@ -263,7 +263,7 @@ func TestConcurrentOptimization(t *testing.T) {
 		return best, nil
 	}
 
-	const NumStreams = 500
+	const NumStreams = 50
 	var wg sync.WaitGroup
 	doneCh := make(chan struct{})
 

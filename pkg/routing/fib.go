@@ -574,18 +574,13 @@ func (f *FIB) optimizeRoute(streamID types.StreamID) {
 		return
 	}
 
-	// Reschedule optimization (periodic)
-	defer f.scheduleOptimization(entry)
-
 	currentUpstream := entry.UpstreamNode
 	findPath := entry.FindPathFunc
-
-	// Current Cost?
-	// We don't store current cost in FIBEntry, but we can query RIB or guess.
-	// Actually, we should probably just find the BEST path now and compare.
 	f.mu.Unlock()
 
-	// Find best path
+	defer f.rescheduleOptimization(streamID)
+
+	// Find best path (outside lock — may do I/O)
 	bestRoute, err := findPath(streamID)
 	if err != nil || bestRoute == nil {
 		return // No path found, keep current
@@ -595,13 +590,10 @@ func (f *FIB) optimizeRoute(streamID types.StreamID) {
 		return // Same upstream, nothing to do
 	}
 
-	// We need to compare costs.
-	// Issue: findPath usually returns the best route.
-	// If it returns a different node, it implies that node is "better" (lower cost).
-	// But we need to apply Hysteresis (Threshold).
-
-	// To do this properly, we need the Cost of the CURRENT route.
-	// We can try to fetch the candidate for current upstream from RIB.
+	// We need to compare costs. findPath returns the best route; if it returns
+	// a different node, that node is "better" (lower cost). But we apply
+	// hysteresis (threshold) to avoid flapping. To do this we need the cost
+	// of the CURRENT route, which we fetch from RIB candidates.
 	candidates, err := f.rib.GetCandidates(streamID)
 	if err != nil {
 		return
@@ -616,26 +608,33 @@ func (f *FIB) optimizeRoute(streamID types.StreamID) {
 	}
 
 	if currentRoute == nil {
-		// Current upstream is gone?
-		// If gone, we should have triggered failover already.
-		// But maybe failover is slow or racing.
-		// If we found a new best route, let's switch.
+		// Current upstream is gone. Failover should have triggered already,
+		// but it may be racing. Switch to the new best route.
 		f.logger.Info("Optimize: Current upstream not found, switching", "current", currentUpstream, "new", bestRoute.Node)
 		f.switchUpstream(streamID, bestRoute)
 		return
 	}
 
-	// Skip optimization if current upstream is in the same Cluster
-	// Intra-cluster traffic is usually preferred/free, so don't switch away unless broken.
+	// Skip optimization if current upstream is in the same cluster —
+	// intra-cluster traffic is usually preferred/free.
 	if currentRoute.Cluster == f.rib.LocalInfo().Cluster {
 		return
 	}
 
-	// Apply Threshold
-	// Switch if: NewCost < CurrentCost - Threshold
+	// Apply threshold: switch if NewCost < CurrentCost - Threshold
 	if bestRoute.BaseCost < currentRoute.BaseCost-f.OptimizationThreshold {
 		f.logger.Info("Optimize: Found better path", "new_node", bestRoute.Node, "new_cost", bestRoute.BaseCost, "current_node", currentUpstream, "current_cost", currentRoute.BaseCost)
 		f.switchUpstream(streamID, bestRoute)
+	}
+}
+
+// rescheduleOptimization re-acquires the lock and reschedules the optimization
+// timer for the given stream. Safe to call without holding f.mu.
+func (f *FIB) rescheduleOptimization(streamID types.StreamID) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if entry, ok := f.entries[streamID]; ok {
+		f.scheduleOptimization(entry)
 	}
 }
 
