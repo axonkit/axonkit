@@ -48,6 +48,7 @@ func (r *Room) Sid() string          { return r.sid }
 func (r *Room) Name() string         { return r.name }
 func (r *Room) Metadata() string     { return r.metadata }
 func (r *Room) SetMetadata(m string) { r.metadata = m }
+func (r *Room) Dynacast() bool       { return r.config.Dynacast }
 
 func (r *Room) SetOnClose(fn func(*Room)) { r.onClose = fn }
 
@@ -113,6 +114,21 @@ func (r *Room) GetParticipant(sid string) *Participant {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.participants[sid]
+}
+
+// FindPublishedTrack looks up a published track by its SID across all participants.
+func (r *Room) FindPublishedTrack(trackSid string) *PublishedTrack {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, p := range r.participants {
+		p.mu.RLock()
+		t := p.publishedTracks[trackSid]
+		p.mu.RUnlock()
+		if t != nil {
+			return t
+		}
+	}
+	return nil
 }
 
 func (r *Room) GetParticipantByIdentity(identity string) *Participant {

@@ -209,18 +209,13 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 			Role:         mediasoup.DtlsRoleClient,
 			Fingerprints: req.ConnectionSettings.DtlsFingerprints,
 		}
-		for _, t := range []*mediasoup.Transport{sendTransport, recvTransport} {
-			err := t.Connect(&mediasoup.TransportConnectOptions{
-				DtlsParameters: dtlsParams,
-			})
-			if err != nil {
-				sendTransport.Close()
-				recvTransport.Close()
-				directTransport.Close()
-				writeJSON(w, http.StatusInternalServerError, proto.ErrorResponse{
-					Code: proto.ErrCodeInternal, Error: "transport connect failed: " + err.Error()})
-				return
-			}
+		if err := connectTransports(dtlsParams, sendTransport, recvTransport); err != nil {
+			sendTransport.Close()
+			recvTransport.Close()
+			directTransport.Close()
+			writeJSON(w, http.StatusInternalServerError, proto.ErrorResponse{
+				Code: proto.ErrCodeInternal, Error: "transport connect failed: " + err.Error()})
+			return
 		}
 	}
 
@@ -394,6 +389,15 @@ func (s *Server) createSignalChannels(send, recv, direct *mediasoup.Transport) (
 	}, nil
 }
 
+func connectTransports(dtlsParams *mediasoup.DtlsParameters, transports ...*mediasoup.Transport) error {
+	for _, t := range transports {
+		if err := t.Connect(&mediasoup.TransportConnectOptions{DtlsParameters: dtlsParams}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Server) transportToProto(t *mediasoup.Transport) *proto.TransportInfo {
 	data := t.Data()
 	info := &proto.TransportInfo{
@@ -518,15 +522,13 @@ func (s *Server) handleReconnectLocal(w http.ResponseWriter, req *proto.JoinRequ
 			Role:         mediasoup.DtlsRoleClient,
 			Fingerprints: req.ConnectionSettings.DtlsFingerprints,
 		}
-		for _, t := range []*mediasoup.Transport{sendTransport, recvTransport} {
-			if err := t.Connect(&mediasoup.TransportConnectOptions{DtlsParameters: dtlsParams}); err != nil {
-				sendTransport.Close()
-				recvTransport.Close()
-				directTransport.Close()
-				writeJSON(w, http.StatusInternalServerError, proto.ErrorResponse{
-					Code: proto.ErrCodeInternal, Error: "transport connect failed: " + err.Error()})
-				return
-			}
+		if err := connectTransports(dtlsParams, sendTransport, recvTransport); err != nil {
+			sendTransport.Close()
+			recvTransport.Close()
+			directTransport.Close()
+			writeJSON(w, http.StatusInternalServerError, proto.ErrorResponse{
+				Code: proto.ErrCodeInternal, Error: "transport connect failed: " + err.Error()})
+			return
 		}
 	}
 
@@ -560,8 +562,8 @@ func (s *Server) handleReconnectLocal(w http.ResponseWriter, req *proto.JoinRequ
 	}
 
 	resp := proto.JoinResponse{
-		Room:        roomProto,
-		Participant: participant.ToProto(),
+		Room:         roomProto,
+		Participant:  participant.ToProto(),
 		PingTimeout:  s.cfg.PingTimeout(),
 		PingInterval: s.cfg.PingInterval(),
 		ServerInfo: &proto.ServerInfo{

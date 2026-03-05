@@ -54,17 +54,18 @@ const (
 	MethodDataSubscriptionCreate = "dataSubscription.create"
 
 	// Server -> Client: Notifications (one-way)
-	MethodSubscriptionClosed     = "subscription.closed"
-	MethodDataSubscriptionClosed = "dataSubscription.closed"
-	MethodParticipantJoined      = "participant.joined"
-	MethodParticipantLeft        = "participant.left"
-	MethodParticipantUpdated     = "participant.updated"
-	MethodTrackPublished         = "track.published"
-	MethodTrackUnpublished       = "track.unpublished"
-	MethodTrackMuted             = "track.muted"
-	MethodActiveSpeakersChanged  = "activeSpeakers.changed"
-	MethodRoomUpdated            = "room.updated"
-	MethodDisconnect             = "disconnect"
+	MethodSubscriptionClosed            = "subscription.closed"
+	MethodDataSubscriptionClosed        = "dataSubscription.closed"
+	MethodParticipantJoined             = "participant.joined"
+	MethodParticipantLeft               = "participant.left"
+	MethodParticipantUpdated            = "participant.updated"
+	MethodTrackPublished                = "track.published"
+	MethodTrackUnpublished              = "track.unpublished"
+	MethodTrackMuted                    = "track.muted"
+	MethodTrackSubscribedQualityChanged = "track.subscribedQualityChanged"
+	MethodActiveSpeakersChanged         = "activeSpeakers.changed"
+	MethodRoomUpdated                   = "room.updated"
+	MethodDisconnect                    = "disconnect"
 )
 
 // Status codes, HTTP-compatible.

@@ -23,6 +23,18 @@ type PublishedTrack struct {
 	width    uint32
 	height   uint32
 	appData  map[string]any
+
+	// Dynacast: track which consumers are active and their max spatial layer.
+	// Protected by mu.
+	mu              sync.Mutex
+	activeConsumers map[string]*consumerLayerState // consumerID → state
+	lastQualities   [3]bool                        // [LOW, MEDIUM, HIGH] last notified
+	publisher       *Participant
+}
+
+type consumerLayerState struct {
+	paused       bool
+	spatialLayer int32 // -1 means unset (use all)
 }
 
 func (t *PublishedTrack) ToProto() *proto.TrackInfo {
@@ -39,6 +51,103 @@ func (t *PublishedTrack) ToProto() *proto.TrackInfo {
 		Height: t.height,
 		Source: t.source,
 	}
+}
+
+// addConsumer registers a consumer for dynacast tracking.
+func (t *PublishedTrack) addConsumer(consumerID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.activeConsumers == nil {
+		return
+	}
+	t.activeConsumers[consumerID] = &consumerLayerState{spatialLayer: -1}
+}
+
+// removeConsumer unregisters a consumer and triggers recalculation.
+func (t *PublishedTrack) removeConsumer(consumerID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.activeConsumers == nil {
+		return
+	}
+	delete(t.activeConsumers, consumerID)
+	t.recalcLocked()
+}
+
+// updateConsumerLayers updates a consumer's preferred spatial layer.
+func (t *PublishedTrack) updateConsumerLayers(consumerID string, spatialLayer int32) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.activeConsumers == nil {
+		return
+	}
+	if st, ok := t.activeConsumers[consumerID]; ok {
+		st.spatialLayer = spatialLayer
+	}
+	t.recalcLocked()
+}
+
+// updateConsumerPaused updates whether a consumer is paused.
+func (t *PublishedTrack) updateConsumerPaused(consumerID string, paused bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.activeConsumers == nil {
+		return
+	}
+	if st, ok := t.activeConsumers[consumerID]; ok {
+		st.paused = paused
+	}
+	t.recalcLocked()
+}
+
+// recalcLocked computes the max needed quality across all active (non-paused)
+// consumers and notifies the publisher if it changed. Must be called with mu held.
+func (t *PublishedTrack) recalcLocked() {
+	// For non-video tracks, dynacast is not applicable.
+	if t.kind != mediasoup.MediaKindVideo {
+		return
+	}
+
+	// Determine max needed spatial layer across all non-paused consumers.
+	maxNeeded := int32(-1) // -1 means no consumer active
+	for _, st := range t.activeConsumers {
+		if st.paused {
+			continue
+		}
+		if st.spatialLayer < 0 {
+			// Unset = needs all layers → max possible.
+			maxNeeded = 2
+			break
+		}
+		if st.spatialLayer > maxNeeded {
+			maxNeeded = st.spatialLayer
+		}
+	}
+
+	// Map max spatial layer to quality flags: LOW=0, MEDIUM=1, HIGH=2.
+	var q [3]bool
+	for i := int32(0); i <= maxNeeded && i <= 2; i++ {
+		q[i] = true
+	}
+
+	if q == t.lastQualities {
+		return
+	}
+	t.lastQualities = q
+
+	if t.publisher == nil {
+		return
+	}
+
+	_ = t.publisher.SendNotification(proto.MethodTrackSubscribedQualityChanged,
+		&proto.SubscribedQualityChangedNotification{
+			TrackSid: t.sid,
+			SubscribedQualities: []proto.SubscribedQuality{
+				{Quality: proto.VideoQuality_LOW, Enabled: q[0]},
+				{Quality: proto.VideoQuality_MEDIUM, Enabled: q[1]},
+				{Quality: proto.VideoQuality_HIGH, Enabled: q[2]},
+			},
+		})
 }
 
 // DataPublishedTrack holds a published data track.
@@ -352,15 +461,21 @@ func (p *Participant) PublishTrack(req *proto.PublishTrackRequest) (*PublishedTr
 	}
 
 	track := &PublishedTrack{
-		sid:      producer.Id(),
-		name:     req.Name,
-		source:   req.Source,
-		kind:     req.Kind,
-		producer: producer,
-		muted:    req.Muted,
-		width:    req.Width,
-		height:   req.Height,
-		appData:  req.AppData,
+		sid:       producer.Id(),
+		name:      req.Name,
+		source:    req.Source,
+		kind:      req.Kind,
+		producer:  producer,
+		muted:     req.Muted,
+		width:     req.Width,
+		height:    req.Height,
+		appData:   req.AppData,
+		publisher: p,
+	}
+
+	if p.room != nil && p.room.Dynacast() && req.Kind == mediasoup.MediaKindVideo {
+		track.activeConsumers = make(map[string]*consumerLayerState)
+		track.lastQualities = [3]bool{true, true, true}
 	}
 
 	p.mu.Lock()
@@ -620,10 +735,20 @@ func (p *Participant) Subscribe(track *PublishedTrack, publisher *Participant) e
 	p.subscriptions[sub.sid] = sub
 	p.mu.Unlock()
 
+	track.addConsumer(consumer.Id())
+
 	consumer.OnClose(func(ctx context.Context) {
 		p.mu.Lock()
 		delete(p.subscriptions, sub.sid)
 		p.mu.Unlock()
+
+		track.removeConsumer(consumer.Id())
+	})
+
+	consumer.OnLayersChange(func(layers *mediasoup.ConsumerLayers) {
+		if layers != nil {
+			track.updateConsumerLayers(consumer.Id(), int32(layers.SpatialLayer))
+		}
 	})
 
 	p.logger.Info("Subscription created", "subscriptionSid", sub.sid,
@@ -715,7 +840,15 @@ func (p *Participant) PauseSubscription(subSid string) error {
 	if !ok {
 		return fmt.Errorf("subscription not found: %s", subSid)
 	}
-	return sub.consumer.Pause()
+	if err := sub.consumer.Pause(); err != nil {
+		return err
+	}
+	if p.room != nil {
+		if track := p.room.FindPublishedTrack(sub.trackSid); track != nil {
+			track.updateConsumerPaused(sub.consumer.Id(), true)
+		}
+	}
+	return nil
 }
 
 func (p *Participant) ResumeSubscription(subSid string) error {
@@ -725,7 +858,15 @@ func (p *Participant) ResumeSubscription(subSid string) error {
 	if !ok {
 		return fmt.Errorf("subscription not found: %s", subSid)
 	}
-	return sub.consumer.Resume()
+	if err := sub.consumer.Resume(); err != nil {
+		return err
+	}
+	if p.room != nil {
+		if track := p.room.FindPublishedTrack(sub.trackSid); track != nil {
+			track.updateConsumerPaused(sub.consumer.Id(), false)
+		}
+	}
+	return nil
 }
 
 func (p *Participant) SetPreferredLayers(req *proto.SetPreferredLayersRequest) error {
@@ -742,7 +883,15 @@ func (p *Participant) SetPreferredLayers(req *proto.SetPreferredLayersRequest) e
 		tl := uint8(*req.TemporalLayer)
 		opts.TemporalLayer = &tl
 	}
-	return sub.consumer.SetPreferredLayers(opts)
+	if err := sub.consumer.SetPreferredLayers(opts); err != nil {
+		return err
+	}
+	if p.room != nil {
+		if track := p.room.FindPublishedTrack(sub.trackSid); track != nil {
+			track.updateConsumerLayers(sub.consumer.Id(), req.SpatialLayer)
+		}
+	}
+	return nil
 }
 
 func (p *Participant) SetPriority(subSid string, priority int32) error {

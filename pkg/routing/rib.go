@@ -187,13 +187,8 @@ func (r *RIB) dispatchUpdate(sw *streamWatcher, entry store.Entry) {
 
 		if isDelete {
 			cb(val.Node, false)
-		} else {
-			// Check if we are upstream
-			// Since PathVector includes the advertising node at the end,
-			// we look for ourselves at len-2.
-			if len(val.PathVector) >= 2 && val.PathVector[len(val.PathVector)-2] == r.local.ID {
-				cb(val.Node, true)
-			}
+		} else if len(val.PathVector) >= 2 && val.PathVector[len(val.PathVector)-2] == r.local.ID {
+			cb(val.Node, true)
 		}
 	}
 }
@@ -370,7 +365,7 @@ func (r *RIB) keepAliveLoop() {
 				item.Priority = time.Now().Add(RefreshRate).UnixNano()
 				heap.Push(&r.pq, item)
 			} else if wait > 0 {
-				// Reset timer
+				timer.Reset(time.Duration(wait))
 			}
 			r.mu.Unlock()
 		}

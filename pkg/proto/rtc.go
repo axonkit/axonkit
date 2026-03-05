@@ -33,7 +33,6 @@ type ConnectionSettings struct {
 	SubscriberAllowPause *bool                       `json:"subscriberAllowPause,omitempty"`
 	AdaptiveStream       bool                        `json:"adaptiveStream,omitempty"`
 	ForceTcp             bool                        `json:"forceTcp,omitempty"`
-	UsePlainTransport    bool                        `json:"usePlainTransport,omitempty"`
 	DtlsFingerprints     []mediasoup.DtlsFingerprint `json:"dtlsFingerprints,omitempty"`
 }
 
@@ -324,6 +323,28 @@ type TrackMutedNotification struct {
 	ParticipantSid string `json:"participantSid"`
 	TrackSid       string `json:"trackSid"`
 	Muted          bool   `json:"muted"`
+}
+
+// SubscribedQualityChangedNotification is sent by the server to the publisher
+// when dynacast is enabled. It tells the publisher which simulcast layers
+// currently have at least one subscriber, so the publisher can pause/unpause
+// encodings to save bandwidth and CPU.
+type SubscribedQualityChangedNotification struct {
+	TrackSid            string              `json:"trackSid"`
+	SubscribedQualities []SubscribedQuality `json:"subscribedQualities"`
+	SubscribedCodecs    []SubscribedCodec   `json:"subscribedCodecs,omitempty"`
+}
+
+// SubscribedQuality reports whether a specific quality level has active subscribers.
+type SubscribedQuality struct {
+	Quality VideoQuality `json:"quality"`
+	Enabled bool         `json:"enabled"`
+}
+
+// SubscribedCodec reports subscribed qualities per codec (for backup codec support).
+type SubscribedCodec struct {
+	Codec     string              `json:"codec"`
+	Qualities []SubscribedQuality `json:"qualities"`
 }
 
 type ActiveSpeakersNotification struct {

@@ -27,10 +27,10 @@ type pipeTransport struct {
 }
 
 type Manager struct {
-	nodeID   types.NodeID
-	nc       *nats.Conn
+	nodeID    types.NodeID
+	nc        *nats.Conn
 	webRtcCfg config.WebRtcConfig
-	logger   *slog.Logger
+	logger    *slog.Logger
 
 	workerBin   string
 	workerCount int
@@ -1040,7 +1040,7 @@ func (m *Manager) handleEnsurePingChannel(req PipeRequest) PipeResponse {
 	resp := PipeResponse{}
 
 	requesterRouterId := req.StreamID.RouterID()
-	if len(requesterRouterId) == 0 {
+	if requesterRouterId == "" {
 		resp.Error = "invalid streamID"
 		return resp
 	}

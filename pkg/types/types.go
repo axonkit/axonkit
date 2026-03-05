@@ -9,7 +9,7 @@ import (
 
 type StreamID string
 
-func NewStreamID(routerId string, producerId string) StreamID {
+func NewStreamID(routerId, producerId string) StreamID {
 	return StreamID(routerId + "." + producerId)
 }
 

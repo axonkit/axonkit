@@ -20,21 +20,21 @@ type Watcher interface {
 	Stop()
 }
 
-type WatchOption func(*watchOptions)
+type WatchOption func(*WatchOptions)
 
-type watchOptions struct {
+type WatchOptions struct {
 	IgnoreDeletes bool
 }
 
 func IgnoreDeletes() WatchOption {
-	return func(o *watchOptions) {
+	return func(o *WatchOptions) {
 		o.IgnoreDeletes = true
 	}
 }
 
 // GetWatchOptions applies options and returns the struct
-func GetWatchOptions(opts ...WatchOption) watchOptions {
-	var o watchOptions
+func GetWatchOptions(opts ...WatchOption) WatchOptions {
+	var o WatchOptions
 	for _, opt := range opts {
 		opt(&o)
 	}

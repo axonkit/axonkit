@@ -52,7 +52,7 @@ func (e *memoryEntry) Operation() Operation { return e.op }
 type memoryWatcher struct {
 	store   *MemoryStore
 	pattern string
-	opts    watchOptions
+	opts    WatchOptions
 	ch      chan Entry
 	stopCh  chan struct{}
 }

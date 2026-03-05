@@ -170,7 +170,9 @@ func (f *FIB) Subscribe(streamID types.StreamID, findPath func(types.StreamID) (
 	f.entries[streamID] = entry
 
 	// 4. Re-advertise (Propagate)
-	newPathVector := append(route.PathVector, f.localNodeID)
+	newPathVector := make([]types.NodeID, len(route.PathVector)+1)
+	copy(newPathVector, route.PathVector)
+	newPathVector[len(route.PathVector)] = f.localNodeID
 
 	// Start Keepalive Advertise
 	err = f.rib.StartAdvertise(AdvertiseOptions{
@@ -217,17 +219,13 @@ func (f *FIB) handleDownstreamChange(streamID types.StreamID, nodeID types.NodeI
 			entry.DownstreamNodes[nodeID] = true
 			f.logger.Info("New downstream dependency", "stream_id", streamID, "downstream_node", nodeID, "total", len(entry.DownstreamNodes))
 		}
-	} else {
-		if entry.DownstreamNodes[nodeID] {
-			delete(entry.DownstreamNodes, nodeID)
-			f.logger.Info("Downstream dependency removed", "stream_id", streamID, "downstream_node", nodeID, "total", len(entry.DownstreamNodes))
+	} else if entry.DownstreamNodes[nodeID] {
+		delete(entry.DownstreamNodes, nodeID)
+		f.logger.Info("Downstream dependency removed", "stream_id", streamID, "downstream_node", nodeID, "total", len(entry.DownstreamNodes))
 
-			// Check if we need to teardown
-			// Logic: If RefCount == 0 AND len(DownstreamNodes) == 0 -> Teardown
-			if entry.RefCount <= 0 && len(entry.DownstreamNodes) == 0 {
-				f.logger.Info("Scheduling teardown (no users/downstreams)", "stream_id", streamID)
-				f.scheduleTeardown(streamID)
-			}
+		if entry.RefCount <= 0 && len(entry.DownstreamNodes) == 0 {
+			f.logger.Info("Scheduling teardown (no users/downstreams)", "stream_id", streamID)
+			f.scheduleTeardown(streamID)
 		}
 	}
 }
@@ -376,8 +374,9 @@ func (f *FIB) handleFailover(streamID types.StreamID, failedUpstream types.NodeI
 	go f.monitorUpstream(streamID, newRoute.Node, findPath)
 
 	// Update Re-advertise (PathVector changed!)
-	// We need to update our advertisement because the path vector is different now
-	newPathVector := append(newRoute.PathVector, f.localNodeID)
+	newPathVector := make([]types.NodeID, len(newRoute.PathVector)+1)
+	copy(newPathVector, newRoute.PathVector)
+	newPathVector[len(newRoute.PathVector)] = f.localNodeID
 	if err := f.rib.StartAdvertise(AdvertiseOptions{
 		StreamID:    streamID,
 		BaseCost:    newRoute.BaseCost + 10,
@@ -471,7 +470,7 @@ func (f *FIB) cancelTeardown(entry *types.FIBEntry) {
 		entry.TeardownTimer.Stop()
 		entry.TeardownTimer = nil
 		entry.State = "connected"
-		f.logger.Info("Stream linger cancelled (reused)", "stream_id", entry.StreamID)
+		f.logger.Info("Stream linger canceled (reused)", "stream_id", entry.StreamID)
 
 		// Restart Optimization Timer if enabled
 		if f.EnableRouteOptimization {
@@ -629,7 +628,6 @@ func (f *FIB) optimizeRoute(streamID types.StreamID) {
 	// Skip optimization if current upstream is in the same Cluster
 	// Intra-cluster traffic is usually preferred/free, so don't switch away unless broken.
 	if currentRoute.Cluster == f.rib.LocalInfo().Cluster {
-		// log.Printf("[FIB] Optimize: Current upstream %s is in same cluster (%s). Skipping optimization.", currentUpstream, currentRoute.OriginCluster)
 		return
 	}
 
@@ -685,7 +683,9 @@ func (f *FIB) switchUpstream(streamID types.StreamID, newRoute *types.RouteKVVal
 	f.mu.Unlock()
 
 	// 3. Update Advertisement (Propagate new path)
-	newPathVector := append(newRoute.PathVector, f.localNodeID)
+	newPathVector := make([]types.NodeID, len(newRoute.PathVector)+1)
+	copy(newPathVector, newRoute.PathVector)
+	newPathVector[len(newRoute.PathVector)] = f.localNodeID
 	err := f.rib.StartAdvertise(AdvertiseOptions{
 		StreamID:    streamID,
 		BaseCost:    newRoute.BaseCost + 10,

@@ -6,12 +6,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jiyeyuran/mediasoup-go/v2"
 	"github.com/jiyeyuran/omnistream/pkg/config"
 	"github.com/jiyeyuran/omnistream/pkg/types"
 	"github.com/nats-io/nats-server/v2/server"
 	natsserver "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
-	"github.com/jiyeyuran/mediasoup-go/v2"
 )
 
 func setupNats(t *testing.T) (*server.Server, *nats.Conn) {

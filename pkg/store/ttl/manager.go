@@ -57,33 +57,31 @@ func (m *Manager[K, V]) AddAt(key K, value V, expireAt time.Time) (V, bool) {
 		item.Priority = priority
 		heap.Fix(&m.pq, item.Index)
 
-		// Signal loop
 		select {
 		case m.signalCh <- struct{}{}:
 		default:
 		}
 		return oldVal, true
-	} else {
-		entry := &Entry[K, V]{
-			Key:   key,
-			Value: value,
-		}
-		item := &ds.Item[*Entry[K, V]]{
-			Value:    entry,
-			Priority: priority,
-		}
-		heap.Push(&m.pq, item)
-		m.items[key] = item
-
-		// Signal loop
-		select {
-		case m.signalCh <- struct{}{}:
-		default:
-		}
-
-		var zero V
-		return zero, false
 	}
+
+	entry := &Entry[K, V]{
+		Key:   key,
+		Value: value,
+	}
+	item := &ds.Item[*Entry[K, V]]{
+		Value:    entry,
+		Priority: priority,
+	}
+	heap.Push(&m.pq, item)
+	m.items[key] = item
+
+	select {
+	case m.signalCh <- struct{}{}:
+	default:
+	}
+
+	var zero V
+	return zero, false
 }
 
 // Remove removes an item.

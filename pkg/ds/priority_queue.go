@@ -66,14 +66,14 @@ func (pq *PriorityQueue[T]) Pop() interface{} {
 
 // PeekAndShift returns the top item if its priority is <= max.
 // If top item > max, returns nil and the difference (wait time).
-func (pq *PriorityQueue[T]) PeekAndShift(max int64) (*Item[T], int64) {
+func (pq *PriorityQueue[T]) PeekAndShift(maxPriority int64) (*Item[T], int64) {
 	if pq.Len() == 0 {
 		return nil, 0
 	}
 
 	item := (*pq)[0]
-	if item.Priority > max {
-		return nil, item.Priority - max
+	if item.Priority > maxPriority {
+		return nil, item.Priority - maxPriority
 	}
 	heap.Remove(pq, 0)
 
