@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jiyeyuran/omnistream/pkg/types"
+	"github.com/axonkit/axonkit/pkg/types"
 )
 
 func TestLinkDB_Probing(t *testing.T) {

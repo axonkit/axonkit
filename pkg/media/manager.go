@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jiyeyuran/omnistream/pkg/config"
-	"github.com/jiyeyuran/omnistream/pkg/types"
+	"github.com/axonkit/axonkit/pkg/config"
+	"github.com/axonkit/axonkit/pkg/types"
 
 	"github.com/jiyeyuran/mediasoup-go/v2"
 	"github.com/nats-io/nats.go"

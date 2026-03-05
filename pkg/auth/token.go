@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jiyeyuran/omnistream/pkg/proto"
+	"github.com/axonkit/axonkit/pkg/proto"
 )
 
 var (

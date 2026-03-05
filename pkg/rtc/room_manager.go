@@ -4,9 +4,9 @@ import (
 	"log/slog"
 	"sync"
 
-	"github.com/jiyeyuran/omnistream/pkg/config"
-	"github.com/jiyeyuran/omnistream/pkg/discovery"
-	"github.com/jiyeyuran/omnistream/pkg/routing"
+	"github.com/axonkit/axonkit/pkg/config"
+	"github.com/axonkit/axonkit/pkg/discovery"
+	"github.com/axonkit/axonkit/pkg/routing"
 	"github.com/rs/xid"
 )
 

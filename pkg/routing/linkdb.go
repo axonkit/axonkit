@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jiyeyuran/omnistream/pkg/types"
+	"github.com/axonkit/axonkit/pkg/types"
 )
 
 // LinkDB stores local perspective of link quality to other clusters and regions

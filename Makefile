@@ -1,6 +1,6 @@
-MODULE   := github.com/jiyeyuran/omnistream
-BINARY   := omnistream
-CMD_DIR  := ./cmd/omnistream
+MODULE   := github.com/axonkit/axonkit
+BINARY   := axonkit
+CMD_DIR  := ./cmd/axonkit
 
 .PHONY: all build run test lint fmt vet tidy clean
 

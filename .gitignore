@@ -19,7 +19,7 @@ go.work
 
 # Project Binaries
 /router
-/omnistream
+/axonkit
 /mediasoup-*
 /bin
 .vscode/

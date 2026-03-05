@@ -1,4 +1,4 @@
-module github.com/jiyeyuran/omnistream
+module github.com/axonkit/axonkit
 
 go 1.25.6
 

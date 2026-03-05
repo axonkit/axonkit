@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jiyeyuran/omnistream/pkg/ds"
-	"github.com/jiyeyuran/omnistream/pkg/store"
-	"github.com/jiyeyuran/omnistream/pkg/types"
+	"github.com/axonkit/axonkit/pkg/ds"
+	"github.com/axonkit/axonkit/pkg/store"
+	"github.com/axonkit/axonkit/pkg/types"
 )
 
 const (

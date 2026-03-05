@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/axonkit/axonkit/pkg/proto"
 	"github.com/jiyeyuran/mediasoup-go/v2"
-	"github.com/jiyeyuran/omnistream/pkg/proto"
 )
 
 // dispatchRPC routes incoming datachannel RPC messages to the appropriate handler.

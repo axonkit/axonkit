@@ -8,12 +8,12 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/axonkit/axonkit/pkg/auth"
+	"github.com/axonkit/axonkit/pkg/config"
+	"github.com/axonkit/axonkit/pkg/proto"
+	"github.com/axonkit/axonkit/pkg/rtc"
+	"github.com/axonkit/axonkit/pkg/types"
 	"github.com/jiyeyuran/mediasoup-go/v2"
-	"github.com/jiyeyuran/omnistream/pkg/auth"
-	"github.com/jiyeyuran/omnistream/pkg/config"
-	"github.com/jiyeyuran/omnistream/pkg/proto"
-	"github.com/jiyeyuran/omnistream/pkg/rtc"
-	"github.com/jiyeyuran/omnistream/pkg/types"
 	"github.com/nats-io/nats.go"
 	"github.com/rs/xid"
 )

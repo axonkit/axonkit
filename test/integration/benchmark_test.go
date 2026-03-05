@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jiyeyuran/omnistream/pkg/types"
+	"github.com/axonkit/axonkit/pkg/types"
 )
 
 // BenchmarkStreamScale measures performance when subscribing to many streams

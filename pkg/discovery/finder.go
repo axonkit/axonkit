@@ -1,9 +1,10 @@
 package discovery
 
 import (
-	"github.com/jiyeyuran/omnistream/pkg/routing"
-	"github.com/jiyeyuran/omnistream/pkg/types"
 	"sort"
+
+	"github.com/axonkit/axonkit/pkg/routing"
+	"github.com/axonkit/axonkit/pkg/types"
 )
 
 type Finder struct {

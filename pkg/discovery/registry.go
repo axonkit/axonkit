@@ -7,8 +7,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/jiyeyuran/omnistream/pkg/store"
-	"github.com/jiyeyuran/omnistream/pkg/types"
+	"github.com/axonkit/axonkit/pkg/store"
+	"github.com/axonkit/axonkit/pkg/types"
 )
 
 const (

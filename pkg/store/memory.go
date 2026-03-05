@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jiyeyuran/omnistream/pkg/store/ttl"
+	"github.com/axonkit/axonkit/pkg/store/ttl"
 )
 
 // MemoryStore implements an in-memory Store.

@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/axonkit/axonkit/pkg/proto"
 	"github.com/jiyeyuran/mediasoup-go/v2"
-	"github.com/jiyeyuran/omnistream/pkg/proto"
 	"github.com/rs/xid"
 )
 

@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jiyeyuran/omnistream/pkg/routing"
-	"github.com/jiyeyuran/omnistream/pkg/store"
-	"github.com/jiyeyuran/omnistream/pkg/types"
+	"github.com/axonkit/axonkit/pkg/routing"
+	"github.com/axonkit/axonkit/pkg/store"
+	"github.com/axonkit/axonkit/pkg/types"
 
 	server "github.com/nats-io/nats-server/v2/server"
 	natsserver "github.com/nats-io/nats-server/v2/test"

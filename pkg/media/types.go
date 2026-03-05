@@ -1,7 +1,7 @@
 package media
 
 import (
-	"github.com/jiyeyuran/omnistream/pkg/types"
+	"github.com/axonkit/axonkit/pkg/types"
 
 	"github.com/jiyeyuran/mediasoup-go/v2"
 )

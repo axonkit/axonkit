@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jiyeyuran/omnistream/pkg/ds"
+	"github.com/axonkit/axonkit/pkg/ds"
 )
 
 type Entry[K comparable, V any] struct {

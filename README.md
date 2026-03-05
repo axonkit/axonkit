@@ -1,6 +1,6 @@
-# OmniStream
+# axonkit
 
-OmniStream is a distributed, intelligent media routing network built on top of [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream) and mediasoup. It leverages RIB (Routing Information Base) and FIB (Forwarding Information Base) concepts from traditional networking to provide dynamic, low-latency stream routing across clusters and regions.
+axonkit is a distributed, intelligent media routing network built on top of [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream) and mediasoup. It leverages RIB (Routing Information Base) and FIB (Forwarding Information Base) concepts from traditional networking to provide dynamic, low-latency stream routing across clusters and regions.
 
 ## Features
 
@@ -16,7 +16,7 @@ OmniStream is a distributed, intelligent media routing network built on top of [
 
 ## Architecture
 
-OmniStream separates the control plane (Routing) from the data plane (Forwarding):
+axonkit separates the control plane (Routing) from the data plane (Forwarding):
 
 - **RIB (Routing Information Base)**:
   - Maintains the global view of available streams and their routes.
@@ -40,14 +40,14 @@ OmniStream separates the control plane (Routing) from the data plane (Forwarding
 ### Installation
 
 ```bash
-git clone https://github.com/jiyeyuran/omnistream.git
-cd omnistream
+git clone https://github.com/axonkit/axonkit.git
+cd axonkit
 go mod tidy
 ```
 
 ### Running the Demo
 
-The project includes a demo scenario (`cmd/omnistream`) that simulates nodes in different regions (e.g., Beijing, NewYork, SanFrancisco).
+The project includes a demo scenario (`cmd/axonkit`) that simulates nodes in different regions (e.g., Beijing, NewYork, SanFrancisco).
 
 1.  **Start NATS Server**:
 
@@ -58,13 +58,13 @@ The project includes a demo scenario (`cmd/omnistream`) that simulates nodes in 
 2.  **Run Node 1 (Beijing)**:
 
     ```bash
-    go run ./cmd/omnistream -node node-bj-1 -cluster Beijing -region CN
+    go run ./cmd/axonkit -node node-bj-1 -cluster Beijing -region CN
     ```
 
 3.  **Run Node 2 (San Francisco)**:
 
     ```bash
-    go run ./cmd/omnistream -node node-sf-1 -cluster SanFrancisco -region US-W
+    go run ./cmd/axonkit -node node-sf-1 -cluster SanFrancisco -region US-W
     ```
 
 4.  **Publish a Stream (on Beijing Node)**:
@@ -85,7 +85,7 @@ The project includes a demo scenario (`cmd/omnistream`) that simulates nodes in 
 - `pkg/routing`: Core RIB, FIB, and LinkDB implementations.
 
 * `pkg/store`: Abstraction layer for NATS KV Store.
-* `cmd/omnistream`: Real application demonstrating the routing logic.
+* `cmd/axonkit`: Real application demonstrating the routing logic.
 * `cmd/router`: A standalone router component (WIP).
 
 ## License

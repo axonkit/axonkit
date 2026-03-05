@@ -1,6 +1,6 @@
-# OmniStream Demo
+# axonkit Demo
 
-This demo illustrates a distributed media routing scenario using RIB (Routing Information Base) and FIB (Forwarding Information Base) within **OmniStream**. It simulates edge nodes in different regions (CN, US-A, US-B) connecting via a NATS backbone.
+This demo illustrates a distributed media routing scenario using RIB (Routing Information Base) and FIB (Forwarding Information Base) within **axonkit**. It simulates edge nodes in different regions (CN, US-A, US-B) connecting via a NATS backbone.
 
 ## Prerequisites
 

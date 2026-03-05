@@ -87,7 +87,7 @@ const (
 )
 
 const (
-	protoLine = "OMNI/1.0\r\n"
+	protoLine = "AXON/1.0\r\n"
 	crlf      = "\r\n"
 )
 
@@ -130,7 +130,7 @@ const (
 //	REQ <method> <logId>\r\n        -- request (logId required)
 //	RES <logId> <status>\r\n        -- response (logId required)
 //	MSG <method> [<logId>]\r\n      -- notification (logId optional, for tracing)
-//	[OMNI/1.0\r\n                   -- optional headers
+//	[AXON/1.0\r\n                   -- optional headers
 //	Key: Value\r\n
 //	\r\n]
 //	<body bytes>                    -- raw bytes (JSON, protobuf, etc.)
@@ -256,7 +256,7 @@ func decodeHeaders(data []byte) (Header, error) {
 	br := bufio.NewReaderSize(bytes.NewReader(data), 128)
 	tp := textproto.NewReader(br)
 	l, err := tp.ReadLine()
-	if err != nil || !strings.HasPrefix(l, "OMNI/") {
+	if err != nil || !strings.HasPrefix(l, "AXON/") {
 		return nil, ErrBadHeader
 	}
 	mh, err := tp.ReadMIMEHeader()

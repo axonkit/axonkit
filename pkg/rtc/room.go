@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jiyeyuran/omnistream/pkg/config"
-	"github.com/jiyeyuran/omnistream/pkg/proto"
+	"github.com/axonkit/axonkit/pkg/config"
+	"github.com/axonkit/axonkit/pkg/proto"
 )
 
 var (

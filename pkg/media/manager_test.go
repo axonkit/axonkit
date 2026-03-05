@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/axonkit/axonkit/pkg/config"
+	"github.com/axonkit/axonkit/pkg/types"
 	"github.com/jiyeyuran/mediasoup-go/v2"
-	"github.com/jiyeyuran/omnistream/pkg/config"
-	"github.com/jiyeyuran/omnistream/pkg/types"
 	"github.com/nats-io/nats-server/v2/server"
 	natsserver "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
