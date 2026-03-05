@@ -11,7 +11,6 @@ import (
 	"github.com/jiyeyuran/mediasoup-go/v2"
 	"github.com/jiyeyuran/omnistream/pkg/auth"
 	"github.com/jiyeyuran/omnistream/pkg/config"
-	"github.com/jiyeyuran/omnistream/pkg/discovery"
 	"github.com/jiyeyuran/omnistream/pkg/proto"
 	"github.com/jiyeyuran/omnistream/pkg/rtc"
 	"github.com/jiyeyuran/omnistream/pkg/types"
@@ -69,7 +68,6 @@ type Server struct {
 	verifier      *auth.TokenVerifier
 	node          types.NodeInfo
 	nc            *nats.Conn
-	sessions      *discovery.SessionRegistry
 	routers       []*mediasoup.Router
 	webRtcServers []*mediasoup.WebRtcServer
 }
@@ -80,7 +78,6 @@ type ServerParams struct {
 	Verifier      *auth.TokenVerifier
 	Node          types.NodeInfo
 	NC            *nats.Conn
-	Sessions      *discovery.SessionRegistry
 	Routers       []*mediasoup.Router
 	WebRtcServers []*mediasoup.WebRtcServer
 }
@@ -92,7 +89,6 @@ func NewServer(params ServerParams) *Server {
 		verifier:      params.Verifier,
 		node:          params.Node,
 		nc:            params.NC,
-		sessions:      params.Sessions,
 		routers:       params.Routers,
 		webRtcServers: params.WebRtcServers,
 	}
@@ -113,12 +109,27 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ---- Node forwarding: if the client specifies a target node, proxy to it ----
+	if req.NodeId != "" && types.NodeID(req.NodeId) != s.node.ID && s.nc != nil {
+		payload, _ := json.Marshal(req)
+		action := "join"
+		if req.Reconnect {
+			action = "reconnect"
+		}
+		s.forwardViaNATS(w, types.NodeID(req.NodeId), action, payload)
+		return
+	}
+
 	// ---- Reconnect branch ----
 	if req.Reconnect && req.ParticipantSid != "" {
 		s.handleReconnect(w, &req, logId)
 		return
 	}
 
+	s.handleJoinLocal(w, &req, logId)
+}
+
+func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, logId string) {
 	var claims *auth.Claims
 	if !s.cfg.Debug {
 		if req.Token == "" {
@@ -202,8 +213,6 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	participant.SetTransports(sendTransport, recvTransport, directTransport)
 
-	// Connect transports immediately using pre-generated DTLS fingerprints.
-	// mediasoup is ICE-Lite so the remote (client) DTLS role is always "client".
 	if req.ConnectionSettings != nil && len(req.ConnectionSettings.DtlsFingerprints) > 0 {
 		dtlsParams := &mediasoup.DtlsParameters{
 			Role:         mediasoup.DtlsRoleClient,
@@ -253,14 +262,6 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		ReceiveTransport: s.transportToProto(recvTransport),
 		Signal:           sig.info,
 		RtpCapabilities:  router.RtpCapabilities(),
-	}
-
-	if s.sessions != nil {
-		_ = s.sessions.Register(participantSid, discovery.SessionInfo{
-			NodeID:   s.node.ID,
-			RoomName: req.Room.Name,
-			Identity: identity,
-		})
 	}
 
 	w.Header().Set("X-Node-Id", string(s.node.ID))
@@ -425,17 +426,14 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.NodeId != "" && types.NodeID(req.NodeId) != s.node.ID && s.nc != nil {
+		payload, _ := json.Marshal(req)
+		s.forwardViaNATS(w, types.NodeID(req.NodeId), "connect", payload)
+		return
+	}
+
 	participant := s.roomManager.GetParticipantBySid(req.ParticipantSid)
 	if participant == nil {
-		// Not on this node — try forwarding via session registry.
-		if s.sessions != nil && s.nc != nil {
-			sess, err := s.sessions.Lookup(req.ParticipantSid)
-			if err == nil && sess.NodeID != s.node.ID {
-				payload, _ := json.Marshal(req)
-				s.forwardViaNATS(w, sess.NodeID, "connect", payload)
-				return
-			}
-		}
 		writeJSON(w, http.StatusNotFound, proto.ErrorResponse{
 			Code: proto.ErrCodeNotFound, Error: "participant not found"})
 		return
@@ -472,26 +470,6 @@ func (s *Server) handleConnectLocal(w http.ResponseWriter, req *proto.ConnectReq
 // ============================================================
 
 func (s *Server) handleReconnect(w http.ResponseWriter, req *proto.JoinRequest, logId string) {
-	if s.sessions == nil {
-		writeJSON(w, http.StatusServiceUnavailable, proto.ErrorResponse{
-			Code: proto.ErrCodeInternal, Error: "session registry not available"})
-		return
-	}
-
-	sess, err := s.sessions.Lookup(req.ParticipantSid)
-	if err != nil {
-		writeJSON(w, http.StatusNotFound, proto.ErrorResponse{
-			Code: proto.ErrCodeSessionNotFound, Error: "session not found, please do a fresh join"})
-		return
-	}
-
-	if sess.NodeID != s.node.ID {
-		// Forward to the owning node via NATS.
-		payload, _ := json.Marshal(req)
-		s.forwardViaNATS(w, sess.NodeID, "reconnect", payload)
-		return
-	}
-
 	s.handleReconnectLocal(w, req, logId)
 }
 
@@ -631,6 +609,16 @@ func (s *Server) HandleNodeRPC(msg *nats.Msg) {
 	rec := &responseRecorder{}
 
 	switch req.Action {
+	case "join":
+		var joinReq proto.JoinRequest
+		if err := json.Unmarshal(req.Payload, &joinReq); err != nil {
+			rec.status = http.StatusBadRequest
+			rec.body, _ = json.Marshal(proto.ErrorResponse{
+				Code: proto.ErrCodeInvalidRequest, Error: err.Error()})
+		} else {
+			s.handleJoinLocal(rec, &joinReq, "")
+		}
+
 	case "reconnect":
 		var joinReq proto.JoinRequest
 		if err := json.Unmarshal(req.Payload, &joinReq); err != nil {

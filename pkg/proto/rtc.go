@@ -22,6 +22,7 @@ type JoinRequest struct {
 	Reconnect       bool            `json:"reconnect,omitempty"`
 	ReconnectReason ReconnectReason `json:"reconnectReason,omitempty"`
 	ParticipantSid  string          `json:"participantSid,omitempty"`
+	NodeId          string          `json:"nodeId,omitempty"`
 	SyncState       *SyncState      `json:"syncState,omitempty"`
 }
 
@@ -42,7 +43,6 @@ type CreateRoomRequest struct {
 	EmptyTimeout     uint32 `json:"emptyTimeout,omitempty"`
 	DepartureTimeout uint32 `json:"departureTimeout,omitempty"`
 	MaxParticipants  uint32 `json:"maxParticipants,omitempty"`
-	NodeId           string `json:"nodeId,omitempty"`
 	Metadata         string `json:"metadata,omitempty"`
 }
 
@@ -87,6 +87,7 @@ type JoinResponse struct {
 // ============================================================
 
 type ConnectRequest struct {
+	NodeId         string             `json:"nodeId,omitempty"`
 	ParticipantSid string             `json:"participantSid"`
 	Transports     []TransportConnect `json:"transports"`
 }
@@ -345,6 +346,16 @@ type SubscribedQuality struct {
 type SubscribedCodec struct {
 	Codec     string              `json:"codec"`
 	Qualities []SubscribedQuality `json:"qualities"`
+}
+
+// SubscriptionStatusChangedNotification is sent to the publisher when the
+// aggregate subscription status of a track changes. When no subscriber is
+// actively consuming (all paused or none), the publisher should pause the
+// track to save CPU and bandwidth. This complements SubscribedQualityChanged
+// (which is simulcast-specific) and works for all codec types including SVC.
+type SubscriptionStatusChangedNotification struct {
+	TrackSid       string `json:"trackSid"`
+	HasSubscribers bool   `json:"hasSubscribers"`
 }
 
 type ActiveSpeakersNotification struct {

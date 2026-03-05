@@ -144,32 +144,23 @@ func main() {
 
 	linkDB.StartProbing(context.Background())
 
-	// 5. Init Session Registry
-	sessionStore, err := store.NewNatsStore(context.Background(), js, discovery.SessionBucketName, discovery.SessionTTL)
-	if err != nil {
-		slog.Error("Failed to init Session Store", "error", err)
-		os.Exit(1)
-	}
-	sessionRegistry := discovery.NewSessionRegistry(sessionStore, myNode.ID)
-
-	// 6. Init Room Manager
+	// 5. Init Room Manager
 	roomManager := rtc.NewRoomManager(rtc.RoomManagerParams{
 		Config: cfg.Room,
 		FIB:    fib,
 		Finder: finder,
 	})
 
-	// 7. Init Token Verifier
+	// 6. Init Token Verifier
 	verifier := auth.NewTokenVerifier(cfg.Auth.APIKey, cfg.Auth.APISecret)
 
-	// 8. HTTP API + NATS RPC
+	// 7. HTTP API + NATS RPC
 	srv := server.NewServer(server.ServerParams{
 		Config:        cfg,
 		RoomManager:   roomManager,
 		Verifier:      verifier,
 		Node:          myNode,
 		NC:            nc,
-		Sessions:      sessionRegistry,
 		Routers:       mediaMgr.Routers(),
 		WebRtcServers: mediaMgr.WebRtcServers(),
 	})
@@ -202,7 +193,6 @@ func main() {
 	rib.Close()
 	roomManager.Close()
 	mediaMgr.Close()
-	sessionRegistry.Close()
 	registry.Close()
 
 	slog.Info("Bye!")
