@@ -23,7 +23,6 @@ type JoinRequest struct {
 	ReconnectReason ReconnectReason `json:"reconnectReason,omitempty"`
 	ParticipantSid  string          `json:"participantSid,omitempty"`
 	NodeId          string          `json:"nodeId,omitempty"`
-	SyncState       *SyncState      `json:"syncState,omitempty"`
 }
 
 type ConnectionSettings struct {
@@ -72,6 +71,13 @@ type JoinResponse struct {
 	ReceiveTransport    *TransportInfo             `json:"receiveTransport,omitempty"`
 	Signal              *SignalInfo                `json:"signal,omitempty"`
 	RtpCapabilities     *mediasoup.RtpCapabilities `json:"rtpCapabilities,omitempty"`
+	FullReconnect       bool                       `json:"fullReconnect,omitempty"`
+}
+
+// ReconnectResponse is returned when a participant reconnects via ICE restart
+// (server still has the session). Contains new IceParameters per transport.
+type ReconnectResponse struct {
+	IceParameters map[string]*mediasoup.IceParameters `json:"iceParameters"`
 }
 
 // ============================================================
@@ -97,10 +103,12 @@ type ConnectResponse struct{}
 
 type ReadyRequest struct {
 	RtpCapabilities *mediasoup.RtpCapabilities `json:"rtpCapabilities,omitempty"`
+	SyncState       *SyncState                 `json:"syncState,omitempty"`
 }
 
 type ReadyResponse struct {
 	OtherParticipants []*ParticipantInfo `json:"otherParticipants,omitempty"`
+	Room              *Room              `json:"room,omitempty"`
 }
 
 type LeaveRequest struct {

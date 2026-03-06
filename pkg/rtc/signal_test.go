@@ -72,6 +72,7 @@ func TestDispatchRPC_Leave(t *testing.T) {
 	msg := makeRequest(proto.MethodLeave, "log-leave", nil)
 	p.dispatchRPC(msg)
 
+	time.Sleep(200 * time.Millisecond)
 	if p.State() != proto.ParticipantInfo_DISCONNECTED {
 		t.Fatal("expected DISCONNECTED after leave")
 	}

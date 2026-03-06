@@ -65,7 +65,7 @@ func TestRoom_AddRemoveParticipant(t *testing.T) {
 		t.Fatal("expected participant by identity")
 	}
 
-	r.RemoveParticipant("sid-alice")
+	r.RemoveParticipant("sid-alice", proto.DisconnectReason_CLIENT_INITIATED)
 	if r.ParticipantCount() != 0 {
 		t.Fatalf("expected 0 participants after remove")
 	}
@@ -168,7 +168,7 @@ func TestRoom_GetOtherParticipants(t *testing.T) {
 
 func TestRoom_RemoveParticipant_NotFound(t *testing.T) {
 	r := NewRoom("sid-1", "test-room", defaultRoomConfig())
-	r.RemoveParticipant("nonexistent") // should not panic
+	r.RemoveParticipant("nonexistent", proto.DisconnectReason_CLIENT_INITIATED) // should not panic
 }
 
 func TestRoom_ToProto(t *testing.T) {
@@ -198,7 +198,7 @@ func TestRoom_EmptyTimer(t *testing.T) {
 
 	p := newTestParticipant("alice")
 	r.AddParticipant(p)
-	r.RemoveParticipant("sid-alice")
+	r.RemoveParticipant("sid-alice", proto.DisconnectReason_CLIENT_INITIATED)
 	p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
 	time.Sleep(300 * time.Millisecond)

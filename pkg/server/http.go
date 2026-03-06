@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -134,7 +135,16 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		if req.Reconnect {
 			action = "reconnect"
 		}
-		s.forwardViaNATS(w, types.NodeID(req.NodeId), action, payload)
+		if err := s.forwardViaNATS(w, types.NodeID(req.NodeId), action, payload); err != nil {
+			if req.Reconnect && errors.Is(err, nats.ErrNoResponders) {
+				slog.Info("Target node unreachable during reconnect, falling back to full reconnect",
+					"oldNode", req.NodeId, "logId", logId)
+				s.handleFullReconnect(w, &req, logId)
+				return
+			}
+			writeJSON(w, http.StatusBadGateway, proto.ErrorResponse{
+				Code: proto.ErrCodeInternal, Error: "failed to reach target node"})
+		}
 		return
 	}
 
@@ -219,8 +229,8 @@ func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, 
 		Grants:        claims.Grants,
 		Router:        router,
 		AutoSubscribe: autoSubscribe,
-		PingInterval:  time.Duration(s.cfg.PingInterval()) * time.Second,
-		PingTimeout:   time.Duration(s.cfg.PingTimeout()) * time.Second,
+		PingInterval:  s.cfg.Room.PingInterval,
+		PingTimeout:   s.cfg.Room.PingTimeout,
 	})
 
 	sendTransport, recvTransport, directTransport, err := s.createTransports(router, webRtcServer)
@@ -266,6 +276,8 @@ func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, 
 		return
 	}
 
+	fullReconnect := req.ParticipantSid != ""
+
 	resp := proto.JoinResponse{
 		Room:         room.ToProto(),
 		Participant:  participant.ToProto(),
@@ -280,6 +292,7 @@ func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, 
 		ReceiveTransport: s.transportToProto(recvTransport),
 		Signal:           sig.info,
 		RtpCapabilities:  router.RtpCapabilities(),
+		FullReconnect:    fullReconnect,
 	}
 
 	w.Header().Set("X-Node-Id", string(s.node.ID))
@@ -288,7 +301,7 @@ func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, 
 	writeJSON(w, http.StatusOK, resp)
 
 	slog.Info("Participant joined", "identity", identity, "sid", participantSid,
-		"room", req.Room.Name, "logId", logId)
+		"room", req.Room.Name, "fullReconnect", fullReconnect, "logId", logId)
 }
 
 // ============================================================
@@ -446,7 +459,10 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	if req.NodeId != "" && types.NodeID(req.NodeId) != s.node.ID && s.nc != nil {
 		payload, _ := json.Marshal(req)
-		s.forwardViaNATS(w, types.NodeID(req.NodeId), "connect", payload)
+		if err := s.forwardViaNATS(w, types.NodeID(req.NodeId), "connect", payload); err != nil {
+			writeJSON(w, http.StatusBadGateway, proto.ErrorResponse{
+				Code: proto.ErrCodeInternal, Error: "failed to reach target node"})
+		}
 		return
 	}
 
@@ -493,99 +509,46 @@ func (s *Server) handleReconnect(w http.ResponseWriter, req *proto.JoinRequest, 
 
 func (s *Server) handleReconnectLocal(w http.ResponseWriter, req *proto.JoinRequest, logId string) {
 	participant := s.roomManager.GetParticipantBySid(req.ParticipantSid)
-	if participant == nil {
-		writeJSON(w, http.StatusNotFound, proto.ErrorResponse{
-			Code: proto.ErrCodeSessionNotFound, Error: "participant session expired"})
+	if participant != nil {
+		// Fast path: server still has session — ICE restart only.
+		s.handleIceRestart(w, participant, logId)
 		return
 	}
 
-	routerIdx := int(time.Now().UnixNano() % int64(len(s.routers)))
-	if routerIdx < 0 {
-		routerIdx = -routerIdx
-	}
-	router := s.routers[routerIdx]
-	webRtcServer := s.webRtcServers[routerIdx]
+	// Slow path: session lost (e.g. server restarted) — full rejoin.
+	s.handleFullReconnect(w, req, logId)
+}
 
-	sendTransport, recvTransport, directTransport, err := s.createTransports(router, webRtcServer)
+// handleIceRestart performs ICE restart on existing transports without
+// tearing down the participant session.
+func (s *Server) handleIceRestart(w http.ResponseWriter, participant *rtc.Participant, logId string) {
+	iceParams, err := participant.RestartIce()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, proto.ErrorResponse{
-			Code: proto.ErrCodeInternal, Error: "transport creation failed: " + err.Error()})
+			Code: proto.ErrCodeInternal, Error: "ICE restart failed: " + err.Error()})
 		return
-	}
-
-	if req.ConnectionSettings != nil && len(req.ConnectionSettings.DtlsFingerprints) > 0 {
-		dtlsParams := &mediasoup.DtlsParameters{
-			Role:         mediasoup.DtlsRoleClient,
-			Fingerprints: req.ConnectionSettings.DtlsFingerprints,
-		}
-		if err := connectTransports(dtlsParams, sendTransport, recvTransport); err != nil {
-			sendTransport.Close()
-			recvTransport.Close()
-			directTransport.Close()
-			writeJSON(w, http.StatusInternalServerError, proto.ErrorResponse{
-				Code: proto.ErrCodeInternal, Error: "transport connect failed: " + err.Error()})
-			return
-		}
-	}
-
-	sig, err := s.createSignalChannels(sendTransport, recvTransport, directTransport)
-	if err != nil {
-		sendTransport.Close()
-		recvTransport.Close()
-		directTransport.Close()
-		writeJSON(w, http.StatusInternalServerError, proto.ErrorResponse{
-			Code: proto.ErrCodeInternal, Error: "signal channel failed: " + err.Error()})
-		return
-	}
-
-	if err := participant.Reconnect(
-		sendTransport, recvTransport, directTransport,
-		sig.outProducer, sig.outConsumer, sig.inProducer, sig.inConsumer,
-		req.SyncState,
-	); err != nil {
-		sendTransport.Close()
-		recvTransport.Close()
-		directTransport.Close()
-		writeJSON(w, http.StatusInternalServerError, proto.ErrorResponse{
-			Code: proto.ErrCodeInternal, Error: "reconnect failed: " + err.Error()})
-		return
-	}
-
-	room := participant.Room()
-	var roomProto *proto.Room
-	if room != nil {
-		roomProto = room.ToProto()
-	}
-
-	resp := proto.JoinResponse{
-		Room:         roomProto,
-		Participant:  participant.ToProto(),
-		PingTimeout:  s.cfg.PingTimeout(),
-		PingInterval: s.cfg.PingInterval(),
-		ServerInfo: &proto.ServerInfo{
-			NodeId:   string(s.node.ID),
-			Region:   string(s.node.Region),
-			Protocol: 1,
-		},
-		SendTransport:    s.transportToProto(sendTransport),
-		ReceiveTransport: s.transportToProto(recvTransport),
-		Signal:           sig.info,
-		RtpCapabilities:  router.RtpCapabilities(),
 	}
 
 	w.Header().Set("X-Node-Id", string(s.node.ID))
 	w.Header().Set("X-Log-Id", logId)
 
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, proto.ReconnectResponse{IceParameters: iceParams})
 
-	slog.Info("Participant reconnected", "sid", req.ParticipantSid, "logId", logId)
+	slog.Info("Participant ICE restarted", "sid", participant.Sid(), "logId", logId)
+}
+
+// handleFullReconnect executes a full join flow and sets FullReconnect=true
+// so the client knows to clean up old resources and re-publish tracks.
+func (s *Server) handleFullReconnect(w http.ResponseWriter, req *proto.JoinRequest, logId string) {
+	req.Reconnect = false
+	s.handleJoinLocal(w, req, logId)
 }
 
 // ============================================================
 // NATS RPC Forwarding
 // ============================================================
 
-func (s *Server) forwardViaNATS(w http.ResponseWriter, targetNode types.NodeID, action string, payload json.RawMessage) {
+func (s *Server) forwardViaNATS(w http.ResponseWriter, targetNode types.NodeID, action string, payload json.RawMessage) error {
 	rpcReq := proto.NodeRPCRequest{Action: action, Payload: payload}
 	data, _ := json.Marshal(rpcReq)
 
@@ -593,22 +556,21 @@ func (s *Server) forwardViaNATS(w http.ResponseWriter, targetNode types.NodeID, 
 	msg, err := s.nc.Request(subject, data, 5*time.Second)
 	if err != nil {
 		slog.Error("NATS forward failed", "target", targetNode, "action", action, "error", err)
-		writeJSON(w, http.StatusBadGateway, proto.ErrorResponse{
-			Code: proto.ErrCodeInternal, Error: "failed to reach target node"})
-		return
+		return err
 	}
 
 	var rpcResp proto.NodeRPCResponse
 	if err := json.Unmarshal(msg.Data, &rpcResp); err != nil {
 		writeJSON(w, http.StatusBadGateway, proto.ErrorResponse{
 			Code: proto.ErrCodeInternal, Error: "invalid response from target node"})
-		return
+		return nil
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Node-Id", string(targetNode))
 	w.WriteHeader(rpcResp.Status)
 	_, _ = w.Write(rpcResp.Payload)
+	return nil
 }
 
 // HandleNodeRPC processes forwarded requests from other nodes via NATS.

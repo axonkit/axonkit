@@ -239,11 +239,10 @@ type Participant struct {
 	pingTimeout  time.Duration
 	pingInterval time.Duration
 
-	autoSubscribe    bool
-	reconnecting     bool
-	pendingSyncState *proto.SyncState
+	autoSubscribe bool
+	reconnecting  bool
 
-	mu     sync.RWMutex
+	mu sync.RWMutex
 	logger *slog.Logger
 	closed bool
 }
@@ -425,13 +424,27 @@ func (p *Participant) handleIceStateChange(state mediasoup.IceState) {
 	switch state {
 	case mediasoup.IceStateConnected, mediasoup.IceStateCompleted:
 		p.mu.Lock()
-		if p.state == proto.ParticipantInfo_JOINING {
+		wasSuspended := p.state == proto.ParticipantInfo_SUSPENDED
+		if p.state == proto.ParticipantInfo_JOINING || p.state == proto.ParticipantInfo_SUSPENDED {
 			p.state = proto.ParticipantInfo_ACTIVE
 		}
 		p.mu.Unlock()
 
+		if wasSuspended && p.room != nil {
+			p.room.BroadcastNotification(proto.MethodParticipantUpdated,
+				&proto.ParticipantUpdatedNotification{Participant: p.ToProto()}, "")
+		}
+
 	case mediasoup.IceStateDisconnected:
-		// todo: handle ice disconnected
+		p.mu.Lock()
+		p.state = proto.ParticipantInfo_SUSPENDED
+		p.mu.Unlock()
+
+		p.logger.Warn("ICE disconnected, suspending participant")
+		if p.room != nil {
+			p.room.BroadcastNotification(proto.MethodParticipantUpdated,
+				&proto.ParticipantUpdatedNotification{Participant: p.ToProto()}, p.sid)
+		}
 
 	case mediasoup.IceStateClosed:
 		p.logger.Warn("ICE closed, closing participant")
@@ -1029,7 +1042,12 @@ func (p *Participant) Request(method string, body any) (*proto.Message, error) {
 func (p *Participant) sendMessage(msg *proto.Message) error {
 	p.mu.RLock()
 	producer := p.signalOutProducer
+	suspended := p.state == proto.ParticipantInfo_SUSPENDED
 	p.mu.RUnlock()
+
+	if suspended {
+		return nil
+	}
 
 	if producer == nil {
 		return fmt.Errorf("signal channel not established")
@@ -1178,80 +1196,38 @@ func (p *Participant) UpdateMetadata(metadata, name *string, attributes map[stri
 // Reconnect
 // ============================================================
 
-// Reconnect replaces the participant's transports and signal channels without
-// destroying the session (published tracks, subscriptions, room membership).
-// This is used when a client's ICE/DTLS connection breaks and it needs to
-// re-establish connectivity to the same mediasoup worker.
-func (p *Participant) Reconnect(send, recv, direct *mediasoup.Transport,
-	outProducer *mediasoup.DataProducer,
-	outConsumer *mediasoup.DataConsumer,
-	inProducer *mediasoup.DataProducer,
-	inConsumer *mediasoup.DataConsumer,
-	syncState *proto.SyncState,
-) error {
-	p.mu.Lock()
+// RestartIce performs ICE restart on the send and recv transports, returning
+// new IceParameters per transport. This is the fast reconnect path used when
+// the server still holds the participant session.
+func (p *Participant) RestartIce() (map[string]*mediasoup.IceParameters, error) {
+	p.mu.RLock()
 	if p.closed {
-		p.mu.Unlock()
-		return fmt.Errorf("participant is closed")
+		p.mu.RUnlock()
+		return nil, fmt.Errorf("participant is closed")
 	}
-	p.reconnecting = true
-	p.pendingSyncState = syncState
+	send := p.sendTransport
+	recv := p.recvTransport
+	p.mu.RUnlock()
 
-	// Snapshot old resources to close after releasing the lock.
-	oldSend := p.sendTransport
-	oldRecv := p.recvTransport
-	oldDirect := p.directTransport
-	oldSigInConsumer := p.signalInConsumer
-	oldSigOutConsumer := p.signalOutConsumer
-	oldSigInProducer := p.signalInProducer
-	oldSigOutProducer := p.signalOutProducer
+	result := make(map[string]*mediasoup.IceParameters)
 
-	// Abort pending RPCs — callers will get a nil response.
-	for _, ch := range p.pendingRPC {
-		close(ch)
+	if send != nil {
+		params, err := send.RestartIce()
+		if err != nil {
+			return nil, fmt.Errorf("send transport ICE restart: %w", err)
+		}
+		result[send.Id()] = params
 	}
-	p.pendingRPC = make(map[string]chan *proto.Message)
-
-	// Clear dead subscriptions — old consumers die with the old recvTransport.
-	p.subscriptions = make(map[string]*Subscription)
-	p.dataSubscriptions = make(map[string]*DataSubscription)
-
-	p.state = proto.ParticipantInfo_JOINING
-	p.mu.Unlock()
-
-	// Close old resources outside the lock. Order: signal → transports.
-	if oldSigInConsumer != nil {
-		oldSigInConsumer.Close()
-	}
-	if oldSigOutConsumer != nil {
-		oldSigOutConsumer.Close()
-	}
-	if oldSigInProducer != nil {
-		oldSigInProducer.Close()
-	}
-	if oldSigOutProducer != nil {
-		oldSigOutProducer.Close()
-	}
-	if oldSend != nil {
-		oldSend.Close()
-	}
-	if oldRecv != nil {
-		oldRecv.Close()
-	}
-	if oldDirect != nil {
-		oldDirect.Close()
+	if recv != nil {
+		params, err := recv.RestartIce()
+		if err != nil {
+			return nil, fmt.Errorf("recv transport ICE restart: %w", err)
+		}
+		result[recv.Id()] = params
 	}
 
-	// Install new resources.
-	p.mu.Lock()
-	p.reconnecting = false
-	p.mu.Unlock()
-
-	p.SetTransports(send, recv, direct)
-	p.SetSignal(outProducer, outConsumer, inProducer, inConsumer)
-
-	p.logger.Info("Participant reconnected")
-	return nil
+	p.logger.Info("ICE restart completed")
+	return result, nil
 }
 
 // ============================================================
@@ -1275,6 +1251,16 @@ func (p *Participant) Close(reason proto.DisconnectReason) {
 		close(ch)
 	}
 	p.pendingRPC = make(map[string]chan *proto.Message)
+
+	// Snapshot published tracks to clean up outside the lock.
+	trackSids := make([]string, 0, len(p.publishedTracks))
+	for sid := range p.publishedTracks {
+		trackSids = append(trackSids, sid)
+	}
+	dataTrackSids := make([]string, 0, len(p.dataPublishedTracks))
+	for sid := range p.dataPublishedTracks {
+		dataTrackSids = append(dataTrackSids, sid)
+	}
 	p.mu.Unlock()
 
 	close(p.done)
@@ -1283,6 +1269,16 @@ func (p *Participant) Close(reason proto.DisconnectReason) {
 		_ = p.SendNotification(proto.MethodDisconnect, &proto.DisconnectNotification{
 			Reason: reason,
 		})
+	}
+
+	// Clean up RIB/FIB/MediaManager advertised streams before closing transports.
+	if p.room != nil {
+		for _, sid := range trackSids {
+			p.room.OnTrackUnpublished(p, sid)
+		}
+		for _, sid := range dataTrackSids {
+			p.room.OnDataTrackUnpublished(p, sid)
+		}
 	}
 
 	if p.signalInConsumer != nil {
@@ -1308,7 +1304,7 @@ func (p *Participant) Close(reason proto.DisconnectReason) {
 	}
 
 	if p.room != nil {
-		p.room.RemoveParticipant(p.sid)
+		p.room.RemoveParticipant(p.sid, reason)
 	}
 
 	p.logger.Info("Participant closed", "reason", reason)

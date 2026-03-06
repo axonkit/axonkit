@@ -79,6 +79,9 @@ const (
 	ParticipantInfo_ACTIVE       ParticipantInfo_State = 1
 	ParticipantInfo_JOINED       ParticipantInfo_State = 2
 	ParticipantInfo_DISCONNECTED ParticipantInfo_State = 3
+	// ParticipantInfo_SUSPENDED indicates ICE is temporarily disconnected.
+	// Messages to this participant are discarded until ICE reconnects.
+	ParticipantInfo_SUSPENDED ParticipantInfo_State = 4
 )
 
 // TrackInfo represents a published media track.

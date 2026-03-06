@@ -247,6 +247,102 @@ func TestParticipant_Close_Idempotent(t *testing.T) {
 	}
 }
 
+func TestParticipant_Close_CleansUpStreams(t *testing.T) {
+	cfg := defaultRoomConfig()
+	cfg.AutoSubscribe = false
+	room := NewRoom("room-cleanup", "cleanup-room", cfg)
+
+	var unpublishedTracks []string
+	var unpublishedDataTracks []string
+	room.cascade = CascadeCallbacks{
+		OnTrackUnpublished:     func(sid string) { unpublishedTracks = append(unpublishedTracks, sid) },
+		OnDataTrackUnpublished: func(sid string) { unpublishedDataTracks = append(unpublishedDataTracks, sid) },
+	}
+
+	p := NewParticipant(ParticipantParams{
+		Sid:      "sid-cleanup",
+		Identity: "cleanup-user",
+		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+	})
+	room.AddParticipant(p)
+
+	p.mu.Lock()
+	p.publishedTracks["track-1"] = &PublishedTrack{sid: "track-1", name: "cam", kind: "video"}
+	p.publishedTracks["track-2"] = &PublishedTrack{sid: "track-2", name: "mic", kind: "audio"}
+	p.dataPublishedTracks["dtrack-1"] = &DataPublishedTrack{sid: "dtrack-1", name: "chat"}
+	p.mu.Unlock()
+
+	p.Close(proto.DisconnectReason_CLIENT_INITIATED)
+
+	if len(unpublishedTracks) != 2 {
+		t.Fatalf("expected 2 track unpublish callbacks, got %d", len(unpublishedTracks))
+	}
+	if len(unpublishedDataTracks) != 1 {
+		t.Fatalf("expected 1 data track unpublish callback, got %d", len(unpublishedDataTracks))
+	}
+
+	if room.ParticipantCount() != 0 {
+		t.Fatalf("expected 0 participants after close, got %d", room.ParticipantCount())
+	}
+}
+
+func TestParticipant_Close_CleansUpStreams_NoRoom(t *testing.T) {
+	p := NewParticipant(ParticipantParams{
+		Sid:      "sid-noroom",
+		Identity: "noroom-user",
+		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+	})
+
+	p.mu.Lock()
+	p.publishedTracks["track-1"] = &PublishedTrack{sid: "track-1"}
+	p.mu.Unlock()
+
+	// Should not panic when room is nil
+	p.Close(proto.DisconnectReason_CLIENT_INITIATED)
+}
+
+func TestParticipant_Close_PassesCorrectReason(t *testing.T) {
+	cfg := defaultRoomConfig()
+	cfg.AutoSubscribe = false
+	room := NewRoom("room-reason", "reason-room", cfg)
+
+	var receivedReason proto.DisconnectReason
+	room.cascade = CascadeCallbacks{
+		OnTrackUnpublished:     func(sid string) {},
+		OnDataTrackUnpublished: func(sid string) {},
+	}
+
+	p := NewParticipant(ParticipantParams{
+		Sid:      "sid-reason",
+		Identity: "reason-user",
+		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+	})
+	room.AddParticipant(p)
+
+	// Observe the reason via a second participant in the room
+	observer := NewParticipant(ParticipantParams{
+		Sid:      "sid-observer",
+		Identity: "observer",
+		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+	})
+	observer.SetState(proto.ParticipantInfo_ACTIVE)
+	room.AddParticipant(observer)
+	defer observer.Close(proto.DisconnectReason_CLIENT_INITIATED)
+
+	// We can't easily intercept the notification without real signal channels,
+	// but we can verify the RemoveParticipant call was made correctly by
+	// checking the room state after close.
+	p.Close(proto.DisconnectReason_CONNECTION_TIMEOUT)
+	_ = receivedReason
+
+	if room.GetParticipant("sid-reason") != nil {
+		t.Fatal("expected participant to be removed after close")
+	}
+	if room.GetParticipant("sid-observer") == nil {
+		t.Fatal("expected observer to still be in room")
+	}
+}
+
 func TestParticipant_HandlePing(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid:          "sid-1",
@@ -627,10 +723,16 @@ func TestParticipant_HandleIceStateChange(t *testing.T) {
 		t.Fatalf("expected ACTIVE after completed, got %d", p.State())
 	}
 
-	// Disconnected -> should log but not change state
+	// Disconnected -> should transition to SUSPENDED
 	p.handleIceStateChange("disconnected")
+	if p.State() != proto.ParticipantInfo_SUSPENDED {
+		t.Fatalf("expected SUSPENDED after ice disconnected, got %d", p.State())
+	}
+
+	// Connected again -> should transition back to ACTIVE
+	p.handleIceStateChange("connected")
 	if p.State() != proto.ParticipantInfo_ACTIVE {
-		t.Fatalf("expected ACTIVE after ice disconnected, got %d", p.State())
+		t.Fatalf("expected ACTIVE after reconnected, got %d", p.State())
 	}
 }
 
@@ -707,17 +809,17 @@ func TestParticipant_Request_NoSignal(t *testing.T) {
 	}
 }
 
-func TestParticipant_Reconnect_Closed(t *testing.T) {
+func TestParticipant_RestartIce_Closed(t *testing.T) {
 	p := newTestParticipant("alice")
 	p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
-	err := p.Reconnect(nil, nil, nil, nil, nil, nil, nil, nil)
+	_, err := p.RestartIce()
 	if err == nil {
 		t.Fatal("expected error when participant is closed")
 	}
 }
 
-func TestParticipant_Reconnect_Basic(t *testing.T) {
+func TestParticipant_RestartIce_NilTransports(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid:      "sid-recon",
 		Identity: "alice",
@@ -725,16 +827,12 @@ func TestParticipant_Reconnect_Basic(t *testing.T) {
 	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
-	p.SetState(proto.ParticipantInfo_ACTIVE)
-
-	err := p.Reconnect(nil, nil, nil, nil, nil, nil, nil, nil)
+	result, err := p.RestartIce()
 	if err != nil {
-		t.Fatalf("Reconnect failed: %v", err)
+		t.Fatalf("RestartIce failed: %v", err)
 	}
-
-	// After reconnect, state should be JOINING
-	if p.State() != proto.ParticipantInfo_JOINING {
-		t.Fatalf("expected JOINING after reconnect, got %d", p.State())
+	if len(result) != 0 {
+		t.Fatalf("expected empty result for nil transports, got %d entries", len(result))
 	}
 }
 

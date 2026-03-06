@@ -107,7 +107,7 @@ func (r *Room) AddParticipant(p *Participant) error {
 	return nil
 }
 
-func (r *Room) RemoveParticipant(sid string) {
+func (r *Room) RemoveParticipant(sid string, reason proto.DisconnectReason) {
 	r.mu.Lock()
 	p, ok := r.participants[sid]
 	if !ok {
@@ -120,10 +120,9 @@ func (r *Room) RemoveParticipant(sid string) {
 
 	r.logger.Info("Participant removed", "participant", p.identity, "sid", sid, "remaining", count)
 
-	// Notify others
 	r.BroadcastNotification(proto.MethodParticipantLeft, &proto.ParticipantLeftNotification{
 		ParticipantSid: sid,
-		Reason:         proto.DisconnectReason_CLIENT_INITIATED,
+		Reason:         reason,
 	}, sid)
 
 	if count == 0 {

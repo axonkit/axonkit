@@ -431,11 +431,11 @@ func TestIntegration_SetSignalAndMessage(t *testing.T) {
 	}
 }
 
-func TestIntegration_Reconnect(t *testing.T) {
+func TestIntegration_RestartIce(t *testing.T) {
 	_, router := createWorkerAndRouter(t)
-	send1 := createWebRtcTransport(t, router)
-	recv1 := createWebRtcTransport(t, router)
-	direct1 := createDirectTransport(t, router)
+	send := createWebRtcTransport(t, router)
+	recv := createWebRtcTransport(t, router)
+	direct := createDirectTransport(t, router)
 
 	p := NewParticipant(ParticipantParams{
 		Sid:          "recon-int",
@@ -447,23 +447,29 @@ func TestIntegration_Reconnect(t *testing.T) {
 	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
-	p.SetTransports(send1, recv1, direct1)
+	p.SetTransports(send, recv, direct)
 	p.SetState(proto.ParticipantInfo_ACTIVE)
 
-	// Reconnect with new transports
-	send2 := createWebRtcTransport(t, router)
-	recv2 := createWebRtcTransport(t, router)
-	direct2 := createDirectTransport(t, router)
-
-	err := p.Reconnect(send2, recv2, direct2, nil, nil, nil, nil, nil)
+	result, err := p.RestartIce()
 	if err != nil {
-		t.Fatalf("Reconnect: %v", err)
+		t.Fatalf("RestartIce: %v", err)
 	}
 
-	if p.SendTransportSid() != send2.Id() {
-		t.Fatal("expected new send transport")
+	if len(result) != 2 {
+		t.Fatalf("expected 2 ICE parameter sets, got %d", len(result))
 	}
-	if p.RecvTransportSid() != recv2.Id() {
-		t.Fatal("expected new recv transport")
+	if result[send.Id()] == nil {
+		t.Fatal("expected ICE params for send transport")
+	}
+	if result[recv.Id()] == nil {
+		t.Fatal("expected ICE params for recv transport")
+	}
+
+	// Transport SIDs should remain the same after ICE restart
+	if p.SendTransportSid() != send.Id() {
+		t.Fatal("expected same send transport after ICE restart")
+	}
+	if p.RecvTransportSid() != recv.Id() {
+		t.Fatal("expected same recv transport after ICE restart")
 	}
 }

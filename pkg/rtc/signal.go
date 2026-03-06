@@ -110,28 +110,24 @@ func (p *Participant) handleReady(msg *proto.Message) (any, int, string) {
 	p.SetState(proto.ParticipantInfo_JOINED)
 	p.StartHeartbeat()
 
-	p.mu.Lock()
-	syncState := p.pendingSyncState
-	p.pendingSyncState = nil
-	p.mu.Unlock()
-
-	isReconnect := syncState != nil
-
 	others := p.room.GetOtherParticipants(p.sid)
 	otherInfos := make([]*proto.ParticipantInfo, len(others))
 	for i, o := range others {
 		otherInfos[i] = o.ToProto()
 	}
 
-	if isReconnect {
-		go p.processReconnectSync(syncState)
+	if req.SyncState != nil {
+		go p.processReconnectSync(req.SyncState)
 	} else {
 		p.room.BroadcastNotification(proto.MethodParticipantJoined,
 			&proto.ParticipantJoinedNotification{Participant: p.ToProto()}, p.sid)
 		go p.room.SubscribeExistingTracks(p)
 	}
 
-	return &proto.ReadyResponse{OtherParticipants: otherInfos}, proto.StatusOK, ""
+	return &proto.ReadyResponse{
+		OtherParticipants: otherInfos,
+		Room:              p.room.ToProto(),
+	}, proto.StatusOK, ""
 }
 
 // processReconnectSync compares the client's last-known state with the current
