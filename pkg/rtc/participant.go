@@ -1279,9 +1279,11 @@ func (p *Participant) Close(reason proto.DisconnectReason) {
 
 	close(p.done)
 
-	_ = p.SendNotification(proto.MethodDisconnect, &proto.DisconnectNotification{
-		Reason: reason,
-	})
+	if reason != proto.DisconnectReason_CLIENT_INITIATED {
+		_ = p.SendNotification(proto.MethodDisconnect, &proto.DisconnectNotification{
+			Reason: reason,
+		})
+	}
 
 	if p.signalInConsumer != nil {
 		p.signalInConsumer.Close()
