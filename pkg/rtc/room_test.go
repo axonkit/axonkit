@@ -126,7 +126,7 @@ func TestRoom_AddParticipant_DuplicateIdentity(t *testing.T) {
 
 func TestRoom_AddParticipant_Closed(t *testing.T) {
 	r := NewRoom("sid-1", "test-room", defaultRoomConfig())
-	r.Close()
+	r.Close(proto.DisconnectReason_ROOM_CLOSED)
 
 	p := newTestParticipant("alice")
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
@@ -138,8 +138,8 @@ func TestRoom_AddParticipant_Closed(t *testing.T) {
 
 func TestRoom_Close_Idempotent(t *testing.T) {
 	r := NewRoom("sid-1", "test-room", defaultRoomConfig())
-	r.Close()
-	r.Close() // should not panic
+	r.Close(proto.DisconnectReason_ROOM_CLOSED)
+	r.Close(proto.DisconnectReason_ROOM_CLOSED) // should not panic
 }
 
 func TestRoom_GetOtherParticipants(t *testing.T) {
@@ -268,7 +268,7 @@ func TestRoom_Close_KicksParticipants(t *testing.T) {
 	r.AddParticipant(p1)
 	r.AddParticipant(p2)
 
-	r.Close()
+	r.Close(proto.DisconnectReason_ROOM_CLOSED)
 	time.Sleep(50 * time.Millisecond)
 
 	if r.ParticipantCount() != 0 {

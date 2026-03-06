@@ -8,6 +8,7 @@ import (
 	"github.com/axonkit/axonkit/pkg/config"
 	"github.com/axonkit/axonkit/pkg/discovery"
 	"github.com/axonkit/axonkit/pkg/media"
+	"github.com/axonkit/axonkit/pkg/proto"
 	"github.com/axonkit/axonkit/pkg/routing"
 	"github.com/axonkit/axonkit/pkg/types"
 	"github.com/rs/xid"
@@ -186,6 +187,6 @@ func (rm *RoomManager) Close() {
 	rm.mu.Unlock()
 
 	for _, r := range rooms {
-		r.Close()
+		r.Close(proto.DisconnectReason_SERVER_SHUTDOWN)
 	}
 }

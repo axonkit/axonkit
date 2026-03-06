@@ -90,7 +90,7 @@ func TestRoomManager_RoomRemoveOnClose(t *testing.T) {
 	defer rm.Close()
 
 	room := rm.GetOrCreateRoom("test-room", 0, "")
-	room.Close()
+	room.Close(proto.DisconnectReason_ROOM_CLOSED)
 
 	if rm.GetRoom("test-room") != nil {
 		t.Fatal("expected room to be removed after close")

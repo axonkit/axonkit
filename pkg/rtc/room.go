@@ -341,7 +341,7 @@ func (r *Room) startEmptyTimer() {
 	}
 	r.emptyTimer = time.AfterFunc(r.config.DepartureTimeout, func() {
 		r.logger.Info("Room empty timeout reached, closing")
-		r.Close()
+		r.Close(proto.DisconnectReason_ROOM_CLOSED)
 	})
 }
 
@@ -352,7 +352,7 @@ func (r *Room) stopEmptyTimer() {
 	}
 }
 
-func (r *Room) Close() {
+func (r *Room) Close(reason proto.DisconnectReason) {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -368,14 +368,14 @@ func (r *Room) Close() {
 	r.mu.Unlock()
 
 	for _, p := range participants {
-		p.Close(proto.DisconnectReason_ROOM_CLOSED)
+		p.Close(reason)
 	}
 
 	if r.onClose != nil {
 		r.onClose(r)
 	}
 
-	r.logger.Info("Room closed")
+	r.logger.Info("Room closed", "reason", reason)
 }
 
 // TestEnsureStream exposes the cascade EnsureStream callback for integration testing.
