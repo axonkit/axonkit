@@ -118,11 +118,23 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("OPTIONS /rtc/connect", func(w http.ResponseWriter, r *http.Request) {})
 }
 
+func readRequest(r *http.Request, v any) error {
+	contentType := r.Header.Get("Content-Type")
+	if contentType == "application/x-www-form-urlencoded" {
+		payload := r.PostFormValue("payload")
+		if payload == "" {
+			return errors.New("missing payload parameter")
+		}
+		return json.Unmarshal([]byte(payload), v)
+	}
+	return json.NewDecoder(r.Body).Decode(v)
+}
+
 func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	logId, _ := r.Context().Value(logIdKey{}).(string)
 
 	var req proto.JoinRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := readRequest(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, proto.ErrorResponse{
 			Code: proto.ErrCodeInvalidRequest, Error: err.Error()})
 		return
@@ -451,7 +463,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	logId, _ := r.Context().Value(logIdKey{}).(string)
 
 	var req proto.ConnectRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := readRequest(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, proto.ErrorResponse{
 			Code: proto.ErrCodeInvalidRequest, Error: err.Error()})
 		return
