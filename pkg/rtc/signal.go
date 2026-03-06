@@ -29,8 +29,7 @@ func (p *Participant) dispatchRPC(msg *proto.Message) {
 		body, status, errMsg = p.handlePingRPC(msg)
 
 	case proto.MethodLeave:
-		p.handleLeave(msg)
-		return
+		body, status, errMsg = p.handleLeave(msg)
 
 	case proto.MethodTokenRefresh:
 		body, status, errMsg = p.handleTokenRefresh(msg)
@@ -216,9 +215,13 @@ func (p *Participant) handlePingRPC(msg *proto.Message) (any, int, string) {
 	}, proto.StatusOK, ""
 }
 
-func (p *Participant) handleLeave(msg *proto.Message) {
-	p.logger.Info("Client requested leave")
-	p.Close(proto.DisconnectReason_CLIENT_INITIATED)
+func (p *Participant) handleLeave(msg *proto.Message) (any, int, string) {
+	p.logger.Info("Client left")
+	// avoid close in sync
+	time.AfterFunc(time.Millisecond*100, func() {
+		p.Close(proto.DisconnectReason_CLIENT_INITIATED)
+	})
+	return nil, proto.StatusOK, ""
 }
 
 func (p *Participant) handleTokenRefresh(msg *proto.Message) (any, int, string) {
