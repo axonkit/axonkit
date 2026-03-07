@@ -448,7 +448,7 @@ func TestIntegration_RestartIce(t *testing.T) {
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
 	p.SetTransports(send, recv, direct)
-	p.SetState(proto.ParticipantInfo_ACTIVE)
+	p.SetState(proto.ParticipantInfo_CONNECTED)
 
 	result, err := p.RestartIce()
 	if err != nil {

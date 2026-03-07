@@ -24,7 +24,7 @@ func newSignalTestParticipant(t *testing.T) *Participant {
 		PingInterval:  5 * time.Second,
 		PingTimeout:   15 * time.Second,
 	})
-	p.SetState(proto.ParticipantInfo_ACTIVE)
+	p.SetState(proto.ParticipantInfo_CONNECTED)
 	room.AddParticipant(p)
 	return p
 }
@@ -375,7 +375,7 @@ func TestProcessReconnectSync(t *testing.T) {
 		Sid: "sync-p1", Identity: "sync-alice",
 		Grants: &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
 	})
-	p.SetState(proto.ParticipantInfo_ACTIVE)
+	p.SetState(proto.ParticipantInfo_CONNECTED)
 	room.AddParticipant(p)
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 

@@ -75,13 +75,17 @@ type ParticipantInfo struct {
 type ParticipantInfo_State int32
 
 const (
-	ParticipantInfo_JOINING      ParticipantInfo_State = 0
-	ParticipantInfo_ACTIVE       ParticipantInfo_State = 1
-	ParticipantInfo_JOINED       ParticipantInfo_State = 2
-	ParticipantInfo_DISCONNECTED ParticipantInfo_State = 3
+	// ParticipantInfo_JOINING indicates the participant has connected but not yet sent 'ready'.
+	ParticipantInfo_JOINING ParticipantInfo_State = 0
+	// ParticipantInfo_CONNECTED indicates transport ice has connected, but hasn't received client's ready request yet.
+	ParticipantInfo_CONNECTED ParticipantInfo_State = 1
+	// ParticipantInfo_JOINED indicates the participant has sent 'ready' and is fully joined.
+	ParticipantInfo_JOINED ParticipantInfo_State = 2
 	// ParticipantInfo_SUSPENDED indicates ICE is temporarily disconnected.
 	// Messages to this participant are discarded until ICE reconnects.
-	ParticipantInfo_SUSPENDED ParticipantInfo_State = 4
+	ParticipantInfo_SUSPENDED ParticipantInfo_State = 3
+	// ParticipantInfo_DISCONNECTED indicates the participant has left the room or been kicked.
+	ParticipantInfo_DISCONNECTED ParticipantInfo_State = 4
 )
 
 // TrackInfo represents a published media track.

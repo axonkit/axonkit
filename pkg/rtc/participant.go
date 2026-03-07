@@ -242,7 +242,7 @@ type Participant struct {
 	autoSubscribe bool
 	reconnecting  bool
 
-	mu sync.RWMutex
+	mu     sync.RWMutex
 	logger *slog.Logger
 	closed bool
 }
@@ -306,7 +306,7 @@ func (p *Participant) IsPublisher() bool {
 func (p *Participant) IsReady() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.state == proto.ParticipantInfo_JOINED || p.state == proto.ParticipantInfo_ACTIVE
+	return p.state == proto.ParticipantInfo_JOINED || p.state == proto.ParticipantInfo_CONNECTED
 }
 
 func (p *Participant) CanSubscribe() bool {
@@ -426,7 +426,7 @@ func (p *Participant) handleIceStateChange(state mediasoup.IceState) {
 		p.mu.Lock()
 		wasSuspended := p.state == proto.ParticipantInfo_SUSPENDED
 		if p.state == proto.ParticipantInfo_JOINING || p.state == proto.ParticipantInfo_SUSPENDED {
-			p.state = proto.ParticipantInfo_ACTIVE
+			p.state = proto.ParticipantInfo_CONNECTED
 		}
 		p.mu.Unlock()
 

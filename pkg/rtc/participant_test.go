@@ -61,9 +61,9 @@ func TestParticipant_IsReady(t *testing.T) {
 	if p.IsReady() {
 		t.Fatal("JOINING should not be ready")
 	}
-	p.SetState(proto.ParticipantInfo_ACTIVE)
+	p.SetState(proto.ParticipantInfo_CONNECTED)
 	if !p.IsReady() {
-		t.Fatal("ACTIVE should be ready")
+		t.Fatal("CONNECTED should be ready")
 	}
 	p.SetState(proto.ParticipantInfo_JOINED)
 	if !p.IsReady() {
@@ -325,7 +325,7 @@ func TestParticipant_Close_PassesCorrectReason(t *testing.T) {
 		Identity: "observer",
 		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
 	})
-	observer.SetState(proto.ParticipantInfo_ACTIVE)
+	observer.SetState(proto.ParticipantInfo_CONNECTED)
 	room.AddParticipant(observer)
 	defer observer.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
@@ -711,16 +711,16 @@ func TestParticipant_HandleIceStateChange(t *testing.T) {
 	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
-	// Connected -> should transition to ACTIVE
+	// Connected -> should transition to CONNECTED
 	p.handleIceStateChange("connected")
-	if p.State() != proto.ParticipantInfo_ACTIVE {
-		t.Fatalf("expected ACTIVE after connected, got %d", p.State())
+	if p.State() != proto.ParticipantInfo_CONNECTED {
+		t.Fatalf("expected CONNECTED after connected, got %d", p.State())
 	}
 
-	// Completed (while ACTIVE, should stay ACTIVE)
+	// Completed (while CONNECTED, should stay CONNECTED)
 	p.handleIceStateChange("completed")
-	if p.State() != proto.ParticipantInfo_ACTIVE {
-		t.Fatalf("expected ACTIVE after completed, got %d", p.State())
+	if p.State() != proto.ParticipantInfo_CONNECTED {
+		t.Fatalf("expected CONNECTED after completed, got %d", p.State())
 	}
 
 	// Disconnected -> should transition to SUSPENDED
@@ -729,10 +729,10 @@ func TestParticipant_HandleIceStateChange(t *testing.T) {
 		t.Fatalf("expected SUSPENDED after ice disconnected, got %d", p.State())
 	}
 
-	// Connected again -> should transition back to ACTIVE
+	// Connected again -> should transition back to CONNECTED
 	p.handleIceStateChange("connected")
-	if p.State() != proto.ParticipantInfo_ACTIVE {
-		t.Fatalf("expected ACTIVE after reconnected, got %d", p.State())
+	if p.State() != proto.ParticipantInfo_CONNECTED {
+		t.Fatalf("expected CONNECTED after reconnected, got %d", p.State())
 	}
 }
 
