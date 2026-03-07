@@ -32,9 +32,10 @@ type RoomConfig struct {
 	// Dynacast: only forward layers that have active subscribers.
 	// When enabled, the server tracks which layers each subscriber needs
 	// and pauses/resumes producer layers accordingly.
-	Dynacast     bool          `json:"dynacast"`
-	PingInterval time.Duration `json:"pingInterval"`
-	PingTimeout  time.Duration `json:"pingTimeout"`
+	Dynacast      bool          `json:"dynacast"`
+	PingInterval  time.Duration `json:"pingInterval"`
+	PingTimeout   time.Duration `json:"pingTimeout"`
+	StatsInterval time.Duration `json:"statsInterval"`
 }
 
 type MediaConfig struct {
@@ -76,6 +77,7 @@ func DefaultConfig() *Config {
 			Dynacast:         true,
 			PingInterval:     5 * time.Second,
 			PingTimeout:      15 * time.Second,
+			StatsInterval:    10 * time.Second,
 		},
 		Media: MediaConfig{
 			WorkerBin: "./mediasoup-worker",
@@ -108,6 +110,14 @@ func (c *Config) PingTimeout() int32 {
 		return int32(c.Room.PingTimeout / time.Second)
 	}
 	return 15
+}
+
+// StatsInterval returns the stats reporting interval in seconds.
+func (c *Config) StatsInterval() int32 {
+	if c.Room.StatsInterval > 0 {
+		return int32(c.Room.StatsInterval / time.Second)
+	}
+	return 10
 }
 
 // Get preferred outbound ip of this machine

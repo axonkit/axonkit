@@ -66,6 +66,7 @@ type JoinResponse struct {
 	ClientConfiguration *ClientConfiguration       `json:"clientConfiguration,omitempty"`
 	PingTimeout         int32                      `json:"pingTimeout,omitempty"`
 	PingInterval        int32                      `json:"pingInterval,omitempty"`
+	StatsInterval       int32                      `json:"statsInterval,omitempty"`
 	ServerInfo          *ServerInfo                `json:"serverInfo,omitempty"`
 	SendTransport       *TransportInfo             `json:"sendTransport,omitempty"`
 	ReceiveTransport    *TransportInfo             `json:"receiveTransport,omitempty"`

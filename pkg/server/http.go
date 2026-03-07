@@ -243,6 +243,7 @@ func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, 
 		AutoSubscribe: autoSubscribe,
 		PingInterval:  s.cfg.Room.PingInterval,
 		PingTimeout:   s.cfg.Room.PingTimeout,
+		StatsInterval: s.cfg.Room.StatsInterval,
 	})
 
 	sendTransport, recvTransport, directTransport, err := s.createTransports(router, webRtcServer)
@@ -291,10 +292,11 @@ func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, 
 	fullReconnect := req.ParticipantSid != ""
 
 	resp := proto.JoinResponse{
-		Room:         room.ToProto(),
-		Participant:  participant.ToProto(),
-		PingTimeout:  s.cfg.PingTimeout(),
-		PingInterval: s.cfg.PingInterval(),
+		Room:          room.ToProto(),
+		Participant:   participant.ToProto(),
+		PingTimeout:   s.cfg.PingTimeout(),
+		PingInterval:  s.cfg.PingInterval(),
+		StatsInterval: s.cfg.StatsInterval(),
 		ServerInfo: &proto.ServerInfo{
 			NodeId:   string(s.node.ID),
 			Region:   string(s.node.Region),

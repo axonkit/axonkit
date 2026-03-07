@@ -100,6 +100,7 @@ func (r *Room) AddParticipant(p *Participant) error {
 	r.participants[p.sid] = p
 	r.stopEmptyTimer()
 	p.room = r
+	p.setupStatsLogger(r.name, r.sid)
 
 	r.logger.Info("Participant added", "participant", p.identity, "sid", p.sid,
 		"count", len(r.participants))

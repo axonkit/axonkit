@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -239,6 +241,11 @@ type Participant struct {
 	pingTimeout  time.Duration
 	pingInterval time.Duration
 
+	// Stats
+	statsInterval time.Duration
+	statsLogger   *slog.Logger
+	statsFile     *os.File
+
 	autoSubscribe bool
 	reconnecting  bool
 
@@ -259,6 +266,7 @@ type ParticipantParams struct {
 	AutoSubscribe bool
 	PingInterval  time.Duration
 	PingTimeout   time.Duration
+	StatsInterval time.Duration
 }
 
 const msgQueueSize = 256
@@ -284,6 +292,7 @@ func NewParticipant(params ParticipantParams) *Participant {
 		autoSubscribe:       params.AutoSubscribe,
 		pingInterval:        params.PingInterval,
 		pingTimeout:         params.PingTimeout,
+		statsInterval:       params.StatsInterval,
 		logger: slog.Default().With("component", "Participant",
 			"identity", params.Identity, "sid", params.Sid),
 	}
@@ -1137,6 +1146,47 @@ func (p *Participant) resetPingTimer() {
 }
 
 // ============================================================
+// Stats Logger
+// ============================================================
+
+func (p *Participant) setupStatsLogger(roomName, roomSid string) {
+	dir := filepath.Join("logs", "stats")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		p.logger.Warn("Failed to create stats log directory", "error", err)
+		return
+	}
+
+	filename := filepath.Join(dir, fmt.Sprintf("%s_%s.log", roomSid, p.sid))
+	f, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		p.logger.Warn("Failed to open stats log file", "error", err)
+		return
+	}
+
+	p.mu.Lock()
+	p.statsFile = f
+	p.statsLogger = slog.New(slog.NewJSONHandler(f, nil)).With(
+		"room", roomName,
+		"roomSid", roomSid,
+		"participant", p.identity,
+		"participantSid", p.sid,
+	)
+	p.mu.Unlock()
+}
+
+func (p *Participant) closeStatsLogger() {
+	p.mu.Lock()
+	f := p.statsFile
+	p.statsFile = nil
+	p.statsLogger = nil
+	p.mu.Unlock()
+
+	if f != nil {
+		f.Close()
+	}
+}
+
+// ============================================================
 // Participant Info
 // ============================================================
 
@@ -1307,6 +1357,7 @@ func (p *Participant) Close(reason proto.DisconnectReason) {
 		p.room.RemoveParticipant(p.sid, reason)
 	}
 
+	p.closeStatsLogger()
 	p.logger.Info("Participant closed", "reason", reason)
 }
 

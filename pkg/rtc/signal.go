@@ -17,7 +17,7 @@ func (p *Participant) dispatchRPC(msg *proto.Message) {
 		errMsg string
 	)
 
-	if msg.Method != proto.MethodPing {
+	if msg.Method != proto.MethodPing && msg.Method != proto.MethodStatsReport {
 		p.logger.Info("dispatchRPC", "method", msg.Method, "log_id", msg.LogId, "data", string(msg.Data))
 	}
 
@@ -27,6 +27,9 @@ func (p *Participant) dispatchRPC(msg *proto.Message) {
 
 	case proto.MethodPing:
 		body, status, errMsg = p.handlePingRPC(msg)
+
+	case proto.MethodStatsReport:
+		p.handleStatsReport(msg)
 
 	case proto.MethodLeave:
 		body, status, errMsg = p.handleLeave(msg)
@@ -209,6 +212,19 @@ func (p *Participant) handlePingRPC(msg *proto.Message) (any, int, string) {
 		LastTimestamp: req.Timestamp,
 		ServerTime:    time.Now().UnixMilli(),
 	}, proto.StatusOK, ""
+}
+
+func (p *Participant) handleStatsReport(msg *proto.Message) {
+	// Reset heartbeat timer -- stats reports act as keepalive
+	p.mu.Lock()
+	p.lastPing = time.Now()
+	p.mu.Unlock()
+	p.resetPingTimer()
+
+	// Write stats to the dedicated file logger
+	if p.statsLogger != nil {
+		p.statsLogger.Info("stats", "data", string(msg.Data))
+	}
 }
 
 func (p *Participant) handleLeave(msg *proto.Message) (any, int, string) {

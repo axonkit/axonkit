@@ -49,6 +49,9 @@ const (
 	// Client -> Server: Participant
 	MethodParticipantUpdate = "participant.update"
 
+	// Client -> Server: Stats (notification, no response)
+	MethodStatsReport = "stats.report"
+
 	// Server -> Client: Subscription lifecycle (RPC, requires response)
 	MethodSubscriptionCreate     = "subscription.create"
 	MethodDataSubscriptionCreate = "dataSubscription.create"
