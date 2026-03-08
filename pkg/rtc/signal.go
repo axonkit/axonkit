@@ -19,8 +19,7 @@ func (p *Participant) dispatchRPC(msg *proto.Message) {
 
 	switch msg.Method {
 	case proto.MethodPing, proto.MethodStatsReport,
-		proto.MethodChatMessage, proto.MethodDataStreamOpen, proto.MethodDataStreamChunk,
-		proto.MethodRpcRequest, proto.MethodRpcResponse:
+		proto.MethodChatMessage, proto.MethodRpcRequest, proto.MethodRpcResponse:
 	default:
 		p.logger.Info("dispatchRPC", "method", msg.Method, "log_id", msg.LogId, "data", string(msg.Data))
 	}
@@ -94,12 +93,6 @@ func (p *Participant) dispatchRPC(msg *proto.Message) {
 
 	case proto.MethodChatMessage:
 		p.handleChatMessageRelay(msg)
-
-	case proto.MethodDataStreamOpen:
-		p.handleDataStreamRelay(msg)
-
-	case proto.MethodDataStreamChunk:
-		p.handleDataStreamRelay(msg)
 
 	case proto.MethodRpcRequest:
 		p.handleRpcRequest(msg)
@@ -551,40 +544,6 @@ func (p *Participant) handleChatMessageRelay(msg *proto.Message) {
 	chatMsg.ParticipantIdentity = p.identity
 
 	p.room.BroadcastNotification(proto.MethodChatMessage, &chatMsg, p.sid)
-}
-
-// ============================================================
-// Data Stream Relay
-// ============================================================
-
-func (p *Participant) handleDataStreamRelay(msg *proto.Message) {
-	if p.room == nil {
-		return
-	}
-
-	var body map[string]any
-	if err := json.Unmarshal(msg.Data, &body); err != nil {
-		p.logger.Warn("Invalid data stream message", "error", err)
-		return
-	}
-
-	body["senderIdentity"] = p.identity
-
-	destinationIdentities, _ := body["destinationIdentities"].([]any)
-	if len(destinationIdentities) > 0 {
-		for _, di := range destinationIdentities {
-			identity, ok := di.(string)
-			if !ok {
-				continue
-			}
-			target := p.room.GetParticipantByIdentity(identity)
-			if target != nil && target.sid != p.sid {
-				_ = target.SendNotification(msg.Method, body)
-			}
-		}
-	} else {
-		p.room.BroadcastNotification(msg.Method, body, p.sid)
-	}
 }
 
 // ============================================================

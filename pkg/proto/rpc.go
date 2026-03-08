@@ -56,12 +56,10 @@ const (
 	MethodSubscriptionSubscribe   = "subscription.subscribe"
 	MethodSubscriptionUnsubscribe = "subscription.unsubscribe"
 
-	// Client -> Server: Chat, Data Stream, P2P RPC (notifications, server relays)
-	MethodChatMessage    = "chat.message"
-	MethodDataStreamOpen  = "dataStream.open"
-	MethodDataStreamChunk = "dataStream.chunk"
-	MethodRpcRequest     = "rpc.request"
-	MethodRpcResponse    = "rpc.response"
+	// Client -> Server: Chat, P2P RPC (notifications, server relays)
+	MethodChatMessage = "chat.message"
+	MethodRpcRequest  = "rpc.request"
+	MethodRpcResponse = "rpc.response"
 
 	// Server -> Client: P2P RPC relay
 	MethodRpcInvoke = "rpc.invoke"
