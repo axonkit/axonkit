@@ -246,8 +246,10 @@ type Participant struct {
 	statsLogger   *slog.Logger
 	statsFile     *os.File
 
-	autoSubscribe bool
-	reconnecting  bool
+	autoSubscribe                    bool
+	reconnecting                     bool
+	allParticipantsAllowedToSubscribe bool
+	trackPermissions                  []proto.TrackPermission
 
 	mu     sync.RWMutex
 	logger *slog.Logger
@@ -289,7 +291,8 @@ func NewParticipant(params ParticipantParams) *Participant {
 		pendingRPC:          make(map[string]chan *proto.Message),
 		msgCh:               make(chan *proto.Message, msgQueueSize),
 		done:                make(chan struct{}),
-		autoSubscribe:       params.AutoSubscribe,
+		autoSubscribe:                     params.AutoSubscribe,
+		allParticipantsAllowedToSubscribe: true,
 		pingInterval:        params.PingInterval,
 		pingTimeout:         params.PingTimeout,
 		statsInterval:       params.StatsInterval,

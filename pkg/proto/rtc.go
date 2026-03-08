@@ -283,6 +283,22 @@ type UpdateParticipantRequest struct {
 }
 
 // ============================================================
+// Datachannel RPC: Subscription Permissions
+// ============================================================
+
+type TrackPermission struct {
+	ParticipantIdentity string   `json:"participantIdentity,omitempty"`
+	ParticipantSid      string   `json:"participantSid,omitempty"`
+	AllTracks           bool     `json:"allowAll,omitempty"`
+	TrackSids           []string `json:"allowedTrackSids,omitempty"`
+}
+
+type UpdateSubscriptionPermissionsRequest struct {
+	AllParticipantsAllowed bool              `json:"allParticipantsAllowed"`
+	TrackPermissions       []TrackPermission `json:"trackPermissions"`
+}
+
+// ============================================================
 // Datachannel RPC: Token Refresh
 // ============================================================
 

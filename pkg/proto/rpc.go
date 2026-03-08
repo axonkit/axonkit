@@ -53,8 +53,9 @@ const (
 	MethodStatsReport = "stats.report"
 
 	// Client -> Server: Manual subscription control
-	MethodSubscriptionSubscribe   = "subscription.subscribe"
-	MethodSubscriptionUnsubscribe = "subscription.unsubscribe"
+	MethodSubscriptionSubscribe          = "subscription.subscribe"
+	MethodSubscriptionUnsubscribe        = "subscription.unsubscribe"
+	MethodSubscriptionUpdatePermissions  = "subscription.updatePermissions"
 
 	// Client -> Server: Chat, P2P RPC (notifications, server relays)
 	MethodChatMessage = "chat.message"

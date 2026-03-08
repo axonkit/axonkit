@@ -91,6 +91,9 @@ func (p *Participant) dispatchRPC(msg *proto.Message) {
 	case proto.MethodSubscriptionUnsubscribe:
 		body, status, errMsg = p.handleSubscriptionUnsubscribe(msg)
 
+	case proto.MethodSubscriptionUpdatePermissions:
+		body, status, errMsg = p.handleSubscriptionUpdatePermissions(msg)
+
 	case proto.MethodChatMessage:
 		p.handleChatMessageRelay(msg)
 
@@ -521,6 +524,24 @@ func (p *Participant) handleSubscriptionUnsubscribe(msg *proto.Message) (any, in
 	_ = p.SendNotification(proto.MethodSubscriptionClosed, &proto.SubscriptionClosedNotification{
 		SubscriptionSid: targetSubSid,
 	})
+
+	return nil, proto.StatusOK, ""
+}
+
+func (p *Participant) handleSubscriptionUpdatePermissions(msg *proto.Message) (any, int, string) {
+	var req proto.UpdateSubscriptionPermissionsRequest
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
+	}
+
+	p.mu.Lock()
+	p.allParticipantsAllowedToSubscribe = req.AllParticipantsAllowed
+	p.trackPermissions = req.TrackPermissions
+	p.mu.Unlock()
+
+	p.logger.Info("Updated subscription permissions",
+		"allAllowed", req.AllParticipantsAllowed,
+		"permissionCount", len(req.TrackPermissions))
 
 	return nil, proto.StatusOK, ""
 }
