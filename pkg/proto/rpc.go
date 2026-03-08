@@ -52,6 +52,20 @@ const (
 	// Client -> Server: Stats (notification, no response)
 	MethodStatsReport = "stats.report"
 
+	// Client -> Server: Manual subscription control
+	MethodSubscriptionSubscribe   = "subscription.subscribe"
+	MethodSubscriptionUnsubscribe = "subscription.unsubscribe"
+
+	// Client -> Server: Chat, Data Stream, P2P RPC (notifications, server relays)
+	MethodChatMessage    = "chat.message"
+	MethodDataStreamOpen  = "dataStream.open"
+	MethodDataStreamChunk = "dataStream.chunk"
+	MethodRpcRequest     = "rpc.request"
+	MethodRpcResponse    = "rpc.response"
+
+	// Server -> Client: P2P RPC relay
+	MethodRpcInvoke = "rpc.invoke"
+
 	// Server -> Client: Subscription lifecycle (RPC, requires response)
 	MethodSubscriptionCreate     = "subscription.create"
 	MethodDataSubscriptionCreate = "dataSubscription.create"

@@ -17,7 +17,11 @@ func (p *Participant) dispatchRPC(msg *proto.Message) {
 		errMsg string
 	)
 
-	if msg.Method != proto.MethodPing && msg.Method != proto.MethodStatsReport {
+	switch msg.Method {
+	case proto.MethodPing, proto.MethodStatsReport,
+		proto.MethodChatMessage, proto.MethodDataStreamOpen, proto.MethodDataStreamChunk,
+		proto.MethodRpcRequest, proto.MethodRpcResponse:
+	default:
 		p.logger.Info("dispatchRPC", "method", msg.Method, "log_id", msg.LogId, "data", string(msg.Data))
 	}
 
@@ -81,6 +85,27 @@ func (p *Participant) dispatchRPC(msg *proto.Message) {
 
 	case proto.MethodParticipantUpdate:
 		body, status, errMsg = p.handleParticipantUpdate(msg)
+
+	case proto.MethodSubscriptionSubscribe:
+		body, status, errMsg = p.handleSubscriptionSubscribe(msg)
+
+	case proto.MethodSubscriptionUnsubscribe:
+		body, status, errMsg = p.handleSubscriptionUnsubscribe(msg)
+
+	case proto.MethodChatMessage:
+		p.handleChatMessageRelay(msg)
+
+	case proto.MethodDataStreamOpen:
+		p.handleDataStreamRelay(msg)
+
+	case proto.MethodDataStreamChunk:
+		p.handleDataStreamRelay(msg)
+
+	case proto.MethodRpcRequest:
+		p.handleRpcRequest(msg)
+
+	case proto.MethodRpcResponse:
+		p.handleRpcResponse(msg)
 
 	default:
 		status = proto.StatusNotFound
@@ -428,4 +453,189 @@ func (p *Participant) handleParticipantUpdate(msg *proto.Message) (any, int, str
 
 	p.UpdateMetadata(req.Metadata, req.Name, req.Attributes)
 	return nil, proto.StatusOK, ""
+}
+
+// ============================================================
+// Manual Subscription
+// ============================================================
+
+func (p *Participant) handleSubscriptionSubscribe(msg *proto.Message) (any, int, string) {
+	var req proto.SubscribeRequest
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
+	}
+
+	if !p.CanSubscribe() {
+		return nil, proto.StatusForbidden, "no subscribe permission"
+	}
+
+	if p.room == nil {
+		return nil, proto.StatusInternalError, "not in a room"
+	}
+
+	track, publisher := p.room.FindPublishedTrackAndPublisher(req.TrackSid)
+	if track == nil || publisher == nil {
+		return nil, proto.StatusNotFound, fmt.Sprintf("track not found: %s", req.TrackSid)
+	}
+
+	if publisher.sid == p.sid {
+		return nil, proto.StatusBadRequest, "cannot subscribe to own track"
+	}
+
+	// Check if already subscribed to this track.
+	p.mu.RLock()
+	for _, sub := range p.subscriptions {
+		if sub.trackSid == req.TrackSid {
+			p.mu.RUnlock()
+			return nil, proto.StatusOK, ""
+		}
+	}
+	p.mu.RUnlock()
+
+	go func() {
+		if err := p.Subscribe(track, publisher); err != nil {
+			p.logger.Warn("Manual subscribe failed", "trackSid", req.TrackSid, "error", err)
+		}
+	}()
+
+	return nil, proto.StatusOK, ""
+}
+
+func (p *Participant) handleSubscriptionUnsubscribe(msg *proto.Message) (any, int, string) {
+	var req proto.UnsubscribeRequest
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
+	}
+
+	p.mu.RLock()
+	var targetSubSid string
+	for sid, sub := range p.subscriptions {
+		if sub.trackSid == req.TrackSid {
+			targetSubSid = sid
+			break
+		}
+	}
+	p.mu.RUnlock()
+
+	if targetSubSid == "" {
+		return nil, proto.StatusNotFound, fmt.Sprintf("no subscription for track: %s", req.TrackSid)
+	}
+
+	if err := p.CloseSubscription(targetSubSid); err != nil {
+		return nil, proto.StatusInternalError, err.Error()
+	}
+
+	_ = p.SendNotification(proto.MethodSubscriptionClosed, &proto.SubscriptionClosedNotification{
+		SubscriptionSid: targetSubSid,
+	})
+
+	return nil, proto.StatusOK, ""
+}
+
+// ============================================================
+// Chat Message Relay
+// ============================================================
+
+func (p *Participant) handleChatMessageRelay(msg *proto.Message) {
+	if p.room == nil {
+		return
+	}
+
+	var chatMsg proto.ChatMessageNotification
+	if err := json.Unmarshal(msg.Data, &chatMsg); err != nil {
+		p.logger.Warn("Invalid chat message", "error", err)
+		return
+	}
+
+	chatMsg.ParticipantSid = p.sid
+	chatMsg.ParticipantIdentity = p.identity
+
+	p.room.BroadcastNotification(proto.MethodChatMessage, &chatMsg, p.sid)
+}
+
+// ============================================================
+// Data Stream Relay
+// ============================================================
+
+func (p *Participant) handleDataStreamRelay(msg *proto.Message) {
+	if p.room == nil {
+		return
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(msg.Data, &body); err != nil {
+		p.logger.Warn("Invalid data stream message", "error", err)
+		return
+	}
+
+	body["senderIdentity"] = p.identity
+
+	destinationIdentities, _ := body["destinationIdentities"].([]any)
+	if len(destinationIdentities) > 0 {
+		for _, di := range destinationIdentities {
+			identity, ok := di.(string)
+			if !ok {
+				continue
+			}
+			target := p.room.GetParticipantByIdentity(identity)
+			if target != nil && target.sid != p.sid {
+				_ = target.SendNotification(msg.Method, body)
+			}
+		}
+	} else {
+		p.room.BroadcastNotification(msg.Method, body, p.sid)
+	}
+}
+
+// ============================================================
+// P2P RPC Relay
+// ============================================================
+
+func (p *Participant) handleRpcRequest(msg *proto.Message) {
+	if p.room == nil {
+		return
+	}
+
+	var req proto.RpcRequestNotification
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		p.logger.Warn("Invalid RPC request", "error", err)
+		return
+	}
+
+	req.CallerIdentity = p.identity
+
+	target := p.room.GetParticipantByIdentity(req.DestinationIdentity)
+	if target == nil {
+		_ = p.SendNotification(proto.MethodRpcResponse, &proto.RpcResponseNotification{
+			RequestID:      req.RequestID,
+			CallerIdentity: p.identity,
+			Error: &proto.RpcError{
+				Code:    1500,
+				Message: "recipient not found",
+			},
+		})
+		return
+	}
+
+	_ = target.SendNotification(proto.MethodRpcInvoke, &req)
+}
+
+func (p *Participant) handleRpcResponse(msg *proto.Message) {
+	if p.room == nil {
+		return
+	}
+
+	var resp proto.RpcResponseNotification
+	if err := json.Unmarshal(msg.Data, &resp); err != nil {
+		p.logger.Warn("Invalid RPC response", "error", err)
+		return
+	}
+
+	target := p.room.GetParticipantByIdentity(resp.CallerIdentity)
+	if target == nil {
+		p.logger.Warn("RPC response target not found", "callerIdentity", resp.CallerIdentity)
+		return
+	}
+
+	_ = target.SendNotification(proto.MethodRpcResponse, &resp)
 }

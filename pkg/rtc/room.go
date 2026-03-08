@@ -154,6 +154,21 @@ func (r *Room) FindPublishedTrack(trackSid string) *PublishedTrack {
 	return nil
 }
 
+// FindPublishedTrackAndPublisher looks up a published track and its publisher.
+func (r *Room) FindPublishedTrackAndPublisher(trackSid string) (*PublishedTrack, *Participant) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, p := range r.participants {
+		p.mu.RLock()
+		t := p.publishedTracks[trackSid]
+		p.mu.RUnlock()
+		if t != nil {
+			return t, p
+		}
+	}
+	return nil, nil
+}
+
 func (r *Room) GetParticipantByIdentity(identity string) *Participant {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

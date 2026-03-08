@@ -380,6 +380,53 @@ type DisconnectNotification struct {
 }
 
 // ============================================================
+// Client -> Server: Manual Subscription
+// ============================================================
+
+type SubscribeRequest struct {
+	TrackSid string `json:"trackSid"`
+}
+
+type UnsubscribeRequest struct {
+	TrackSid string `json:"trackSid"`
+}
+
+// ============================================================
+// Client -> Server: Chat, Data Stream, P2P RPC (relay payloads)
+// ============================================================
+
+type ChatMessageNotification struct {
+	ID                  string `json:"id"`
+	Message             string `json:"message"`
+	Timestamp           int64  `json:"timestamp"`
+	EditTimestamp        *int64 `json:"editTimestamp,omitempty"`
+	ParticipantSid      string `json:"participantSid,omitempty"`
+	ParticipantIdentity string `json:"participantIdentity,omitempty"`
+}
+
+type RpcRequestNotification struct {
+	RequestID           string `json:"requestId"`
+	DestinationIdentity string `json:"destinationIdentity"`
+	Method              string `json:"method"`
+	Payload             string `json:"payload"`
+	ResponseTimeout     int    `json:"responseTimeout,omitempty"`
+	CallerIdentity      string `json:"callerIdentity"`
+}
+
+type RpcResponseNotification struct {
+	RequestID      string    `json:"requestId"`
+	CallerIdentity string    `json:"callerIdentity"`
+	Payload        string    `json:"payload,omitempty"`
+	Error          *RpcError `json:"error,omitempty"`
+}
+
+type RpcError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    string `json:"data,omitempty"`
+}
+
+// ============================================================
 // Inter-node RPC (via NATS)
 // ============================================================
 
