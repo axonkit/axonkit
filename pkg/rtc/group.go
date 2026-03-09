@@ -4,7 +4,7 @@ import (
 	"sync"
 
 	"github.com/axonkit/axonkit/pkg/proto"
-	"github.com/lithammer/shortuuid/v4"
+	"github.com/rs/xid"
 )
 
 // Group represents a breakout room within a Room.
@@ -21,7 +21,7 @@ type Group struct {
 
 func NewGroup(name string, permissions *proto.ParticipantPermission) *Group {
 	return &Group{
-		sid:          "GR_" + shortuuid.New(),
+		sid:          "gr_" + xid.New().String(),
 		name:         name,
 		permissions:  permissions,
 		participants: make(map[string]bool),

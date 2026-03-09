@@ -67,7 +67,7 @@ func (rm *RoomManager) GetOrCreateRoom(name string, maxParticipants int, metadat
 		cfg.MaxParticipants = maxParticipants
 	}
 
-	sid := xid.New().String()
+	sid := "rm_" + xid.New().String()
 	room := NewRoom(sid, name, cfg)
 	room.metadata = metadata
 	room.SetOnClose(func(r *Room) {

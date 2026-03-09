@@ -146,7 +146,6 @@ type PublishTrackRequest struct {
 	Width         uint32                   `json:"width,omitempty"`
 	Height        uint32                   `json:"height,omitempty"`
 	Muted         bool                     `json:"muted,omitempty"`
-	Layers        []*VideoLayer            `json:"layers,omitempty"`
 	AppData       map[string]any           `json:"appData,omitempty"`
 }
 
@@ -164,10 +163,9 @@ type MuteTrackRequest struct {
 }
 
 type UpdateTrackRequest struct {
-	TrackSid string        `json:"trackSid"`
-	Width    uint32        `json:"width,omitempty"`
-	Height   uint32        `json:"height,omitempty"`
-	Layers   []*VideoLayer `json:"layers,omitempty"`
+	TrackSid string `json:"trackSid"`
+	Width    uint32 `json:"width,omitempty"`
+	Height   uint32 `json:"height,omitempty"`
 }
 
 // ============================================================

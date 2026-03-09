@@ -53,24 +53,19 @@ type Room struct {
 }
 
 type ParticipantInfo struct {
-	Sid              string                       `json:"sid,omitempty"`
-	Identity         string                       `json:"identity,omitempty"`
-	State            ParticipantInfo_State        `json:"state,omitempty"`
-	Tracks           []*TrackInfo                 `json:"tracks,omitempty"`
-	Metadata         string                       `json:"metadata,omitempty"`
-	JoinedAt         int64                        `json:"joinedAt,omitempty"`
-	Name             string                       `json:"name,omitempty"`
-	Version          uint32                       `json:"version,omitempty"`
-	Permission       *ParticipantPermission       `json:"permission,omitempty"`
-	Region           string                       `json:"region,omitempty"`
-	IsPublisher      bool                         `json:"isPublisher,omitempty"`
-	Kind             ParticipantInfo_Kind         `json:"kind,omitempty"`
-	Attributes       map[string]string            `json:"attributes,omitempty"`
-	DisconnectReason DisconnectReason             `json:"disconnectReason,omitempty"`
-	KindDetails      []ParticipantInfo_KindDetail `json:"kindDetails,omitempty"`
-	DataTracks       []*DataTrackInfo             `json:"dataTracks,omitempty"`
-	ClientProtocol   int32                        `json:"clientProtocol,omitempty"`
-	GroupId          string                       `json:"groupId,omitempty"`
+	Sid         string                 `json:"sid,omitempty"`
+	Identity    string                 `json:"identity,omitempty"`
+	State       ParticipantInfo_State  `json:"state,omitempty"`
+	Tracks      []*TrackInfo           `json:"tracks,omitempty"`
+	Metadata    string                 `json:"metadata,omitempty"`
+	JoinedAt    int64                  `json:"joinedAt,omitempty"`
+	Name        string                 `json:"name,omitempty"`
+	Version     uint32                 `json:"version,omitempty"`
+	Permission  *ParticipantPermission `json:"permission,omitempty"`
+	IsPublisher bool                   `json:"isPublisher,omitempty"`
+	Attributes  map[string]string      `json:"attributes,omitempty"`
+	DataTracks  []*DataTrackInfo       `json:"dataTracks,omitempty"`
+	GroupId     string                 `json:"groupId,omitempty"`
 }
 
 type ParticipantInfo_State int32
@@ -179,16 +174,6 @@ const (
 	DisconnectReason_MEDIA_FAILURE       DisconnectReason = 15
 )
 
-type ParticipantInfo_KindDetail int32
-
-const (
-	ParticipantInfo_CLOUD_AGENT        ParticipantInfo_KindDetail = 0
-	ParticipantInfo_FORWARDED          ParticipantInfo_KindDetail = 1
-	ParticipantInfo_CONNECTOR_WHATSAPP ParticipantInfo_KindDetail = 2
-	ParticipantInfo_CONNECTOR_TWILIO   ParticipantInfo_KindDetail = 3
-	ParticipantInfo_BRIDGE_RTSP        ParticipantInfo_KindDetail = 4
-)
-
 // DataTrackInfo represents a published data track.
 type DataTrackInfo struct {
 	Sid     string         `json:"sid,omitempty"`
@@ -270,21 +255,12 @@ type Codec struct {
 }
 
 type ServerInfo struct {
-	Edition       ServerInfo_Edition `json:"edition,omitempty"`
-	Version       string             `json:"version,omitempty"`
-	Protocol      int32              `json:"protocol,omitempty"`
-	Region        string             `json:"region,omitempty"`
-	NodeId        string             `json:"nodeId,omitempty"`
-	DebugInfo     string             `json:"debugInfo,omitempty"`
-	AgentProtocol int32              `json:"agentProtocol,omitempty"`
+	Version   string `json:"version,omitempty"`
+	Protocol  int32  `json:"protocol,omitempty"`
+	Region    string `json:"region,omitempty"`
+	NodeId    string `json:"nodeId,omitempty"`
+	DebugInfo string `json:"debugInfo,omitempty"`
 }
-
-type ServerInfo_Edition int32
-
-const (
-	ServerInfo_Standard ServerInfo_Edition = 0
-	ServerInfo_Cloud    ServerInfo_Edition = 1
-)
 
 type TimedVersion struct {
 	UnixMicro int64 `json:"unixMicro,omitempty"`
@@ -324,17 +300,6 @@ type SpeakerInfo struct {
 	ParticipantSid string  `json:"participantSid"`
 	Level          float32 `json:"level"`
 	Active         bool    `json:"active"`
-}
-
-// VideoLayer describes a simulcast or SVC video layer.
-type VideoLayer struct {
-	Quality       VideoQuality `json:"quality,omitempty"`
-	Width         uint32       `json:"width,omitempty"`
-	Height        uint32       `json:"height,omitempty"`
-	Bitrate       uint32       `json:"bitrate,omitempty"`
-	Ssrc          uint32       `json:"ssrc,omitempty"`
-	SpatialLayer  int32        `json:"spatialLayer,omitempty"`
-	TemporalLayer int32        `json:"temporalLayer,omitempty"`
 }
 
 type VideoQuality int32

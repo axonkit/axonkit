@@ -220,7 +220,7 @@ func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, 
 	}
 	router := s.routers[routerIdx]
 	webRtcServer := s.webRtcServers[routerIdx]
-	participantSid := xid.New().String()
+	participantSid := "pa_" + xid.New().String()
 
 	identity := claims.Identity()
 	if identity == "" {

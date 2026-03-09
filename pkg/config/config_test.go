@@ -7,8 +7,8 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg == nil {
 		t.Fatal("expected non-nil config")
 	}
-	if cfg.Node.Port != 8080 {
-		t.Fatalf("expected port 8080, got %d", cfg.Node.Port)
+	if cfg.Node.Port != 7990 {
+		t.Fatalf("expected port 7990, got %d", cfg.Node.Port)
 	}
 	if !cfg.Room.Dynacast {
 		t.Fatal("expected Dynacast enabled by default")
