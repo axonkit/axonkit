@@ -14,7 +14,6 @@ type Config struct {
 	Media MediaConfig `json:"media"`
 	Auth  AuthConfig  `json:"auth"`
 	Nats  NatsConfig  `json:"nats"`
-	Debug bool        `json:"debug"`
 }
 
 type NodeConfig struct {
@@ -94,7 +93,6 @@ func DefaultConfig() *Config {
 			TokenTTL:        6 * time.Hour,
 			RefreshTokenTTL: 7 * 24 * time.Hour,
 		},
-		Debug: false,
 	}
 }
 

@@ -171,58 +171,37 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, logId string) {
 	var claims *auth.Claims
-	if !s.cfg.Debug {
-		if req.Token == "" {
-			if !s.cfg.Auth.AllowAnonymous {
-				writeJSON(w, http.StatusUnauthorized, proto.ErrorResponse{
-					Code: proto.ErrCodeInvalidToken, Error: "token required"})
-				return
-			}
-			// Anonymous mode: generate a unique identity with default grants.
-			roomName := ""
-			if req.Room != nil {
-				roomName = req.Room.Name
-			}
-			anonIdentity := "anon_" + xid.New().String()
-			claims = &auth.Claims{
-				Sub:  anonIdentity,
-				Name: anonIdentity,
-				Grants: &proto.ClaimGrants{
-					Identity: anonIdentity,
-					Video: &proto.VideoGrant{
-						RoomJoin:     true,
-						Room:         roomName,
-						CanPublish:   true,
-						CanSubscribe: true,
-					},
-				},
-			}
-		} else {
-			var err error
-			claims, err = s.verifier.Verify(req.Token)
-			if err != nil {
-				writeJSON(w, http.StatusUnauthorized, proto.ErrorResponse{
-					Code: proto.ErrCodeInvalidToken, Error: err.Error()})
-				return
-			}
+	if req.Token != "" {
+		var err error
+		claims, err = s.verifier.Verify(req.Token)
+		if err != nil {
+			writeJSON(w, http.StatusUnauthorized, proto.ErrorResponse{
+				Code: proto.ErrCodeInvalidToken, Error: err.Error()})
+			return
 		}
-	} else {
+	} else if s.cfg.Auth.AllowAnonymous {
 		roomName := ""
 		if req.Room != nil {
 			roomName = req.Room.Name
 		}
-		debugIdentity := "debug_" + xid.New().String()
+		anonIdentity := "anon_" + xid.New().String()
 		claims = &auth.Claims{
-			Sub:  debugIdentity,
-			Name: debugIdentity,
+			Sub:  anonIdentity,
+			Name: anonIdentity,
 			Grants: &proto.ClaimGrants{
-				Identity: debugIdentity,
+				Identity: anonIdentity,
 				Video: &proto.VideoGrant{
-					RoomJoin: true,
-					Room:     roomName,
+					RoomJoin:     true,
+					Room:         roomName,
+					CanPublish:   true,
+					CanSubscribe: true,
 				},
 			},
 		}
+	} else {
+		writeJSON(w, http.StatusUnauthorized, proto.ErrorResponse{
+			Code: proto.ErrCodeInvalidToken, Error: "token required"})
+		return
 	}
 
 	if req.Room == nil || req.Room.Name == "" {
@@ -582,16 +561,17 @@ func (s *Server) handleReconnect(w http.ResponseWriter, req *proto.JoinRequest, 
 
 func (s *Server) handleReconnectLocal(w http.ResponseWriter, req *proto.JoinRequest, logId string) {
 	// Validate reconnect credentials: prefer refreshToken, fall back to original token.
-	if !s.cfg.Debug {
-		tokenToVerify := req.RefreshToken
-		if tokenToVerify == "" {
-			tokenToVerify = req.Token
-		}
-		if tokenToVerify == "" {
-			writeJSON(w, http.StatusUnauthorized, proto.ErrorResponse{
-				Code: proto.ErrCodeInvalidToken, Error: "refresh token or token required for reconnect"})
-			return
-		}
+	// Anonymous users always have a refreshToken from their initial join.
+	tokenToVerify := req.RefreshToken
+	if tokenToVerify == "" {
+		tokenToVerify = req.Token
+	}
+	if tokenToVerify == "" && !s.cfg.Auth.AllowAnonymous {
+		writeJSON(w, http.StatusUnauthorized, proto.ErrorResponse{
+			Code: proto.ErrCodeInvalidToken, Error: "refresh token or token required for reconnect"})
+		return
+	}
+	if tokenToVerify != "" {
 		if _, err := s.verifier.Verify(tokenToVerify); err != nil {
 			writeJSON(w, http.StatusUnauthorized, proto.ErrorResponse{
 				Code: proto.ErrCodeInvalidToken, Error: err.Error()})

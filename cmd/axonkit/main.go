@@ -26,16 +26,16 @@ import (
 )
 
 var (
-	cfg       = config.DefaultConfig()
-	nodeID    = flag.String("node", cfg.Node.ID, "Node ID")
-	regionID  = flag.String("region", cfg.Node.Region, "Region ID")
-	clusterID = flag.String("cluster", cfg.Node.Cluster, "Cluster ID")
-	natsURL   = flag.String("nats", cfg.Nats.URL, "NATS URL")
-	httpPort  = flag.Int("port", cfg.Node.Port, "HTTP Port")
-	workerBin = flag.String("worker", cfg.Media.WorkerBin, "Path to mediasoup-worker binary")
-	apiKey    = flag.String("api-key", cfg.Auth.APIKey, "API key for token verification")
-	apiSecret = flag.String("api-secret", cfg.Auth.APISecret, "API secret for token signing")
-	debug     = flag.Bool("debug", cfg.Debug, "Debug mode (skip token verification)")
+	cfg            = config.DefaultConfig()
+	nodeID         = flag.String("node", cfg.Node.ID, "Node ID")
+	regionID       = flag.String("region", cfg.Node.Region, "Region ID")
+	clusterID      = flag.String("cluster", cfg.Node.Cluster, "Cluster ID")
+	natsURL        = flag.String("nats", cfg.Nats.URL, "NATS URL")
+	httpPort       = flag.Int("port", cfg.Node.Port, "HTTP Port")
+	workerBin      = flag.String("worker", cfg.Media.WorkerBin, "Path to mediasoup-worker binary")
+	apiKey         = flag.String("api-key", cfg.Auth.APIKey, "API key for token verification")
+	apiSecret      = flag.String("api-secret", cfg.Auth.APISecret, "API secret for token signing")
+	allowAnonymous = flag.Bool("allow-anonymous", cfg.Auth.AllowAnonymous, "Allow joining without a token (auto-generate identity)")
 )
 
 func main() {
@@ -53,7 +53,7 @@ func main() {
 	cfg.Nats.URL = *natsURL
 	cfg.Auth.APIKey = *apiKey
 	cfg.Auth.APISecret = *apiSecret
-	cfg.Debug = *debug
+	cfg.Auth.AllowAnonymous = *allowAnonymous
 
 	myNode := types.NodeInfo{
 		ID:      types.NodeID(cfg.Node.ID),
@@ -63,7 +63,7 @@ func main() {
 
 	slog.Info("Starting axonkit Node",
 		"id", myNode.ID, "region", myNode.Region, "cluster", myNode.Cluster,
-		"debug", cfg.Debug)
+		"allowAnonymous", cfg.Auth.AllowAnonymous)
 
 	// 1. Connect to NATS
 	options := []nats.Option{}
