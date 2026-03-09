@@ -57,6 +57,13 @@ const (
 	MethodSubscriptionUnsubscribe        = "subscription.unsubscribe"
 	MethodSubscriptionUpdatePermissions  = "subscription.updatePermissions"
 
+	// Client -> Server: Group (breakout room) operations
+	MethodGroupCreate = "group.create"
+	MethodGroupDelete = "group.delete"
+	MethodGroupList   = "group.list"
+	MethodGroupJoin   = "group.join"
+	MethodGroupLeave  = "group.leave"
+
 	// Client -> Server: Chat, P2P RPC (notifications, server relays)
 	MethodChatMessage = "chat.message"
 	MethodRpcRequest  = "rpc.request"
@@ -83,6 +90,12 @@ const (
 	MethodActiveSpeakersChanged          = "activeSpeakers.changed"
 	MethodRoomUpdated                    = "room.updated"
 	MethodDisconnect                     = "disconnect"
+
+	// Server -> Client: Group notifications
+	MethodGroupCreated            = "group.created"
+	MethodGroupDeleted            = "group.deleted"
+	MethodGroupParticipantJoined  = "group.participantJoined"
+	MethodGroupParticipantLeft    = "group.participantLeft"
 )
 
 // Status codes, HTTP-compatible.

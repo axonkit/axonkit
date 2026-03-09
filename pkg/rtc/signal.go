@@ -94,6 +94,21 @@ func (p *Participant) dispatchRPC(msg *proto.Message) {
 	case proto.MethodSubscriptionUpdatePermissions:
 		body, status, errMsg = p.handleSubscriptionUpdatePermissions(msg)
 
+	case proto.MethodGroupCreate:
+		body, status, errMsg = p.handleGroupCreate(msg)
+
+	case proto.MethodGroupDelete:
+		body, status, errMsg = p.handleGroupDelete(msg)
+
+	case proto.MethodGroupList:
+		body, status, errMsg = p.handleGroupList(msg)
+
+	case proto.MethodGroupJoin:
+		body, status, errMsg = p.handleGroupJoin(msg)
+
+	case proto.MethodGroupLeave:
+		body, status, errMsg = p.handleGroupLeave(msg)
+
 	case proto.MethodChatMessage:
 		p.handleChatMessageRelay(msg)
 
@@ -140,7 +155,17 @@ func (p *Participant) handleReady(msg *proto.Message) (any, int, string) {
 		otherInfos[i] = o.ToProto()
 	}
 
+	// Collect groups for the response.
+	groupList := p.room.ListGroups()
+	groupInfos := make([]*proto.GroupInfo, len(groupList))
+	for i, g := range groupList {
+		groupInfos[i] = g.ToProto()
+	}
+
+	// For reconnect, deliver chat messages the client missed.
+	var missedMessages []*proto.ChatMessageNotification
 	if req.SyncState != nil {
+		missedMessages = p.room.GetMessagesSince(req.SyncState.LastMessageTimestamp)
 		go p.processReconnectSync(req.SyncState)
 	} else {
 		p.room.BroadcastNotification(proto.MethodParticipantJoined,
@@ -151,6 +176,8 @@ func (p *Participant) handleReady(msg *proto.Message) (any, int, string) {
 	return &proto.ReadyResponse{
 		OtherParticipants: otherInfos,
 		Room:              p.room.ToProto(),
+		Groups:            groupInfos,
+		Messages:          missedMessages,
 	}, proto.StatusOK, ""
 }
 
@@ -564,6 +591,7 @@ func (p *Participant) handleChatMessageRelay(msg *proto.Message) {
 	chatMsg.ParticipantSid = p.sid
 	chatMsg.ParticipantIdentity = p.identity
 
+	p.room.StoreChatMessage(&chatMsg)
 	p.room.BroadcastNotification(proto.MethodChatMessage, &chatMsg, p.sid)
 }
 
@@ -618,4 +646,84 @@ func (p *Participant) handleRpcResponse(msg *proto.Message) {
 	}
 
 	_ = target.SendNotification(proto.MethodRpcResponse, &resp)
+}
+
+// ============================================================
+// Group (Breakout Room) Handlers
+// ============================================================
+
+func (p *Participant) handleGroupCreate(msg *proto.Message) (any, int, string) {
+	if p.room == nil {
+		return nil, proto.StatusBadRequest, "not in a room"
+	}
+	if p.permission == nil || !p.permission.CanManageGroups {
+		return nil, proto.StatusForbidden, "no permission to manage groups"
+	}
+
+	var req proto.CreateGroupRequest
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		return nil, proto.StatusBadRequest, "invalid request"
+	}
+
+	g := p.room.CreateGroup(req.Name, req.Permissions)
+	return &proto.CreateGroupResponse{Group: g.ToProto()}, proto.StatusOK, ""
+}
+
+func (p *Participant) handleGroupDelete(msg *proto.Message) (any, int, string) {
+	if p.room == nil {
+		return nil, proto.StatusBadRequest, "not in a room"
+	}
+	if p.permission == nil || !p.permission.CanManageGroups {
+		return nil, proto.StatusForbidden, "no permission to manage groups"
+	}
+
+	var req proto.DeleteGroupRequest
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		return nil, proto.StatusBadRequest, "invalid request"
+	}
+
+	if err := p.room.DeleteGroup(req.GroupId); err != nil {
+		return nil, proto.StatusNotFound, err.Error()
+	}
+	return nil, proto.StatusOK, ""
+}
+
+func (p *Participant) handleGroupList(msg *proto.Message) (any, int, string) {
+	if p.room == nil {
+		return nil, proto.StatusBadRequest, "not in a room"
+	}
+
+	groups := p.room.ListGroups()
+	infos := make([]*proto.GroupInfo, 0, len(groups))
+	for _, g := range groups {
+		infos = append(infos, g.ToProto())
+	}
+	return &proto.ListGroupsResponse{Groups: infos}, proto.StatusOK, ""
+}
+
+func (p *Participant) handleGroupJoin(msg *proto.Message) (any, int, string) {
+	if p.room == nil {
+		return nil, proto.StatusBadRequest, "not in a room"
+	}
+
+	var req proto.JoinGroupRequest
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		return nil, proto.StatusBadRequest, "invalid request"
+	}
+
+	if err := p.room.JoinGroup(p, req.GroupId); err != nil {
+		return nil, proto.StatusNotFound, err.Error()
+	}
+	return nil, proto.StatusOK, ""
+}
+
+func (p *Participant) handleGroupLeave(msg *proto.Message) (any, int, string) {
+	if p.room == nil {
+		return nil, proto.StatusBadRequest, "not in a room"
+	}
+
+	if err := p.room.LeaveGroup(p); err != nil {
+		return nil, proto.StatusBadRequest, err.Error()
+	}
+	return nil, proto.StatusOK, ""
 }

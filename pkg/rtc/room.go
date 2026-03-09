@@ -46,6 +46,8 @@ type Room struct {
 	creationTime time.Time
 
 	participants map[string]*Participant
+	groups       map[string]*Group // groupSid -> Group
+	chatMessages []*proto.ChatMessageNotification
 	mu           sync.RWMutex
 
 	cascade CascadeCallbacks
@@ -62,6 +64,7 @@ func NewRoom(sid, name string, cfg config.RoomConfig) *Room {
 		name:         name,
 		config:       cfg,
 		participants: make(map[string]*Participant),
+		groups:       make(map[string]*Group),
 		creationTime: time.Now(),
 		logger:       slog.Default().With("component", "Room", "room", name, "roomSid", sid),
 	}
@@ -128,6 +131,9 @@ func (r *Room) RemoveParticipant(sid string, reason proto.DisconnectReason) {
 
 	if count == 0 {
 		r.mu.Lock()
+		// Groups still contain refs to participant SIDs but those
+		// participants are now gone. Only start the empty timer when
+		// there are truly no participants left in the room at all.
 		r.startEmptyTimer()
 		r.mu.Unlock()
 	}
@@ -238,6 +244,48 @@ func (r *Room) BroadcastNotification(method string, body any, excludeSid string)
 	}
 }
 
+// StoreChatMessage appends a chat message to the room's history.
+// Messages with an EditTimestamp update the existing message in-place.
+func (r *Room) StoreChatMessage(msg *proto.ChatMessageNotification) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if msg.EditTimestamp != nil {
+		for i, m := range r.chatMessages {
+			if m.ID == msg.ID {
+				r.chatMessages[i] = msg
+				return
+			}
+		}
+	}
+	r.chatMessages = append(r.chatMessages, msg)
+}
+
+// GetMessagesSince returns all chat messages with a timestamp strictly
+// greater than the provided value. If since is 0 all messages are returned.
+func (r *Room) GetMessagesSince(since int64) []*proto.ChatMessageNotification {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if since == 0 {
+		out := make([]*proto.ChatMessageNotification, len(r.chatMessages))
+		copy(out, r.chatMessages)
+		return out
+	}
+
+	var out []*proto.ChatMessageNotification
+	for _, m := range r.chatMessages {
+		ts := m.Timestamp
+		if m.EditTimestamp != nil && *m.EditTimestamp > ts {
+			ts = *m.EditTimestamp
+		}
+		if ts > since {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 // OnTrackPublished handles a new track being published.
 // For auto-subscribe rooms, it creates subscriptions for all other participants.
 func (r *Room) OnTrackPublished(publisher *Participant, track *PublishedTrack) {
@@ -254,9 +302,13 @@ func (r *Room) OnTrackPublished(publisher *Participant, track *PublishedTrack) {
 		return
 	}
 
+	publisherGroupId := publisher.GetGroupId()
 	others := r.GetOtherParticipants(publisher.sid)
 	for _, sub := range others {
 		if !sub.IsReady() || !sub.CanSubscribe() {
+			continue
+		}
+		if !r.shouldPeerSubscribe(publisherGroupId, sub.GetGroupId()) {
 			continue
 		}
 		go func(subscriber *Participant) {
@@ -320,14 +372,20 @@ func (r *Room) OnDataTrackUnpublished(publisher *Participant, dataTrackSid strin
 	}
 }
 
-// SubscribeExistingTracks subscribes a new participant to all existing tracks in the room.
+// SubscribeExistingTracks subscribes a new participant to all existing tracks
+// from peers in the same group (or all in the main room when groupId == "").
 func (r *Room) SubscribeExistingTracks(subscriber *Participant) {
 	if !r.config.AutoSubscribe || !subscriber.CanSubscribe() {
 		return
 	}
 
+	subscriberGroupId := subscriber.GetGroupId()
 	others := r.GetOtherParticipants(subscriber.sid)
 	for _, publisher := range others {
+		if !r.shouldPeerSubscribe(subscriberGroupId, publisher.GetGroupId()) {
+			continue
+		}
+
 		tracks := publisher.GetPublishedTracks()
 		for _, track := range tracks {
 			go func(t *PublishedTrack, pub *Participant) {
@@ -346,6 +404,211 @@ func (r *Room) SubscribeExistingTracks(subscriber *Participant) {
 						"subscriber", subscriber.identity, "dataTrack", t.sid, "error", err)
 				}
 			}(dt, publisher)
+		}
+	}
+}
+
+// ============================================================
+// Group (Breakout Room) Management
+// ============================================================
+
+func (r *Room) CreateGroup(name string, permissions *proto.ParticipantPermission) *Group {
+	g := NewGroup(name, permissions)
+	r.mu.Lock()
+	r.groups[g.SID()] = g
+	r.mu.Unlock()
+
+	r.BroadcastNotification(proto.MethodGroupCreated, &proto.GroupCreatedNotification{
+		Group: g.ToProto(),
+	}, "")
+
+	r.logger.Info("Group created", "groupId", g.SID(), "name", name)
+	return g
+}
+
+func (r *Room) DeleteGroup(groupId string) error {
+	r.mu.Lock()
+	g, ok := r.groups[groupId]
+	if !ok {
+		r.mu.Unlock()
+		return errors.New("group not found")
+	}
+	delete(r.groups, groupId)
+	r.mu.Unlock()
+
+	participantSids := g.ParticipantSids()
+	for _, pSid := range participantSids {
+		p := r.GetParticipant(pSid)
+		if p == nil {
+			continue
+		}
+		r.participantLeaveGroup(p, g)
+	}
+
+	r.BroadcastNotification(proto.MethodGroupDeleted, &proto.GroupDeletedNotification{
+		GroupId: groupId,
+	}, "")
+
+	r.logger.Info("Group deleted", "groupId", groupId, "participantsReturned", len(participantSids))
+	return nil
+}
+
+func (r *Room) GetGroup(groupId string) *Group {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.groups[groupId]
+}
+
+func (r *Room) ListGroups() []*Group {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	groups := make([]*Group, 0, len(r.groups))
+	for _, g := range r.groups {
+		groups = append(groups, g)
+	}
+	return groups
+}
+
+// JoinGroup moves a participant from their current context (main room or
+// another group) into the specified group.  Subscriptions are rewired:
+// old peers lose this participant's tracks, new peers gain them.
+func (r *Room) JoinGroup(p *Participant, groupId string) error {
+	r.mu.RLock()
+	g, ok := r.groups[groupId]
+	r.mu.RUnlock()
+	if !ok {
+		return errors.New("group not found")
+	}
+
+	oldGroupId := p.GetGroupId()
+
+	if oldGroupId != "" {
+		if oldGroup := r.GetGroup(oldGroupId); oldGroup != nil {
+			r.participantLeaveGroup(p, oldGroup)
+		}
+	}
+
+	g.AddParticipant(p.sid)
+	p.SetGroupId(groupId)
+
+	if g.permissions != nil {
+		p.SetEffectivePermission(g.permissions)
+	}
+
+	r.rewireSubscriptions(p)
+
+	r.BroadcastNotification(proto.MethodGroupParticipantJoined, &proto.GroupParticipantJoinedNotification{
+		GroupId:        groupId,
+		ParticipantSid: p.sid,
+	}, "")
+
+	r.logger.Info("Participant joined group", "participant", p.identity,
+		"groupId", groupId, "from", oldGroupId)
+	return nil
+}
+
+// LeaveGroup returns a participant to the main room.
+func (r *Room) LeaveGroup(p *Participant) error {
+	groupId := p.GetGroupId()
+	if groupId == "" {
+		return errors.New("participant not in a group")
+	}
+
+	g := r.GetGroup(groupId)
+	if g != nil {
+		r.participantLeaveGroup(p, g)
+	}
+
+	r.BroadcastNotification(proto.MethodGroupParticipantLeft, &proto.GroupParticipantLeftNotification{
+		GroupId:        groupId,
+		ParticipantSid: p.sid,
+	}, "")
+
+	return nil
+}
+
+// participantLeaveGroup is the internal helper that removes a participant
+// from a group, restores room-level permissions, and rewires subscriptions.
+func (r *Room) participantLeaveGroup(p *Participant, g *Group) {
+	g.RemoveParticipant(p.sid)
+	p.SetGroupId("")
+	p.RestoreRoomPermission()
+
+	r.rewireSubscriptions(p)
+
+	r.logger.Info("Participant left group", "participant", p.identity, "groupId", g.SID())
+}
+
+// rewireSubscriptions adjusts the subscriptions for a participant and all
+// other participants so that only peers in the same group (or all in the
+// main room when groupId == "") are cross-subscribed.
+func (r *Room) rewireSubscriptions(target *Participant) {
+	if !r.config.AutoSubscribe {
+		return
+	}
+
+	others := r.GetOtherParticipants(target.sid)
+	targetGroupId := target.GetGroupId()
+
+	for _, other := range others {
+		otherGroupId := other.GetGroupId()
+		shouldSubscribe := r.shouldPeerSubscribe(targetGroupId, otherGroupId)
+
+		if shouldSubscribe {
+			r.ensureCrossSubscription(target, other)
+		} else {
+			r.removeCrossSubscription(target, other)
+		}
+	}
+}
+
+// shouldPeerSubscribe determines if two participants should be subscribed
+// to each other based on their group membership.
+// Rules:
+//   - Same group (non-empty) -> yes
+//   - Both in main room ("") -> yes
+//   - One in group, one in main room -> no
+//   - Different groups -> no
+func (r *Room) shouldPeerSubscribe(groupA, groupB string) bool {
+	return groupA == groupB
+}
+
+func (r *Room) ensureCrossSubscription(a, b *Participant) {
+	if a.IsReady() && a.CanSubscribe() {
+		for _, track := range b.GetPublishedTracks() {
+			if !a.HasSubscription(track.sid) {
+				go func(t *PublishedTrack, pub *Participant) {
+					if err := a.Subscribe(t, pub); err != nil {
+						r.logger.Debug("Group re-subscribe failed", "subscriber", a.identity,
+							"track", t.sid, "error", err)
+					}
+				}(track, b)
+			}
+		}
+	}
+	if b.IsReady() && b.CanSubscribe() {
+		for _, track := range a.GetPublishedTracks() {
+			if !b.HasSubscription(track.sid) {
+				go func(t *PublishedTrack, pub *Participant) {
+					if err := b.Subscribe(t, pub); err != nil {
+						r.logger.Debug("Group re-subscribe failed", "subscriber", b.identity,
+							"track", t.sid, "error", err)
+					}
+				}(track, a)
+			}
+		}
+	}
+}
+
+func (r *Room) removeCrossSubscription(a, b *Participant) {
+	for _, track := range b.GetPublishedTracks() {
+		if a.HasSubscription(track.sid) {
+			go a.CloseSubscription(track.sid)
+		}
+	}
+	for _, track := range a.GetPublishedTracks() {
+		if b.HasSubscription(track.sid) {
+			go b.CloseSubscription(track.sid)
 		}
 	}
 }

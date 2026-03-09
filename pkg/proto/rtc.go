@@ -56,6 +56,9 @@ type SyncState struct {
 	SubscribedDataTrackSids []string `json:"subscribedDataTrackSids,omitempty"`
 	// PublishedTrackSids the client had published itself (for server to verify).
 	PublishedTrackSids []string `json:"publishedTrackSids,omitempty"`
+	// LastMessageTimestamp is the timestamp of the last chat message the client
+	// received before disconnecting. The server returns messages newer than this.
+	LastMessageTimestamp int64 `json:"lastMessageTimestamp,omitempty"`
 }
 
 type JoinResponse struct {
@@ -108,8 +111,10 @@ type ReadyRequest struct {
 }
 
 type ReadyResponse struct {
-	OtherParticipants []*ParticipantInfo `json:"otherParticipants,omitempty"`
-	Room              *Room              `json:"room,omitempty"`
+	OtherParticipants []*ParticipantInfo         `json:"otherParticipants,omitempty"`
+	Room              *Room                      `json:"room,omitempty"`
+	Groups            []*GroupInfo               `json:"groups,omitempty"`
+	Messages          []*ChatMessageNotification `json:"messages,omitempty"`
 }
 
 type LeaveRequest struct {
@@ -415,7 +420,7 @@ type ChatMessageNotification struct {
 	ID                  string `json:"id"`
 	Message             string `json:"message"`
 	Timestamp           int64  `json:"timestamp"`
-	EditTimestamp        *int64 `json:"editTimestamp,omitempty"`
+	EditTimestamp       *int64 `json:"editTimestamp,omitempty"`
 	ParticipantSid      string `json:"participantSid,omitempty"`
 	ParticipantIdentity string `json:"participantIdentity,omitempty"`
 }
@@ -440,6 +445,58 @@ type RpcError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
 	Data    string `json:"data,omitempty"`
+}
+
+// ============================================================
+// Group (Breakout Room) Management
+// ============================================================
+
+type GroupInfo struct {
+	GroupId          string                 `json:"groupId"`
+	Name             string                 `json:"name"`
+	Permissions      *ParticipantPermission `json:"permissions,omitempty"`
+	ParticipantCount int                    `json:"participantCount"`
+}
+
+type CreateGroupRequest struct {
+	Name        string                 `json:"name"`
+	Permissions *ParticipantPermission `json:"permissions,omitempty"`
+}
+
+type CreateGroupResponse struct {
+	Group *GroupInfo `json:"group"`
+}
+
+type DeleteGroupRequest struct {
+	GroupId string `json:"groupId"`
+}
+
+type ListGroupsResponse struct {
+	Groups []*GroupInfo `json:"groups"`
+}
+
+type JoinGroupRequest struct {
+	GroupId string `json:"groupId"`
+}
+
+type LeaveGroupRequest struct{}
+
+type GroupCreatedNotification struct {
+	Group *GroupInfo `json:"group"`
+}
+
+type GroupDeletedNotification struct {
+	GroupId string `json:"groupId"`
+}
+
+type GroupParticipantJoinedNotification struct {
+	GroupId        string `json:"groupId"`
+	ParticipantSid string `json:"participantSid"`
+}
+
+type GroupParticipantLeftNotification struct {
+	GroupId        string `json:"groupId"`
+	ParticipantSid string `json:"participantSid"`
 }
 
 // ============================================================

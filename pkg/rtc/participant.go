@@ -251,6 +251,10 @@ type Participant struct {
 	allParticipantsAllowedToSubscribe bool
 	trackPermissions                  []proto.TrackPermission
 
+	// Group (breakout room) membership
+	groupId        string                       // empty = main room
+	roomPermission *proto.ParticipantPermission  // saved room-level permission for restore
+
 	mu     sync.RWMutex
 	logger *slog.Logger
 	closed bool
@@ -327,6 +331,47 @@ func (p *Participant) CanSubscribe() bool {
 
 func (p *Participant) CanPublish() bool {
 	return p.permission != nil && p.permission.CanPublish
+}
+
+func (p *Participant) GetGroupId() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.groupId
+}
+
+func (p *Participant) SetGroupId(groupId string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.groupId = groupId
+}
+
+// SetEffectivePermission saves the current room-level permission (if not
+// already saved) and replaces it with the given group-level permission.
+func (p *Participant) SetEffectivePermission(perm *proto.ParticipantPermission) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.roomPermission == nil {
+		p.roomPermission = p.permission
+	}
+	p.permission = perm
+}
+
+// RestoreRoomPermission reverts the effective permission to the room-level
+// permission that was saved when the participant joined a group.
+func (p *Participant) RestoreRoomPermission() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.roomPermission != nil {
+		p.permission = p.roomPermission
+		p.roomPermission = nil
+	}
+}
+
+func (p *Participant) HasSubscription(trackSid string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	_, ok := p.subscriptions[trackSid]
+	return ok
 }
 
 func (p *Participant) State() proto.ParticipantInfo_State {

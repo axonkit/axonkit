@@ -142,6 +142,7 @@ type ParticipantPermission struct {
 	CanUpdateMetadata     bool          `json:"canUpdateMetadata,omitempty"`
 	CanSubscribeMetrics   bool          `json:"canSubscribeMetrics,omitempty"`
 	CanManageAgentSession bool          `json:"canManageAgentSession,omitempty"`
+	CanManageGroups       bool          `json:"canManageGroups,omitempty"`
 }
 
 type ParticipantInfo_Kind int32
