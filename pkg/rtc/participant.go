@@ -86,7 +86,6 @@ func (t *PublishedTrack) updateConsumerLayers(consumerID string, spatialLayer in
 	if st, ok := t.activeConsumers[consumerID]; ok {
 		st.spatialLayer = spatialLayer
 	}
-	slog.Info("updateConsumerLayers", "consumerID", consumerID, "spatialLayer", spatialLayer)
 	t.recalcLocked()
 }
 
