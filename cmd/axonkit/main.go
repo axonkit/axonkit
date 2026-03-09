@@ -145,13 +145,21 @@ func main() {
 
 	linkDB.StartProbing(context.Background())
 
-	// 5. Init Room Manager
+	// 5. Init Room Manager (with shared KV for cross-node room state)
+	roomKV, err := store.NewNatsStore(context.Background(), js, "ROOM_STATE", 0)
+	if err != nil {
+		slog.Error("Failed to init Room State Store", "error", err)
+		os.Exit(1)
+	}
+
 	roomManager := rtc.NewRoomManager(rtc.RoomManagerParams{
 		Config:       cfg.Room,
 		RIB:          rib,
 		FIB:          fib,
 		Finder:       finder,
 		MediaManager: mediaMgr,
+		KV:           roomKV,
+		NodeID:       string(myNode.ID),
 	})
 
 	// 6. Init Token Verifier

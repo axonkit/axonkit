@@ -38,7 +38,7 @@ func newTestParticipant(identity string) *Participant {
 }
 
 func TestRoom_NewRoom(t *testing.T) {
-	r := NewRoom("sid-1", "test-room", defaultRoomConfig())
+	r := NewRoom("sid-1", "test-room", defaultRoomConfig(), time.Now())
 	if r.Sid() != "sid-1" || r.Name() != "test-room" {
 		t.Fatalf("unexpected sid/name: %s/%s", r.Sid(), r.Name())
 	}
@@ -48,7 +48,7 @@ func TestRoom_NewRoom(t *testing.T) {
 }
 
 func TestRoom_AddRemoveParticipant(t *testing.T) {
-	r := NewRoom("sid-1", "test-room", defaultRoomConfig())
+	r := NewRoom("sid-1", "test-room", defaultRoomConfig(), time.Now())
 	p := newTestParticipant("alice")
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
@@ -74,7 +74,7 @@ func TestRoom_AddRemoveParticipant(t *testing.T) {
 func TestRoom_AddParticipant_MaxParticipants(t *testing.T) {
 	cfg := defaultRoomConfig()
 	cfg.MaxParticipants = 1
-	r := NewRoom("sid-1", "test-room", cfg)
+	r := NewRoom("sid-1", "test-room", cfg, time.Now())
 
 	p1 := newTestParticipant("alice")
 	defer p1.Close(proto.DisconnectReason_CLIENT_INITIATED)
@@ -90,7 +90,7 @@ func TestRoom_AddParticipant_MaxParticipants(t *testing.T) {
 }
 
 func TestRoom_AddParticipant_DuplicateIdentity(t *testing.T) {
-	r := NewRoom("sid-1", "test-room", defaultRoomConfig())
+	r := NewRoom("sid-1", "test-room", defaultRoomConfig(), time.Now())
 
 	p1 := NewParticipant(ParticipantParams{
 		Sid:      "sid-1",
@@ -125,7 +125,7 @@ func TestRoom_AddParticipant_DuplicateIdentity(t *testing.T) {
 }
 
 func TestRoom_AddParticipant_Closed(t *testing.T) {
-	r := NewRoom("sid-1", "test-room", defaultRoomConfig())
+	r := NewRoom("sid-1", "test-room", defaultRoomConfig(), time.Now())
 	r.Close(proto.DisconnectReason_ROOM_CLOSED)
 
 	p := newTestParticipant("alice")
@@ -137,13 +137,13 @@ func TestRoom_AddParticipant_Closed(t *testing.T) {
 }
 
 func TestRoom_Close_Idempotent(t *testing.T) {
-	r := NewRoom("sid-1", "test-room", defaultRoomConfig())
+	r := NewRoom("sid-1", "test-room", defaultRoomConfig(), time.Now())
 	r.Close(proto.DisconnectReason_ROOM_CLOSED)
 	r.Close(proto.DisconnectReason_ROOM_CLOSED) // should not panic
 }
 
 func TestRoom_GetOtherParticipants(t *testing.T) {
-	r := NewRoom("sid-1", "test-room", defaultRoomConfig())
+	r := NewRoom("sid-1", "test-room", defaultRoomConfig(), time.Now())
 	p1 := newTestParticipant("alice")
 	p2 := newTestParticipant("bob")
 	p3 := newTestParticipant("charlie")
@@ -167,12 +167,12 @@ func TestRoom_GetOtherParticipants(t *testing.T) {
 }
 
 func TestRoom_RemoveParticipant_NotFound(t *testing.T) {
-	r := NewRoom("sid-1", "test-room", defaultRoomConfig())
+	r := NewRoom("sid-1", "test-room", defaultRoomConfig(), time.Now())
 	r.RemoveParticipant("nonexistent", proto.DisconnectReason_CLIENT_INITIATED) // should not panic
 }
 
 func TestRoom_ToProto(t *testing.T) {
-	r := NewRoom("sid-1", "test-room", defaultRoomConfig())
+	r := NewRoom("sid-1", "test-room", defaultRoomConfig(), time.Now())
 	p1 := newTestParticipant("alice")
 	defer p1.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
@@ -189,7 +189,7 @@ func TestRoom_ToProto(t *testing.T) {
 func TestRoom_EmptyTimer(t *testing.T) {
 	cfg := defaultRoomConfig()
 	cfg.DepartureTimeout = 100 * time.Millisecond
-	r := NewRoom("sid-1", "test-room", cfg)
+	r := NewRoom("sid-1", "test-room", cfg, time.Now())
 
 	var closed atomic.Int32
 	r.SetOnClose(func(*Room) {
@@ -208,7 +208,7 @@ func TestRoom_EmptyTimer(t *testing.T) {
 }
 
 func TestRoom_SetMetadata(t *testing.T) {
-	r := NewRoom("sid-1", "test-room", defaultRoomConfig())
+	r := NewRoom("sid-1", "test-room", defaultRoomConfig(), time.Now())
 	r.SetMetadata("hello")
 	if r.Metadata() != "hello" {
 		t.Fatalf("expected metadata 'hello', got %q", r.Metadata())
@@ -218,19 +218,19 @@ func TestRoom_SetMetadata(t *testing.T) {
 func TestRoom_Dynacast(t *testing.T) {
 	cfg := defaultRoomConfig()
 	cfg.Dynacast = true
-	r := NewRoom("sid-1", "test-room", cfg)
+	r := NewRoom("sid-1", "test-room", cfg, time.Now())
 	if !r.Dynacast() {
 		t.Fatal("expected Dynacast = true")
 	}
 	cfg.Dynacast = false
-	r2 := NewRoom("sid-2", "test-room-2", cfg)
+	r2 := NewRoom("sid-2", "test-room-2", cfg, time.Now())
 	if r2.Dynacast() {
 		t.Fatal("expected Dynacast = false")
 	}
 }
 
 func TestRoom_CascadeCallbacks_Publish(t *testing.T) {
-	r := NewRoom("sid-1", "test-room", defaultRoomConfig())
+	r := NewRoom("sid-1", "test-room", defaultRoomConfig(), time.Now())
 
 	var published, unpublished []string
 	r.cascade = CascadeCallbacks{
@@ -256,7 +256,7 @@ func TestRoom_CascadeCallbacks_Publish(t *testing.T) {
 }
 
 func TestRoom_Close_KicksParticipants(t *testing.T) {
-	r := NewRoom("sid-1", "test-room", defaultRoomConfig())
+	r := NewRoom("sid-1", "test-room", defaultRoomConfig(), time.Now())
 
 	var onCloseInvoked atomic.Int32
 	r.SetOnClose(func(*Room) {
@@ -280,7 +280,7 @@ func TestRoom_Close_KicksParticipants(t *testing.T) {
 }
 
 func TestRoom_FindPublishedTrack(t *testing.T) {
-	r := NewRoom("sid-1", "test-room", defaultRoomConfig())
+	r := NewRoom("sid-1", "test-room", defaultRoomConfig(), time.Now())
 	if r.FindPublishedTrack("nonexistent") != nil {
 		t.Fatal("expected nil for nonexistent track")
 	}
@@ -289,7 +289,7 @@ func TestRoom_FindPublishedTrack(t *testing.T) {
 func TestRoom_OnTrackPublished(t *testing.T) {
 	cfg := defaultRoomConfig()
 	cfg.AutoSubscribe = false
-	r := NewRoom("sid-1", "test-room", cfg)
+	r := NewRoom("sid-1", "test-room", cfg, time.Now())
 
 	var published []string
 	r.cascade = CascadeCallbacks{
@@ -314,7 +314,7 @@ func TestRoom_OnTrackPublished(t *testing.T) {
 func TestRoom_OnTrackPublished_AutoSubscribe(t *testing.T) {
 	cfg := defaultRoomConfig()
 	cfg.AutoSubscribe = true
-	r := NewRoom("sid-1", "test-room", cfg)
+	r := NewRoom("sid-1", "test-room", cfg, time.Now())
 
 	pub := newTestParticipant("alice")
 	sub := newTestParticipant("bob")
@@ -330,7 +330,7 @@ func TestRoom_OnTrackPublished_AutoSubscribe(t *testing.T) {
 }
 
 func TestRoom_OnTrackMuted(t *testing.T) {
-	r := NewRoom("sid-1", "test-room", defaultRoomConfig())
+	r := NewRoom("sid-1", "test-room", defaultRoomConfig(), time.Now())
 	pub := newTestParticipant("alice")
 	sub := newTestParticipant("bob")
 	defer pub.Close(proto.DisconnectReason_CLIENT_INITIATED)
@@ -345,7 +345,7 @@ func TestRoom_OnTrackMuted(t *testing.T) {
 func TestRoom_OnDataTrackPublished(t *testing.T) {
 	cfg := defaultRoomConfig()
 	cfg.AutoSubscribe = true
-	r := NewRoom("sid-1", "test-room", cfg)
+	r := NewRoom("sid-1", "test-room", cfg, time.Now())
 
 	var published []string
 	r.cascade = CascadeCallbacks{
@@ -371,7 +371,7 @@ func TestRoom_OnDataTrackPublished(t *testing.T) {
 func TestRoom_OnDataTrackPublished_NoAutoSubscribe(t *testing.T) {
 	cfg := defaultRoomConfig()
 	cfg.AutoSubscribe = false
-	r := NewRoom("sid-1", "test-room", cfg)
+	r := NewRoom("sid-1", "test-room", cfg, time.Now())
 
 	pub := newTestParticipant("alice")
 	defer pub.Close(proto.DisconnectReason_CLIENT_INITIATED)
@@ -384,7 +384,7 @@ func TestRoom_OnDataTrackPublished_NoAutoSubscribe(t *testing.T) {
 func TestRoom_SubscribeExistingTracks(t *testing.T) {
 	cfg := defaultRoomConfig()
 	cfg.AutoSubscribe = true
-	r := NewRoom("sid-1", "test-room", cfg)
+	r := NewRoom("sid-1", "test-room", cfg, time.Now())
 
 	pub := newTestParticipant("alice")
 	sub := newTestParticipant("bob")
@@ -399,7 +399,7 @@ func TestRoom_SubscribeExistingTracks(t *testing.T) {
 func TestRoom_SubscribeExistingTracks_NoAutoSubscribe(t *testing.T) {
 	cfg := defaultRoomConfig()
 	cfg.AutoSubscribe = false
-	r := NewRoom("sid-1", "test-room", cfg)
+	r := NewRoom("sid-1", "test-room", cfg, time.Now())
 
 	sub := newTestParticipant("alice")
 	defer sub.Close(proto.DisconnectReason_CLIENT_INITIATED)
@@ -409,7 +409,7 @@ func TestRoom_SubscribeExistingTracks_NoAutoSubscribe(t *testing.T) {
 }
 
 func TestRoom_FindPublishedTrack_MultiParticipant(t *testing.T) {
-	r := NewRoom("sid-1", "test-room", defaultRoomConfig())
+	r := NewRoom("sid-1", "test-room", defaultRoomConfig(), time.Now())
 
 	p := newTestParticipant("alice")
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
@@ -446,7 +446,7 @@ func TestRoom_FindPublishedTrack_MultiParticipant(t *testing.T) {
 }
 
 func TestRoom_GetParticipantByIdentity(t *testing.T) {
-	r := NewRoom("sid-1", "test-room", defaultRoomConfig())
+	r := NewRoom("sid-1", "test-room", defaultRoomConfig(), time.Now())
 	p := newTestParticipant("alice")
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 	r.AddParticipant(p)
@@ -461,7 +461,7 @@ func TestRoom_GetParticipantByIdentity(t *testing.T) {
 }
 
 func TestRoom_CascadeCallbacks_Advertise(t *testing.T) {
-	r := NewRoom("sid-1", "test-room", defaultRoomConfig())
+	r := NewRoom("sid-1", "test-room", defaultRoomConfig(), time.Now())
 
 	published := make([]string, 0)
 	unpublished := make([]string, 0)
@@ -504,7 +504,7 @@ func TestRoom_CascadeCallbacks_Advertise(t *testing.T) {
 
 func TestRoom_TestHelpers(t *testing.T) {
 	cfg := defaultRoomConfig()
-	r := NewRoom("sid-1", "test-room", cfg)
+	r := NewRoom("sid-1", "test-room", cfg, time.Now())
 
 	// With no cascade callbacks, these should be no-ops
 	if err := r.TestEnsureStream("stream-1"); err != nil {

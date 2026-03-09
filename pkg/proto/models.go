@@ -66,6 +66,7 @@ type ParticipantInfo struct {
 	Attributes  map[string]string      `json:"attributes,omitempty"`
 	DataTracks  []*DataTrackInfo       `json:"dataTracks,omitempty"`
 	GroupId     string                 `json:"groupId,omitempty"`
+	NodeId      string                 `json:"nodeId,omitempty"`
 }
 
 type ParticipantInfo_State int32

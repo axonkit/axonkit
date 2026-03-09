@@ -249,6 +249,7 @@ func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, 
 		StatsInterval:   s.cfg.Room.StatsInterval,
 		TokenVerifier:   s.verifier,
 		RefreshTokenTTL: s.cfg.Auth.RefreshTokenTTL,
+		NodeId:          string(s.node.ID),
 	})
 
 	sendTransport, recvTransport, directTransport, err := s.createTransports(router, webRtcServer)

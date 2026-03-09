@@ -1,6 +1,7 @@
 package rtc
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"sync"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/axonkit/axonkit/pkg/config"
 	"github.com/axonkit/axonkit/pkg/proto"
+	"github.com/axonkit/axonkit/pkg/store"
 )
 
 var (
@@ -45,12 +47,18 @@ type Room struct {
 	metadata     string
 	creationTime time.Time
 
-	participants map[string]*Participant
-	groups       map[string]*Group // groupSid -> Group
-	chatMessages []*proto.ChatMessageNotification
-	mu           sync.RWMutex
+	participants       map[string]*Participant
+	remoteParticipants map[string]bool // SIDs of participants on other nodes
+	groups             map[string]*Group // groupSid -> Group
+	chatMessages       []*proto.ChatMessageNotification
+	remoteMsgIds       map[string]bool // dedup remote chat messages
+	mu                 sync.RWMutex
 
-	cascade CascadeCallbacks
+	cascade    CascadeCallbacks
+	roomStore  *RoomStore
+	watchCtx   context.Context
+	watchClose context.CancelFunc
+
 	onClose func(*Room)
 	logger  *slog.Logger
 
@@ -58,15 +66,17 @@ type Room struct {
 	closed     bool
 }
 
-func NewRoom(sid, name string, cfg config.RoomConfig) *Room {
+func NewRoom(sid, name string, cfg config.RoomConfig, creationTime time.Time) *Room {
 	return &Room{
-		sid:          sid,
-		name:         name,
-		config:       cfg,
-		participants: make(map[string]*Participant),
-		groups:       make(map[string]*Group),
-		creationTime: time.Now(),
-		logger:       slog.Default().With("component", "Room", "room", name, "roomSid", sid),
+		sid:                sid,
+		name:               name,
+		config:             cfg,
+		participants:       make(map[string]*Participant),
+		remoteParticipants: make(map[string]bool),
+		groups:             make(map[string]*Group),
+		remoteMsgIds:       make(map[string]bool),
+		creationTime:       creationTime,
+		logger:             slog.Default().With("component", "Room", "room", name, "roomSid", sid),
 	}
 }
 
@@ -75,8 +85,117 @@ func (r *Room) Name() string         { return r.name }
 func (r *Room) Metadata() string     { return r.metadata }
 func (r *Room) SetMetadata(m string) { r.metadata = m }
 func (r *Room) Dynacast() bool       { return r.config.Dynacast }
+func (r *Room) Store() *RoomStore    { return r.roomStore }
 
 func (r *Room) SetOnClose(fn func(*Room)) { r.onClose = fn }
+
+// SetupStore initialises the cross-node RoomStore and starts watching for
+// remote changes. Must be called after NewRoom and before participants join.
+func (r *Room) SetupStore(kv store.Store, nodeID string) {
+	r.roomStore = NewRoomStore(kv, r.name, nodeID)
+	ctx, cancel := context.WithCancel(context.Background())
+	r.watchCtx = ctx
+	r.watchClose = cancel
+
+	ch, err := r.roomStore.Watch(ctx)
+	if err != nil {
+		r.logger.Warn("Failed to start room store watch", "error", err)
+		return
+	}
+	go r.processStoreEvents(ch, nodeID)
+}
+
+// processStoreEvents reacts to changes made by other nodes (participant
+// join/leave, group changes, new chat messages). Events originating from the
+// local node are ignored because the local Room already processes them.
+func (r *Room) processStoreEvents(ch <-chan RoomStoreEvent, localNodeID string) {
+	for evt := range ch {
+		switch evt.Type {
+		case "participant":
+			if evt.Participant != nil && evt.Participant.NodeId == localNodeID {
+				continue
+			}
+			r.handleRemoteParticipantEvent(evt)
+		case "group":
+			// Groups are authoritative from the store — we always sync.
+			r.handleRemoteGroupEvent(evt)
+		case "msg":
+			if evt.Message != nil {
+				r.handleRemoteChatEvent(evt)
+			}
+		}
+	}
+}
+
+func (r *Room) handleRemoteParticipantEvent(evt RoomStoreEvent) {
+	switch evt.Operation {
+	case store.OpPut:
+		if evt.Participant == nil {
+			return
+		}
+		info := evt.Participant
+
+		r.mu.Lock()
+		_, known := r.remoteParticipants[info.Sid]
+		r.remoteParticipants[info.Sid] = true
+		r.mu.Unlock()
+
+		if known {
+			r.BroadcastNotification(proto.MethodParticipantUpdated,
+				&proto.ParticipantUpdatedNotification{Participant: info}, "")
+		} else {
+			r.BroadcastNotification(proto.MethodParticipantJoined,
+				&proto.ParticipantJoinedNotification{Participant: info}, "")
+		}
+	case store.OpDelete:
+		r.mu.Lock()
+		delete(r.remoteParticipants, evt.Key)
+		r.mu.Unlock()
+
+		r.BroadcastNotification(proto.MethodParticipantLeft,
+			&proto.ParticipantLeftNotification{
+				ParticipantSid: evt.Key,
+				Reason:         proto.DisconnectReason_UNKNOWN_REASON,
+			}, "")
+	}
+}
+
+func (r *Room) handleRemoteGroupEvent(evt RoomStoreEvent) {
+	r.mu.Lock()
+	switch evt.Operation {
+	case store.OpPut:
+		if evt.Group != nil {
+			if existing, ok := r.groups[evt.Group.GroupId]; ok {
+				existing.name = evt.Group.Name
+			} else {
+				r.groups[evt.Group.GroupId] = &Group{
+					sid:  evt.Group.GroupId,
+					name: evt.Group.Name,
+				}
+			}
+		}
+	case store.OpDelete:
+		delete(r.groups, evt.Key)
+	}
+	r.mu.Unlock()
+}
+
+func (r *Room) handleRemoteChatEvent(evt RoomStoreEvent) {
+	if evt.Message == nil {
+		return
+	}
+
+	r.mu.Lock()
+	if r.remoteMsgIds[evt.Message.ID] {
+		r.mu.Unlock()
+		return
+	}
+	r.remoteMsgIds[evt.Message.ID] = true
+	r.chatMessages = append(r.chatMessages, evt.Message)
+	r.mu.Unlock()
+
+	r.BroadcastNotification(proto.MethodChatMessage, evt.Message, "")
+}
 
 func (r *Room) AddParticipant(p *Participant) error {
 	r.mu.Lock()
@@ -108,6 +227,10 @@ func (r *Room) AddParticipant(p *Participant) error {
 	r.logger.Info("Participant added", "participant", p.identity, "sid", p.sid,
 		"count", len(r.participants))
 
+	if r.roomStore != nil {
+		go r.roomStore.PutParticipant(p.ToProto())
+	}
+
 	return nil
 }
 
@@ -123,6 +246,10 @@ func (r *Room) RemoveParticipant(sid string, reason proto.DisconnectReason) {
 	r.mu.Unlock()
 
 	r.logger.Info("Participant removed", "participant", p.identity, "sid", sid, "remaining", count)
+
+	if r.roomStore != nil {
+		go r.roomStore.DeleteParticipant(sid)
+	}
 
 	r.BroadcastNotification(proto.MethodParticipantLeft, &proto.ParticipantLeftNotification{
 		ParticipantSid: sid,
@@ -228,6 +355,86 @@ func (r *Room) ToProto() *proto.Room {
 	}
 }
 
+// GetAllParticipantInfos returns ParticipantInfo for all participants across
+// all nodes. Local participants are serialized from in-memory state; remote
+// participants are fetched from the shared store.
+func (r *Room) GetAllParticipantInfos(excludeSid string) []*proto.ParticipantInfo {
+	r.mu.RLock()
+	localSids := make(map[string]bool, len(r.participants))
+	var result []*proto.ParticipantInfo
+	for _, p := range r.participants {
+		localSids[p.sid] = true
+		if p.sid != excludeSid {
+			result = append(result, p.ToProto())
+		}
+	}
+	r.mu.RUnlock()
+
+	if r.roomStore != nil {
+		remote := r.roomStore.GetAllParticipants()
+		for _, info := range remote {
+			if info.Sid == excludeSid || localSids[info.Sid] {
+				continue
+			}
+			result = append(result, info)
+		}
+	}
+	return result
+}
+
+// GetAllGroupInfos returns GroupInfo for all groups across all nodes.
+func (r *Room) GetAllGroupInfos() []*proto.GroupInfo {
+	r.mu.RLock()
+	localIds := make(map[string]bool, len(r.groups))
+	var result []*proto.GroupInfo
+	for _, g := range r.groups {
+		localIds[g.SID()] = true
+		result = append(result, g.ToProto())
+	}
+	r.mu.RUnlock()
+
+	if r.roomStore != nil {
+		remote := r.roomStore.GetAllGroups()
+		for _, info := range remote {
+			if localIds[info.GroupId] {
+				continue
+			}
+			result = append(result, info)
+		}
+	}
+	return result
+}
+
+// GetAllMessagesSince returns chat messages across all nodes since the given
+// timestamp. Local messages come from in-memory cache; remote from the store.
+func (r *Room) GetAllMessagesSince(since int64) []*proto.ChatMessageNotification {
+	r.mu.RLock()
+	localIds := make(map[string]bool, len(r.chatMessages))
+	var result []*proto.ChatMessageNotification
+	for _, m := range r.chatMessages {
+		ts := m.Timestamp
+		if m.EditTimestamp != nil && *m.EditTimestamp > ts {
+			ts = *m.EditTimestamp
+		}
+		if since == 0 || ts > since {
+			localIds[m.ID] = true
+			result = append(result, m)
+		}
+	}
+	r.mu.RUnlock()
+
+	if r.roomStore != nil {
+		remote := r.roomStore.GetMessagesSince(since)
+		for _, m := range remote {
+			if localIds[m.ID] {
+				continue
+			}
+			result = append(result, m)
+		}
+	}
+	return result
+}
+
 // BroadcastNotification sends a notification to all participants except the excluded one.
 func (r *Room) BroadcastNotification(method string, body any, excludeSid string) {
 	r.mu.RLock()
@@ -254,11 +461,17 @@ func (r *Room) StoreChatMessage(msg *proto.ChatMessageNotification) {
 		for i, m := range r.chatMessages {
 			if m.ID == msg.ID {
 				r.chatMessages[i] = msg
+				if r.roomStore != nil {
+					go r.roomStore.PutMessage(msg)
+				}
 				return
 			}
 		}
 	}
 	r.chatMessages = append(r.chatMessages, msg)
+	if r.roomStore != nil {
+		go r.roomStore.PutMessage(msg)
+	}
 }
 
 // GetMessagesSince returns all chat messages with a timestamp strictly
@@ -418,6 +631,10 @@ func (r *Room) CreateGroup(name string, permissions *proto.ParticipantPermission
 	r.groups[g.SID()] = g
 	r.mu.Unlock()
 
+	if r.roomStore != nil {
+		go r.roomStore.PutGroup(g.ToProto())
+	}
+
 	r.BroadcastNotification(proto.MethodGroupCreated, &proto.GroupCreatedNotification{
 		Group: g.ToProto(),
 	}, "")
@@ -443,6 +660,10 @@ func (r *Room) DeleteGroup(groupId string) error {
 			continue
 		}
 		r.participantLeaveGroup(p, g)
+	}
+
+	if r.roomStore != nil {
+		go r.roomStore.DeleteGroup(groupId)
 	}
 
 	r.BroadcastNotification(proto.MethodGroupDeleted, &proto.GroupDeletedNotification{
@@ -501,6 +722,11 @@ func (r *Room) JoinGroup(p *Participant, groupId string) ([]*Participant, error)
 
 	r.rewireSubscriptions(p)
 
+	if r.roomStore != nil {
+		go r.roomStore.PutParticipant(p.ToProto())
+		go r.roomStore.PutGroup(g.ToProto())
+	}
+
 	r.BroadcastNotification(proto.MethodGroupParticipantJoined, &proto.GroupParticipantJoinedNotification{
 		GroupId:        groupId,
 		ParticipantSid: p.sid,
@@ -545,10 +771,17 @@ func (r *Room) LeaveGroup(p *Participant) error {
 // from a group, restores room-level permissions, and rewires subscriptions.
 func (r *Room) participantLeaveGroup(p *Participant, g *Group) {
 	g.RemoveParticipant(p.sid)
+	if r.roomStore != nil {
+		go r.roomStore.PutGroup(g.ToProto())
+	}
 	p.SetGroupId("")
 	p.RestoreRoomPermission()
 
 	r.rewireSubscriptions(p)
+
+	if r.roomStore != nil {
+		go r.roomStore.PutParticipant(p.ToProto())
+	}
 
 	r.logger.Info("Participant left group", "participant", p.identity, "groupId", g.SID())
 }
@@ -661,6 +894,13 @@ func (r *Room) Close(reason proto.DisconnectReason) {
 
 	for _, p := range participants {
 		p.Close(reason)
+	}
+
+	if r.watchClose != nil {
+		r.watchClose()
+	}
+	if r.roomStore != nil {
+		go r.roomStore.CleanupLocal()
 	}
 
 	if r.onClose != nil {

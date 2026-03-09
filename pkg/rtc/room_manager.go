@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/axonkit/axonkit/pkg/config"
 	"github.com/axonkit/axonkit/pkg/discovery"
 	"github.com/axonkit/axonkit/pkg/media"
 	"github.com/axonkit/axonkit/pkg/proto"
 	"github.com/axonkit/axonkit/pkg/routing"
+	"github.com/axonkit/axonkit/pkg/store"
 	"github.com/axonkit/axonkit/pkg/types"
 	"github.com/rs/xid"
 )
@@ -28,6 +30,9 @@ type RoomManager struct {
 	finder   *discovery.Finder
 	mediaMgr *media.Manager
 
+	kv     store.Store // shared KV for cross-node room state sync
+	nodeID string
+
 	logger *slog.Logger
 }
 
@@ -37,6 +42,8 @@ type RoomManagerParams struct {
 	FIB          *routing.FIB
 	Finder       *discovery.Finder
 	MediaManager *media.Manager
+	KV           store.Store
+	NodeID       string
 }
 
 func NewRoomManager(params RoomManagerParams) *RoomManager {
@@ -48,12 +55,16 @@ func NewRoomManager(params RoomManagerParams) *RoomManager {
 		fib:        params.FIB,
 		finder:     params.Finder,
 		mediaMgr:   params.MediaManager,
+		kv:         params.KV,
+		nodeID:     params.NodeID,
 		logger:     slog.Default().With("component", "RoomManager"),
 	}
 }
 
 // GetOrCreateRoom returns an existing room by name, or creates one using
 // the provided creation request settings (with server defaults as fallback).
+// The room's identity and configuration are stored in the shared KV so that
+// every node in the cluster creates an identical local Room instance.
 func (rm *RoomManager) GetOrCreateRoom(name string, maxParticipants int, metadata string) *Room {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -62,22 +73,39 @@ func (rm *RoomManager) GetOrCreateRoom(name string, maxParticipants int, metadat
 		return room
 	}
 
-	cfg := rm.config
-	if maxParticipants > 0 {
-		cfg.MaxParticipants = maxParticipants
+	// Try to read room state from the shared store (another node may have
+	// created this room already).
+	existing, _ := GetRoomMeta(rm.kv, name)
+
+	var meta *RoomMeta
+	if existing != nil {
+		meta = existing
+	} else {
+		cfg := rm.config
+		if maxParticipants > 0 {
+			cfg.MaxParticipants = maxParticipants
+		}
+		meta = &RoomMeta{
+			Sid:          "rm_" + xid.New().String(),
+			Name:         name,
+			Metadata:     metadata,
+			CreationTime: time.Now().UnixMilli(),
+			Config:       cfg,
+		}
+		PutRoomMeta(rm.kv, meta)
 	}
 
-	sid := "rm_" + xid.New().String()
-	room := NewRoom(sid, name, cfg)
-	room.metadata = metadata
+	room := NewRoom(meta.Sid, meta.Name, meta.Config, time.UnixMilli(meta.CreationTime))
+	room.metadata = meta.Metadata
 	room.SetOnClose(func(r *Room) {
 		rm.removeRoom(r)
 	})
 	rm.setupCascadeCallbacks(room)
+	room.SetupStore(rm.kv, rm.nodeID)
 
 	rm.rooms[name] = room
-	rm.roomsBySid[sid] = room
-	rm.logger.Info("Room created", "name", name, "sid", sid)
+	rm.roomsBySid[meta.Sid] = room
+	rm.logger.Info("Room created", "name", name, "sid", meta.Sid)
 
 	return room
 }

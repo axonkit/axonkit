@@ -255,6 +255,9 @@ type Participant struct {
 	groupId        string                       // empty = main room
 	roomPermission *proto.ParticipantPermission  // saved room-level permission for restore
 
+	// Node identification for cross-node sync
+	nodeId string
+
 	// Token refresh
 	refreshToken    string
 	tokenVerifier   *auth.TokenVerifier
@@ -281,6 +284,7 @@ type ParticipantParams struct {
 	StatsInterval   time.Duration
 	TokenVerifier   *auth.TokenVerifier
 	RefreshTokenTTL time.Duration
+	NodeId          string
 }
 
 const msgQueueSize = 256
@@ -308,6 +312,7 @@ func NewParticipant(params ParticipantParams) *Participant {
 		pingInterval:        params.PingInterval,
 		pingTimeout:         params.PingTimeout,
 		statsInterval:       params.StatsInterval,
+		nodeId:              params.NodeId,
 		tokenVerifier:       params.TokenVerifier,
 		refreshTokenTTL:     params.RefreshTokenTTL,
 		logger: slog.Default().With("component", "Participant",
@@ -1325,6 +1330,7 @@ func (p *Participant) ToProto() *proto.ParticipantInfo {
 		IsPublisher: len(p.publishedTracks) > 0 || len(p.dataPublishedTracks) > 0,
 		Attributes:  p.attributes,
 		GroupId:     p.groupId,
+		NodeId:      p.nodeId,
 	}
 }
 

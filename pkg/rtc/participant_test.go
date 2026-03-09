@@ -250,7 +250,7 @@ func TestParticipant_Close_Idempotent(t *testing.T) {
 func TestParticipant_Close_CleansUpStreams(t *testing.T) {
 	cfg := defaultRoomConfig()
 	cfg.AutoSubscribe = false
-	room := NewRoom("room-cleanup", "cleanup-room", cfg)
+	room := NewRoom("room-cleanup", "cleanup-room", cfg, time.Now())
 
 	var unpublishedTracks []string
 	var unpublishedDataTracks []string
@@ -304,7 +304,7 @@ func TestParticipant_Close_CleansUpStreams_NoRoom(t *testing.T) {
 func TestParticipant_Close_PassesCorrectReason(t *testing.T) {
 	cfg := defaultRoomConfig()
 	cfg.AutoSubscribe = false
-	room := NewRoom("room-reason", "reason-room", cfg)
+	room := NewRoom("room-reason", "reason-room", cfg, time.Now())
 
 	var receivedReason proto.DisconnectReason
 	room.cascade = CascadeCallbacks{

@@ -146,23 +146,15 @@ func (p *Participant) handleReady(msg *proto.Message) (any, int, string) {
 	p.SetState(proto.ParticipantInfo_JOINED)
 	p.StartHeartbeat()
 
-	others := p.room.GetOtherParticipants(p.sid)
-	otherInfos := make([]*proto.ParticipantInfo, len(others))
-	for i, o := range others {
-		otherInfos[i] = o.ToProto()
-	}
-
-	// Collect groups for the response.
-	groupList := p.room.ListGroups()
-	groupInfos := make([]*proto.GroupInfo, len(groupList))
-	for i, g := range groupList {
-		groupInfos[i] = g.ToProto()
-	}
+	// Fetch participants, groups and messages from both local node and
+	// shared store so the response covers all nodes in the cluster.
+	otherInfos := p.room.GetAllParticipantInfos(p.sid)
+	groupInfos := p.room.GetAllGroupInfos()
 
 	// For reconnect, deliver chat messages the client missed.
 	var missedMessages []*proto.ChatMessageNotification
 	if req.SyncState != nil {
-		missedMessages = p.room.GetMessagesSince(req.SyncState.LastMessageTimestamp)
+		missedMessages = p.room.GetAllMessagesSince(req.SyncState.LastMessageTimestamp)
 		go p.processReconnectSync(req.SyncState)
 	} else {
 		p.room.BroadcastNotification(proto.MethodParticipantJoined,
