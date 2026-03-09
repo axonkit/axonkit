@@ -48,7 +48,7 @@ type Room struct {
 	creationTime time.Time
 
 	participants       map[string]*Participant
-	remoteParticipants map[string]bool // SIDs of participants on other nodes
+	remoteParticipants map[string]bool   // SIDs of participants on other nodes
 	groups             map[string]*Group // groupSid -> Group
 	chatMessages       []*proto.ChatMessageNotification
 	remoteMsgIds       map[string]bool // dedup remote chat messages
@@ -66,17 +66,26 @@ type Room struct {
 	closed     bool
 }
 
-func NewRoom(sid, name string, cfg config.RoomConfig, creationTime time.Time) *Room {
+type RoomParams struct {
+	Sid          string
+	Name         string
+	Config       config.RoomConfig
+	CreationTime time.Time
+	Metadata     string
+}
+
+func NewRoom(params RoomParams) *Room {
 	return &Room{
-		sid:                sid,
-		name:               name,
-		config:             cfg,
+		sid:                params.Sid,
+		name:               params.Name,
+		config:             params.Config,
+		metadata:           params.Metadata,
 		participants:       make(map[string]*Participant),
 		remoteParticipants: make(map[string]bool),
 		groups:             make(map[string]*Group),
 		remoteMsgIds:       make(map[string]bool),
-		creationTime:       creationTime,
-		logger:             slog.Default().With("component", "Room", "room", name, "roomSid", sid),
+		creationTime:       params.CreationTime,
+		logger:             slog.Default().With("component", "Room", "room", params.Name, "roomSid", params.Sid),
 	}
 }
 

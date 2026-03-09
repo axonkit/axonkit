@@ -13,7 +13,12 @@ func newSignalTestParticipant(t *testing.T) *Participant {
 	t.Helper()
 	cfg := defaultRoomConfig()
 	cfg.AutoSubscribe = false
-	room := NewRoom("room-sig", "signal-room", cfg, time.Now())
+	room := NewRoom(RoomParams{
+		Sid:          "room-sig",
+		Name:         "signal-room",
+		Config:       cfg,
+		CreationTime: time.Now(),
+	})
 
 	p := NewParticipant(ParticipantParams{
 		Sid:           "sig-p1",
@@ -286,7 +291,12 @@ func TestDispatchRPC_Ready(t *testing.T) {
 		MaxParticipants:  10,
 		AutoSubscribe:    false,
 	}
-	room := NewRoom("room-ready", "ready-room", cfg, time.Now())
+	room := NewRoom(RoomParams{
+		Sid:          "room-ready",
+		Name:         "ready-room",
+		Config:       cfg,
+		CreationTime: time.Now(),
+	})
 
 	p := NewParticipant(ParticipantParams{
 		Sid:           "ready-p1",
@@ -309,7 +319,12 @@ func TestDispatchRPC_Ready(t *testing.T) {
 
 func TestDispatchRPC_Ready_BadJSON(t *testing.T) {
 	cfg := defaultRoomConfig()
-	room := NewRoom("room-ready-bad", "ready-bad", cfg, time.Now())
+	room := NewRoom(RoomParams{
+		Sid:          "room-ready-bad",
+		Name:         "ready-bad",
+		Config:       cfg,
+		CreationTime: time.Now(),
+	})
 
 	p := NewParticipant(ParticipantParams{
 		Sid: "ready-bad-p1", Identity: "ready-bad-alice",
@@ -361,7 +376,12 @@ func TestDispatchRPC_AllBadJSON(t *testing.T) {
 func TestProcessReconnectSync(t *testing.T) {
 	cfg := defaultRoomConfig()
 	cfg.AutoSubscribe = false
-	room := NewRoom("room-sync", "sync-room", cfg, time.Now())
+	room := NewRoom(RoomParams{
+		Sid:          "room-sync",
+		Name:         "sync-room",
+		Config:       cfg,
+		CreationTime: time.Now(),
+	})
 
 	p := NewParticipant(ParticipantParams{
 		Sid: "sync-p1", Identity: "sync-alice",
@@ -439,7 +459,12 @@ func TestHandleIncomingMessage_ResponseUnknownLogId(t *testing.T) {
 func TestProcessReconnectSync_WithTracks(t *testing.T) {
 	cfg := defaultRoomConfig()
 	cfg.AutoSubscribe = false
-	room := NewRoom("room-recon", "recon-room", cfg, time.Now())
+	room := NewRoom(RoomParams{
+		Sid:          "room-recon",
+		Name:         "recon-room",
+		Config:       cfg,
+		CreationTime: time.Now(),
+	})
 
 	p := NewParticipant(ParticipantParams{
 		Sid: "recon-sub", Identity: "alice",

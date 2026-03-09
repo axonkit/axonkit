@@ -95,8 +95,13 @@ func (rm *RoomManager) GetOrCreateRoom(name string, maxParticipants int, metadat
 		PutRoomMeta(rm.kv, meta)
 	}
 
-	room := NewRoom(meta.Sid, meta.Name, meta.Config, time.UnixMilli(meta.CreationTime))
-	room.metadata = meta.Metadata
+	room := NewRoom(RoomParams{
+		Sid:          meta.Sid,
+		Name:         meta.Name,
+		Config:       meta.Config,
+		CreationTime: time.UnixMilli(meta.CreationTime),
+		Metadata:     meta.Metadata,
+	})
 	room.SetOnClose(func(r *Room) {
 		rm.removeRoom(r)
 	})
