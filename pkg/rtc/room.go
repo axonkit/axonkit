@@ -472,12 +472,13 @@ func (r *Room) ListGroups() []*Group {
 // JoinGroup moves a participant from their current context (main room or
 // another group) into the specified group.  Subscriptions are rewired:
 // old peers lose this participant's tracks, new peers gain them.
-func (r *Room) JoinGroup(p *Participant, groupId string) error {
+// Returns the list of other participants already in the group.
+func (r *Room) JoinGroup(p *Participant, groupId string) ([]*Participant, error) {
 	r.mu.RLock()
 	g, ok := r.groups[groupId]
 	r.mu.RUnlock()
 	if !ok {
-		return errors.New("group not found")
+		return nil, errors.New("group not found")
 	}
 
 	oldGroupId := p.GetGroupId()
@@ -487,6 +488,9 @@ func (r *Room) JoinGroup(p *Participant, groupId string) error {
 			r.participantLeaveGroup(p, oldGroup)
 		}
 	}
+
+	// Snapshot the existing members before adding the new participant.
+	existingSids := g.ParticipantSids()
 
 	g.AddParticipant(p.sid)
 	p.SetGroupId(groupId)
@@ -502,9 +506,19 @@ func (r *Room) JoinGroup(p *Participant, groupId string) error {
 		ParticipantSid: p.sid,
 	}, "")
 
+	// Collect ParticipantInfo for existing group members.
+	r.mu.RLock()
+	others := make([]*Participant, 0, len(existingSids))
+	for _, sid := range existingSids {
+		if peer, ok := r.participants[sid]; ok {
+			others = append(others, peer)
+		}
+	}
+	r.mu.RUnlock()
+
 	r.logger.Info("Participant joined group", "participant", p.identity,
 		"groupId", groupId, "from", oldGroupId)
-	return nil
+	return others, nil
 }
 
 // LeaveGroup returns a participant to the main room.

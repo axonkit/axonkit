@@ -70,6 +70,7 @@ type ParticipantInfo struct {
 	KindDetails      []ParticipantInfo_KindDetail `json:"kindDetails,omitempty"`
 	DataTracks       []*DataTrackInfo             `json:"dataTracks,omitempty"`
 	ClientProtocol   int32                        `json:"clientProtocol,omitempty"`
+	GroupId          string                       `json:"groupId,omitempty"`
 }
 
 type ParticipantInfo_State int32

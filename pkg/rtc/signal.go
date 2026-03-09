@@ -711,10 +711,16 @@ func (p *Participant) handleGroupJoin(msg *proto.Message) (any, int, string) {
 		return nil, proto.StatusBadRequest, "invalid request"
 	}
 
-	if err := p.room.JoinGroup(p, req.GroupId); err != nil {
+	others, err := p.room.JoinGroup(p, req.GroupId)
+	if err != nil {
 		return nil, proto.StatusNotFound, err.Error()
 	}
-	return nil, proto.StatusOK, ""
+
+	infos := make([]*proto.ParticipantInfo, 0, len(others))
+	for _, o := range others {
+		infos = append(infos, o.ToProto())
+	}
+	return &proto.JoinGroupResponse{OtherParticipants: infos}, proto.StatusOK, ""
 }
 
 func (p *Participant) handleGroupLeave(msg *proto.Message) (any, int, string) {

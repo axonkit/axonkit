@@ -479,6 +479,10 @@ type JoinGroupRequest struct {
 	GroupId string `json:"groupId"`
 }
 
+type JoinGroupResponse struct {
+	OtherParticipants []*ParticipantInfo `json:"otherParticipants,omitempty"`
+}
+
 type LeaveGroupRequest struct{}
 
 type GroupCreatedNotification struct {

@@ -1264,6 +1264,7 @@ func (p *Participant) ToProto() *proto.ParticipantInfo {
 		Permission:  p.permission,
 		IsPublisher: len(p.publishedTracks) > 0 || len(p.dataPublishedTracks) > 0,
 		Attributes:  p.attributes,
+		GroupId:     p.groupId,
 	}
 }
 
