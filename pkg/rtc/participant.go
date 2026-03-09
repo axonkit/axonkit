@@ -104,13 +104,9 @@ func (t *PublishedTrack) updateConsumerPaused(consumerID string, paused bool) {
 // recalcLocked computes the aggregate subscription state and notifies the
 // publisher of changes. Must be called with mu held.
 //
-// Two notifications may be sent:
-//   - track.subscriptionStatusChanged: fires for ALL tracks (audio/video) when
-//     the track transitions between "has active subscribers" and "no active subscribers".
-//     The publisher should pause/resume the track accordingly.
-//   - track.subscribedQualityChanged: fires for simulcast VIDEO tracks only,
-//     reporting which quality layers have active subscribers so the publisher
-//     can toggle individual encodings.
+// Audio tracks receive track.subscriptionStatusChanged (has/no subscribers).
+// Video tracks receive track.subscribedQualityChanged with per-layer state;
+// the publisher derives "no subscribers" from all layers being disabled.
 func (t *PublishedTrack) recalcLocked() {
 	if t.publisher == nil {
 		return
@@ -131,19 +127,21 @@ func (t *PublishedTrack) recalcLocked() {
 	}
 
 	hasSubscriber := activeCount > 0
-	if hasSubscriber != t.lastHasSubscriber {
-		t.lastHasSubscriber = hasSubscriber
-		_ = t.publisher.SendNotification(proto.MethodTrackSubscriptionStatusChanged,
-			&proto.SubscriptionStatusChangedNotification{
-				TrackSid:       t.sid,
-				HasSubscribers: hasSubscriber,
-			})
-	}
 
 	if t.kind != mediasoup.MediaKindVideo {
+		// Audio: simple has/no subscribers notification.
+		if hasSubscriber != t.lastHasSubscriber {
+			t.lastHasSubscriber = hasSubscriber
+			_ = t.publisher.SendNotification(proto.MethodTrackSubscriptionStatusChanged,
+				&proto.SubscriptionStatusChangedNotification{
+					TrackSid:       t.sid,
+					HasSubscribers: hasSubscriber,
+				})
+		}
 		return
 	}
 
+	// Video: per-layer quality notification (publisher pauses when all false).
 	var q [3]bool
 	for i := int32(0); i <= maxNeeded && i <= 2; i++ {
 		q[i] = true
@@ -153,6 +151,7 @@ func (t *PublishedTrack) recalcLocked() {
 		return
 	}
 	t.lastQualities = q
+	t.lastHasSubscriber = hasSubscriber
 
 	_ = t.publisher.SendNotification(proto.MethodTrackSubscribedQualityChanged,
 		&proto.SubscribedQualityChangedNotification{

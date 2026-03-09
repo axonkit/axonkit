@@ -308,5 +308,4 @@ const (
 	VideoQuality_LOW    VideoQuality = 0
 	VideoQuality_MEDIUM VideoQuality = 1
 	VideoQuality_HIGH   VideoQuality = 2
-	VideoQuality_OFF    VideoQuality = 3
 )

@@ -366,11 +366,10 @@ type SubscribedCodec struct {
 	Qualities []SubscribedQuality `json:"qualities"`
 }
 
-// SubscriptionStatusChangedNotification is sent to the publisher when the
-// aggregate subscription status of a track changes. When no subscriber is
-// actively consuming (all paused or none), the publisher should pause the
-// track to save CPU and bandwidth. This complements SubscribedQualityChanged
-// (which is simulcast-specific) and works for all codec types including SVC.
+// SubscriptionStatusChangedNotification is sent to the publisher of an
+// audio track when the aggregate subscription status changes. Video tracks
+// use SubscribedQualityChangedNotification instead (the publisher can derive
+// hasSubscribers from whether all qualities are disabled).
 type SubscriptionStatusChangedNotification struct {
 	TrackSid       string `json:"trackSid"`
 	HasSubscribers bool   `json:"hasSubscribers"`
