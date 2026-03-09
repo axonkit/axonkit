@@ -33,7 +33,6 @@ type PublishedTrack struct {
 	mu                sync.Mutex
 	activeConsumers   map[string]*consumerLayerState // consumerID → state
 	lastQualities     [3]bool                        // [LOW, MEDIUM, HIGH] last notified
-	lastHasSubscriber bool                           // last notified subscription status
 	publisher         *Participant
 }
 
@@ -101,24 +100,19 @@ func (t *PublishedTrack) updateConsumerPaused(consumerID string, paused bool) {
 	t.recalcLocked()
 }
 
-// recalcLocked computes the aggregate subscription state and notifies the
-// publisher of changes. Must be called with mu held.
-//
-// Audio tracks receive track.subscriptionStatusChanged (has/no subscribers).
-// Video tracks receive track.subscribedQualityChanged with per-layer state;
-// the publisher derives "no subscribers" from all layers being disabled.
+// recalcLocked computes the aggregate subscription state for video tracks and
+// notifies the publisher via track.subscribedQualityChanged. Must be called
+// with mu held. Dynacast only applies to video; audio tracks are ignored.
 func (t *PublishedTrack) recalcLocked() {
-	if t.publisher == nil {
+	if t.publisher == nil || t.kind != mediasoup.MediaKindVideo {
 		return
 	}
 
-	activeCount := 0
 	maxNeeded := int32(-1)
 	for _, st := range t.activeConsumers {
 		if st.paused {
 			continue
 		}
-		activeCount++
 		if st.spatialLayer < 0 {
 			maxNeeded = 2
 		} else if st.spatialLayer > maxNeeded {
@@ -126,22 +120,6 @@ func (t *PublishedTrack) recalcLocked() {
 		}
 	}
 
-	hasSubscriber := activeCount > 0
-
-	if t.kind != mediasoup.MediaKindVideo {
-		// Audio: simple has/no subscribers notification.
-		if hasSubscriber != t.lastHasSubscriber {
-			t.lastHasSubscriber = hasSubscriber
-			_ = t.publisher.SendNotification(proto.MethodTrackSubscriptionStatusChanged,
-				&proto.SubscriptionStatusChangedNotification{
-					TrackSid:       t.sid,
-					HasSubscribers: hasSubscriber,
-				})
-		}
-		return
-	}
-
-	// Video: per-layer quality notification (publisher pauses when all false).
 	var q [3]bool
 	for i := int32(0); i <= maxNeeded && i <= 2; i++ {
 		q[i] = true
@@ -151,7 +129,6 @@ func (t *PublishedTrack) recalcLocked() {
 		return
 	}
 	t.lastQualities = q
-	t.lastHasSubscriber = hasSubscriber
 
 	_ = t.publisher.SendNotification(proto.MethodTrackSubscribedQualityChanged,
 		&proto.SubscribedQualityChangedNotification{
@@ -1125,6 +1102,7 @@ func (p *Participant) SendNotification(method string, body any) error {
 	if err != nil {
 		return err
 	}
+	msg.LogId = xid.New().String()
 	return p.sendMessage(msg)
 }
 
@@ -1353,7 +1331,10 @@ func (p *Participant) UpdateMetadata(metadata, name *string, attributes map[stri
 
 	if p.room != nil {
 		p.room.BroadcastNotification(proto.MethodParticipantUpdated,
-			&proto.ParticipantUpdatedNotification{Participant: p.ToProto()}, "")
+			&proto.ParticipantUpdatedNotification{Participant: p.ToProto()}, p.sid)
+		if p.room.Store() != nil {
+			go p.room.Store().PutParticipant(p.ToProto())
+		}
 	}
 }
 
