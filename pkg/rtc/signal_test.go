@@ -78,14 +78,6 @@ func TestDispatchRPC_Leave(t *testing.T) {
 	}
 }
 
-func TestDispatchRPC_TokenRefresh(t *testing.T) {
-	p := newSignalTestParticipant(t)
-	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
-
-	msg := makeRequest(proto.MethodTokenRefresh, "log-token", nil)
-	p.dispatchRPC(msg)
-}
-
 func TestDispatchRPC_TrackPublish_NoTransport(t *testing.T) {
 	p := newSignalTestParticipant(t)
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)

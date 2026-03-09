@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/axonkit/axonkit/pkg/auth"
 	"github.com/axonkit/axonkit/pkg/proto"
 	"github.com/axonkit/axonkit/pkg/types"
 	"github.com/jiyeyuran/mediasoup-go/v2"
@@ -255,6 +256,12 @@ type Participant struct {
 	groupId        string                       // empty = main room
 	roomPermission *proto.ParticipantPermission  // saved room-level permission for restore
 
+	// Token refresh
+	refreshToken    string
+	tokenVerifier   *auth.TokenVerifier
+	refreshTokenTTL time.Duration
+	refreshTimer    *time.Timer
+
 	mu     sync.RWMutex
 	logger *slog.Logger
 	closed bool
@@ -269,10 +276,12 @@ type ParticipantParams struct {
 	Grants     *proto.ClaimGrants
 	Router     *mediasoup.Router
 
-	AutoSubscribe bool
-	PingInterval  time.Duration
-	PingTimeout   time.Duration
-	StatsInterval time.Duration
+	AutoSubscribe   bool
+	PingInterval    time.Duration
+	PingTimeout     time.Duration
+	StatsInterval   time.Duration
+	TokenVerifier   *auth.TokenVerifier
+	RefreshTokenTTL time.Duration
 }
 
 const msgQueueSize = 256
@@ -300,6 +309,8 @@ func NewParticipant(params ParticipantParams) *Participant {
 		pingInterval:        params.PingInterval,
 		pingTimeout:         params.PingTimeout,
 		statsInterval:       params.StatsInterval,
+		tokenVerifier:       params.TokenVerifier,
+		refreshTokenTTL:     params.RefreshTokenTTL,
 		logger: slog.Default().With("component", "Participant",
 			"identity", params.Identity, "sid", params.Sid),
 	}
@@ -331,6 +342,56 @@ func (p *Participant) CanSubscribe() bool {
 
 func (p *Participant) CanPublish() bool {
 	return p.permission != nil && p.permission.CanPublish
+}
+
+// SetRefreshToken stores the refresh token and starts the background refresh scheduler.
+func (p *Participant) SetRefreshToken(token string) {
+	p.mu.Lock()
+	p.refreshToken = token
+	p.mu.Unlock()
+	p.scheduleTokenRefresh()
+}
+
+func (p *Participant) RefreshToken() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.refreshToken
+}
+
+// scheduleTokenRefresh sets a timer to push a new refresh token to the client
+// before the current one expires. Fires at 90% of the TTL.
+func (p *Participant) scheduleTokenRefresh() {
+	if p.tokenVerifier == nil || p.refreshTokenTTL == 0 {
+		return
+	}
+	p.mu.Lock()
+	if p.refreshTimer != nil {
+		p.refreshTimer.Stop()
+	}
+	delay := time.Duration(float64(p.refreshTokenTTL) * 0.9)
+	p.refreshTimer = time.AfterFunc(delay, func() {
+		p.mu.RLock()
+		oldToken := p.refreshToken
+		closed := p.closed
+		p.mu.RUnlock()
+		if closed || oldToken == "" {
+			return
+		}
+		newToken, err := p.tokenVerifier.RefreshToken(oldToken, p.refreshTokenTTL)
+		if err != nil {
+			p.logger.Warn("Failed to refresh token", "error", err)
+			return
+		}
+		p.mu.Lock()
+		p.refreshToken = newToken
+		p.mu.Unlock()
+		_ = p.SendNotification(proto.MethodTokenRefreshed, &proto.TokenRefreshedNotification{
+			Token: newToken,
+		})
+		p.logger.Info("Refresh token pushed to client")
+		p.scheduleTokenRefresh()
+	})
+	p.mu.Unlock()
 }
 
 func (p *Participant) GetGroupId() string {
@@ -1344,6 +1405,9 @@ func (p *Participant) Close(reason proto.DisconnectReason) {
 
 	if p.pingTimer != nil {
 		p.pingTimer.Stop()
+	}
+	if p.refreshTimer != nil {
+		p.refreshTimer.Stop()
 	}
 
 	for _, ch := range p.pendingRPC {

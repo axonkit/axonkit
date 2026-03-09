@@ -37,9 +37,6 @@ func (p *Participant) dispatchRPC(msg *proto.Message) {
 	case proto.MethodLeave:
 		body, status, errMsg = p.handleLeave(msg)
 
-	case proto.MethodTokenRefresh:
-		body, status, errMsg = p.handleTokenRefresh(msg)
-
 	case proto.MethodTrackPublish:
 		body, status, errMsg = p.handleTrackPublish(msg)
 
@@ -284,9 +281,6 @@ func (p *Participant) handleLeave(msg *proto.Message) (any, int, string) {
 	return nil, proto.StatusOK, ""
 }
 
-func (p *Participant) handleTokenRefresh(msg *proto.Message) (any, int, string) {
-	return nil, proto.StatusOK, ""
-}
 
 func (p *Participant) handleTrackPublish(msg *proto.Message) (any, int, string) {
 	var req proto.PublishTrackRequest

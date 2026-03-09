@@ -173,27 +173,50 @@ func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, 
 	var claims *auth.Claims
 	if !s.cfg.Debug {
 		if req.Token == "" {
-			writeJSON(w, http.StatusUnauthorized, proto.ErrorResponse{
-				Code: proto.ErrCodeInvalidToken, Error: "token required"})
-			return
-		}
-		var err error
-		claims, err = s.verifier.Verify(req.Token)
-		if err != nil {
-			writeJSON(w, http.StatusUnauthorized, proto.ErrorResponse{
-				Code: proto.ErrCodeInvalidToken, Error: err.Error()})
-			return
+			if !s.cfg.Auth.AllowAnonymous {
+				writeJSON(w, http.StatusUnauthorized, proto.ErrorResponse{
+					Code: proto.ErrCodeInvalidToken, Error: "token required"})
+				return
+			}
+			// Anonymous mode: generate a unique identity with default grants.
+			roomName := ""
+			if req.Room != nil {
+				roomName = req.Room.Name
+			}
+			anonIdentity := "anon_" + xid.New().String()
+			claims = &auth.Claims{
+				Sub:  anonIdentity,
+				Name: anonIdentity,
+				Grants: &proto.ClaimGrants{
+					Identity: anonIdentity,
+					Video: &proto.VideoGrant{
+						RoomJoin:     true,
+						Room:         roomName,
+						CanPublish:   true,
+						CanSubscribe: true,
+					},
+				},
+			}
+		} else {
+			var err error
+			claims, err = s.verifier.Verify(req.Token)
+			if err != nil {
+				writeJSON(w, http.StatusUnauthorized, proto.ErrorResponse{
+					Code: proto.ErrCodeInvalidToken, Error: err.Error()})
+				return
+			}
 		}
 	} else {
 		roomName := ""
 		if req.Room != nil {
 			roomName = req.Room.Name
 		}
+		debugIdentity := "debug_" + xid.New().String()
 		claims = &auth.Claims{
-			Sub:  req.DisplayName,
-			Name: req.DisplayName,
+			Sub:  debugIdentity,
+			Name: debugIdentity,
 			Grants: &proto.ClaimGrants{
-				Identity: req.DisplayName,
+				Identity: debugIdentity,
 				Video: &proto.VideoGrant{
 					RoomJoin: true,
 					Room:     roomName,
@@ -224,7 +247,7 @@ func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, 
 
 	identity := claims.Identity()
 	if identity == "" {
-		identity = req.DisplayName
+		identity = claims.Name
 	}
 
 	autoSubscribe := s.cfg.Room.AutoSubscribe
@@ -233,17 +256,19 @@ func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, 
 	}
 
 	participant := rtc.NewParticipant(rtc.ParticipantParams{
-		Sid:           participantSid,
-		Identity:      identity,
-		Name:          claims.Name,
-		Metadata:      req.Metadata,
-		Attributes:    req.ParticipantAttributes,
-		Grants:        claims.Grants,
-		Router:        router,
-		AutoSubscribe: autoSubscribe,
-		PingInterval:  s.cfg.Room.PingInterval,
-		PingTimeout:   s.cfg.Room.PingTimeout,
-		StatsInterval: s.cfg.Room.StatsInterval,
+		Sid:             participantSid,
+		Identity:        identity,
+		Name:            claims.Name,
+		Metadata:        req.Metadata,
+		Attributes:      req.ParticipantAttributes,
+		Grants:          claims.Grants,
+		Router:          router,
+		AutoSubscribe:   autoSubscribe,
+		PingInterval:    s.cfg.Room.PingInterval,
+		PingTimeout:     s.cfg.Room.PingTimeout,
+		StatsInterval:   s.cfg.Room.StatsInterval,
+		TokenVerifier:   s.verifier,
+		RefreshTokenTTL: s.cfg.Auth.RefreshTokenTTL,
 	})
 
 	sendTransport, recvTransport, directTransport, err := s.createTransports(router, webRtcServer)
@@ -291,6 +316,38 @@ func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, 
 
 	fullReconnect := req.ParticipantSid != ""
 
+	// Generate a long-lived refresh token for reconnection.
+	var refreshTokenStr string
+	ttl := s.cfg.Auth.RefreshTokenTTL
+	if ttl == 0 {
+		ttl = 7 * 24 * time.Hour
+	}
+	if s.verifier != nil && req.Token != "" {
+		rt, err := s.verifier.RefreshToken(req.Token, ttl)
+		if err == nil {
+			refreshTokenStr = rt
+			participant.SetRefreshToken(rt)
+		} else {
+			slog.Warn("Failed to generate refresh token", "error", err)
+		}
+	} else if s.verifier != nil && claims != nil {
+		// Anonymous or debug mode: generate a fresh token from constructed claims.
+		at := auth.NewAccessToken(s.cfg.Auth.APIKey, s.cfg.Auth.APISecret)
+		at.SetIdentity(claims.Sub).SetName(claims.Name).SetGrants(claims.Grants).SetTTL(ttl)
+		rt, err := at.Sign()
+		if err == nil {
+			refreshTokenStr = rt
+			participant.SetRefreshToken(rt)
+		} else {
+			slog.Warn("Failed to generate refresh token for anonymous user", "error", err)
+		}
+	}
+
+	var icePolicy string
+	if req.ConnectionSettings != nil && req.ConnectionSettings.ForceTcp {
+		icePolicy = "relay"
+	}
+
 	resp := proto.JoinResponse{
 		Room:          room.ToProto(),
 		Participant:   participant.ToProto(),
@@ -302,11 +359,13 @@ func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, 
 			Region:   string(s.node.Region),
 			Protocol: 1,
 		},
-		SendTransport:    s.transportToProto(sendTransport),
-		ReceiveTransport: s.transportToProto(recvTransport),
-		Signal:           sig.info,
-		RtpCapabilities:  router.RtpCapabilities(),
-		FullReconnect:    fullReconnect,
+		SendTransport:      s.transportToProto(sendTransport),
+		ReceiveTransport:   s.transportToProto(recvTransport),
+		Signal:             sig.info,
+		RtpCapabilities:    router.RtpCapabilities(),
+		FullReconnect:      fullReconnect,
+		RefreshToken:       refreshTokenStr,
+		IceTransportPolicy: icePolicy,
 	}
 
 	w.Header().Set("X-Node-Id", string(s.node.ID))
@@ -522,6 +581,24 @@ func (s *Server) handleReconnect(w http.ResponseWriter, req *proto.JoinRequest, 
 }
 
 func (s *Server) handleReconnectLocal(w http.ResponseWriter, req *proto.JoinRequest, logId string) {
+	// Validate reconnect credentials: prefer refreshToken, fall back to original token.
+	if !s.cfg.Debug {
+		tokenToVerify := req.RefreshToken
+		if tokenToVerify == "" {
+			tokenToVerify = req.Token
+		}
+		if tokenToVerify == "" {
+			writeJSON(w, http.StatusUnauthorized, proto.ErrorResponse{
+				Code: proto.ErrCodeInvalidToken, Error: "refresh token or token required for reconnect"})
+			return
+		}
+		if _, err := s.verifier.Verify(tokenToVerify); err != nil {
+			writeJSON(w, http.StatusUnauthorized, proto.ErrorResponse{
+				Code: proto.ErrCodeInvalidToken, Error: err.Error()})
+			return
+		}
+	}
+
 	participant := s.roomManager.GetParticipantBySid(req.ParticipantSid)
 	if participant != nil {
 		// Fast path: server still has session — ICE restart only.
@@ -553,7 +630,12 @@ func (s *Server) handleIceRestart(w http.ResponseWriter, participant *rtc.Partic
 
 // handleFullReconnect executes a full join flow and sets FullReconnect=true
 // so the client knows to clean up old resources and re-publish tracks.
+// If the original token is missing/expired but a valid refreshToken is present,
+// the refreshToken is promoted to the primary token for the join flow.
 func (s *Server) handleFullReconnect(w http.ResponseWriter, req *proto.JoinRequest, logId string) {
+	if req.Token == "" && req.RefreshToken != "" {
+		req.Token = req.RefreshToken
+	}
 	req.Reconnect = false
 	s.handleJoinLocal(w, req, logId)
 }

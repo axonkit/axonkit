@@ -52,9 +52,11 @@ type WebRtcConfig struct {
 }
 
 type AuthConfig struct {
-	APIKey    string        `json:"apiKey"`
-	APISecret string        `json:"apiSecret"`
-	TokenTTL  time.Duration `json:"tokenTtl"`
+	APIKey          string        `json:"apiKey"`
+	APISecret       string        `json:"apiSecret"`
+	TokenTTL        time.Duration `json:"tokenTtl"`
+	RefreshTokenTTL time.Duration `json:"refreshTokenTtl"`
+	AllowAnonymous  bool          `json:"allowAnonymous"`
 }
 
 type NatsConfig struct {
@@ -89,7 +91,8 @@ func DefaultConfig() *Config {
 			},
 		},
 		Auth: AuthConfig{
-			TokenTTL: 6 * time.Hour,
+			TokenTTL:        6 * time.Hour,
+			RefreshTokenTTL: 7 * 24 * time.Hour,
 		},
 		Debug: false,
 	}

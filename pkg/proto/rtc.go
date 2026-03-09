@@ -12,7 +12,7 @@ import (
 
 type JoinRequest struct {
 	Token                 string              `json:"token,omitempty"`
-	DisplayName           string              `json:"displayName,omitempty"`
+	RefreshToken          string              `json:"refreshToken,omitempty"`
 	Room                  *CreateRoomRequest  `json:"room,omitempty"`
 	ClientInfo            *ClientInfo         `json:"clientInfo,omitempty"`
 	ConnectionSettings    *ConnectionSettings `json:"connectionSettings,omitempty"`
@@ -76,6 +76,8 @@ type JoinResponse struct {
 	Signal              *SignalInfo                `json:"signal,omitempty"`
 	RtpCapabilities     *mediasoup.RtpCapabilities `json:"rtpCapabilities,omitempty"`
 	FullReconnect       bool                       `json:"fullReconnect,omitempty"`
+	RefreshToken        string                     `json:"refreshToken,omitempty"`
+	IceTransportPolicy  string                     `json:"iceTransportPolicy,omitempty"`
 }
 
 // ReconnectResponse is returned when a participant reconnects via ICE restart
@@ -302,14 +304,10 @@ type UpdateSubscriptionPermissionsRequest struct {
 }
 
 // ============================================================
-// Datachannel RPC: Token Refresh
+// Server -> Client: Token Refresh Notification
 // ============================================================
 
-type RefreshTokenRequest struct {
-	Token string `json:"token"`
-}
-
-type RefreshTokenResponse struct {
+type TokenRefreshedNotification struct {
 	Token string `json:"token"`
 }
 

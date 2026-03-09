@@ -19,9 +19,6 @@ const (
 	MethodPing  = "ping"
 	MethodPong  = "pong"
 
-	// Client -> Server: Token
-	MethodTokenRefresh = "token.refresh"
-
 	// Client -> Server: Track operations
 	MethodTrackPublish   = "track.publish"
 	MethodTrackUnpublish = "track.unpublish"
@@ -90,6 +87,9 @@ const (
 	MethodActiveSpeakersChanged          = "activeSpeakers.changed"
 	MethodRoomUpdated                    = "room.updated"
 	MethodDisconnect                     = "disconnect"
+
+	// Server -> Client: Token refresh
+	MethodTokenRefreshed = "token.refreshed"
 
 	// Server -> Client: Group notifications
 	MethodGroupCreated            = "group.created"
