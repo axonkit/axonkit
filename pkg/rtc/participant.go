@@ -950,12 +950,19 @@ func (p *Participant) Subscribe(track *PublishedTrack, publisher *Participant) e
 	consumer.OnClose(func(ctx context.Context) {
 		p.mu.Lock()
 		delete(p.subscriptions, sub.sid)
+		closed := p.closed
 		p.mu.Unlock()
 
 		track.removeConsumer(consumer.Id())
 
 		if p.room != nil && p.room.cascade.ReleaseStream != nil {
 			p.room.cascade.ReleaseStream(track.sid)
+		}
+
+		if !closed {
+			_ = p.SendNotification(proto.MethodSubscriptionClosed, &proto.SubscriptionClosedNotification{
+				SubscriptionSid: sub.sid,
+			})
 		}
 	})
 
@@ -1045,10 +1052,17 @@ func (p *Participant) SubscribeData(track *DataPublishedTrack, publisher *Partic
 	dataConsumer.OnClose(func(ctx context.Context) {
 		p.mu.Lock()
 		delete(p.dataSubscriptions, sub.sid)
+		closed := p.closed
 		p.mu.Unlock()
 
 		if p.room != nil && p.room.cascade.ReleaseStream != nil {
 			p.room.cascade.ReleaseStream(track.sid)
+		}
+
+		if !closed {
+			_ = p.SendNotification(proto.MethodDataSubscriptionClosed, &proto.DataSubscriptionClosedNotification{
+				DataSubscriptionSid: sub.sid,
+			})
 		}
 	})
 

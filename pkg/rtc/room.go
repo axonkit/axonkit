@@ -238,25 +238,46 @@ func (r *Room) handleRemoteTrackSubEvent(evt RoomStoreEvent) {
 }
 
 func (r *Room) AddParticipant(p *Participant) error {
+	// First pass: detect duplicate identity and check capacity.
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return ErrRoomClosed
+	}
+
+	var existing *Participant
+	for _, ep := range r.participants {
+		if ep.identity == p.identity && ep.sid != p.sid {
+			existing = ep
+			break
+		}
+	}
+
+	effectiveCount := len(r.participants)
+	if existing != nil {
+		effectiveCount--
+	}
+	if r.config.MaxParticipants > 0 && effectiveCount >= r.config.MaxParticipants {
+		r.mu.Unlock()
+		return ErrRoomFull
+	}
+	r.mu.Unlock()
+
+	// Close old participant synchronously (outside the lock) so its
+	// producers/consumers are fully torn down before the new one is added.
+	// Close() internally calls RemoveParticipant which handles broadcast
+	// and store cleanup.
+	if existing != nil {
+		r.logger.Info("Kicking duplicate identity", "identity", p.identity, "oldSid", existing.sid)
+		existing.Close(proto.DisconnectReason_DUPLICATE_IDENTITY)
+	}
+
+	// Second pass: add the new participant.
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if r.closed {
 		return ErrRoomClosed
-	}
-
-	if r.config.MaxParticipants > 0 && len(r.participants) >= r.config.MaxParticipants {
-		return ErrRoomFull
-	}
-
-	// Kick existing participant with same identity
-	for _, existing := range r.participants {
-		if existing.identity == p.identity && existing.sid != p.sid {
-			r.logger.Info("Kicking duplicate identity", "identity", p.identity, "oldSid", existing.sid)
-			go existing.Close(proto.DisconnectReason_DUPLICATE_IDENTITY)
-			delete(r.participants, existing.sid)
-			break
-		}
 	}
 
 	r.participants[p.sid] = p
