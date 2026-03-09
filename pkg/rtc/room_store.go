@@ -232,17 +232,46 @@ func (s *RoomStore) GetMessagesSince(since int64) []*proto.ChatMessageNotificati
 	return result
 }
 
+// --- Track Subscription (dynacast cross-node) ---
+
+// TrackSubInfo is the per-layer subscription state for one track on one node.
+// Key: room.<roomName>.tracksub.<trackSid>.<nodeId>
+type TrackSubInfo struct {
+	TrackSid string  `json:"trackSid"`
+	NodeId   string  `json:"nodeId"`
+	Layers   [3]bool `json:"layers"` // [LOW, MEDIUM, HIGH] — which layers have active subscribers
+}
+
+func (s *RoomStore) PutTrackSub(info *TrackSubInfo) {
+	key := fmt.Sprintf("%s.tracksub.%s.%s", s.prefix(), info.TrackSid, info.NodeId)
+	data, err := json.Marshal(info)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = s.kv.Put(ctx, key, data)
+}
+
+func (s *RoomStore) DeleteTrackSub(trackSid string) {
+	key := fmt.Sprintf("%s.tracksub.%s.%s", s.prefix(), trackSid, s.nodeID)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = s.kv.Delete(ctx, key)
+}
+
 // --- Watch ---
 
 // RoomStoreEvent represents a change observed from the shared store.
 type RoomStoreEvent struct {
-	Type      string // "participant", "group", "msg"
+	Type      string // "participant", "group", "msg", "tracksub"
 	Operation store.Operation
-	Key       string // the sub-key (sid, groupId, msgId)
+	Key       string // the sub-key (sid, groupId, msgId, trackSid.nodeId)
 
 	Participant *proto.ParticipantInfo
 	Group       *proto.GroupInfo
 	Message     *proto.ChatMessageNotification
+	TrackSub    *TrackSubInfo
 }
 
 // Watch starts watching all keys under this room prefix. Events from the
@@ -310,6 +339,11 @@ func (s *RoomStore) parseEvent(entry store.Entry) (RoomStoreEvent, bool) {
 			if json.Unmarshal(entry.Value(), &msg) == nil {
 				evt.Message = &msg
 			}
+		case "tracksub":
+			var info TrackSubInfo
+			if json.Unmarshal(entry.Value(), &info) == nil {
+				evt.TrackSub = &info
+			}
 		}
 	}
 
@@ -336,6 +370,16 @@ func (s *RoomStore) CleanupLocal() {
 		}
 		var info proto.ParticipantInfo
 		if json.Unmarshal(entry.Value(), &info) == nil && info.NodeId == s.nodeID {
+			_ = s.kv.Delete(ctx, k)
+		}
+	}
+
+	// Remove local track subscriptions.
+	subPattern := fmt.Sprintf("%s.tracksub.>", s.prefix())
+	subKeys, _ := s.kv.Keys(ctx, subPattern)
+	for _, k := range subKeys {
+		// tracksub.<trackSid>.<nodeId> — last segment is nodeId
+		if strings.HasSuffix(k, "."+s.nodeID) {
 			_ = s.kv.Delete(ctx, k)
 		}
 	}

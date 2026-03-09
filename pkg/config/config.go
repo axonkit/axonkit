@@ -76,8 +76,8 @@ func DefaultConfig() *Config {
 			MaxParticipants:  100,
 			AutoSubscribe:    true,
 			Dynacast:         true,
-			PingInterval:     5 * time.Second,
-			PingTimeout:      15 * time.Second,
+			PingInterval:     15 * time.Second,
+			PingTimeout:      30 * time.Second,
 			StatsInterval:    10 * time.Second,
 		},
 		Media: MediaConfig{

@@ -50,9 +50,9 @@ const (
 	MethodStatsReport = "stats.report"
 
 	// Client -> Server: Manual subscription control
-	MethodSubscriptionSubscribe          = "subscription.subscribe"
-	MethodSubscriptionUnsubscribe        = "subscription.unsubscribe"
-	MethodSubscriptionUpdatePermissions  = "subscription.updatePermissions"
+	MethodSubscriptionSubscribe         = "subscription.subscribe"
+	MethodSubscriptionUnsubscribe       = "subscription.unsubscribe"
+	MethodSubscriptionUpdatePermissions = "subscription.updatePermissions"
 
 	// Client -> Server: Group (breakout room) operations
 	MethodGroupCreate = "group.create"
@@ -92,10 +92,10 @@ const (
 	MethodTokenRefreshed = "token.refreshed"
 
 	// Server -> Client: Group notifications
-	MethodGroupCreated            = "group.created"
-	MethodGroupDeleted            = "group.deleted"
-	MethodGroupParticipantJoined  = "group.participantJoined"
-	MethodGroupParticipantLeft    = "group.participantLeft"
+	MethodGroupCreated           = "group.created"
+	MethodGroupDeleted           = "group.deleted"
+	MethodGroupParticipantJoined = "group.participantJoined"
+	MethodGroupParticipantLeft   = "group.participantLeft"
 )
 
 // Status codes, HTTP-compatible.

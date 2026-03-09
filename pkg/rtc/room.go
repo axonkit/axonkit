@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -98,7 +99,7 @@ func (r *Room) Store() *RoomStore    { return r.roomStore }
 
 func (r *Room) SetOnClose(fn func(*Room)) { r.onClose = fn }
 
-// SetupStore initialises the cross-node RoomStore and starts watching for
+// SetupStore initializes the cross-node RoomStore and starts watching for
 // remote changes. Must be called after NewRoom and before participants join.
 func (r *Room) SetupStore(kv store.Store, nodeID string) {
 	r.roomStore = NewRoomStore(kv, r.name, nodeID)
@@ -131,6 +132,12 @@ func (r *Room) processStoreEvents(ch <-chan RoomStoreEvent, localNodeID string) 
 		case "msg":
 			if evt.Message != nil {
 				r.handleRemoteChatEvent(evt)
+			}
+		case "tracksub":
+			if evt.TrackSub != nil && evt.TrackSub.NodeId != localNodeID {
+				r.handleRemoteTrackSubEvent(evt)
+			} else if evt.Operation == store.OpDelete {
+				r.handleRemoteTrackSubEvent(evt)
 			}
 		}
 	}
@@ -204,6 +211,30 @@ func (r *Room) handleRemoteChatEvent(evt RoomStoreEvent) {
 	r.mu.Unlock()
 
 	r.BroadcastNotification(proto.MethodChatMessage, evt.Message, "")
+}
+
+func (r *Room) handleRemoteTrackSubEvent(evt RoomStoreEvent) {
+	// evt.Key format: <trackSid>.<nodeId>
+	parts := strings.SplitN(evt.Key, ".", 2)
+	if len(parts) != 2 {
+		return
+	}
+	trackSid := parts[0]
+	nodeID := parts[1]
+
+	track := r.FindPublishedTrack(trackSid)
+	if track == nil {
+		return
+	}
+
+	switch evt.Operation {
+	case store.OpPut:
+		if evt.TrackSub != nil {
+			track.updateRemoteSubscription(nodeID, evt.TrackSub)
+		}
+	case store.OpDelete:
+		track.removeRemoteSubscription(nodeID)
+	}
 }
 
 func (r *Room) AddParticipant(p *Participant) error {

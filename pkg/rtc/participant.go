@@ -30,10 +30,11 @@ type PublishedTrack struct {
 
 	// Dynacast: track which consumers are active and their max spatial layer.
 	// Protected by mu.
-	mu                sync.Mutex
-	activeConsumers   map[string]*consumerLayerState // consumerID → state
-	lastQualities     [3]bool                        // [LOW, MEDIUM, HIGH] last notified
-	publisher         *Participant
+	mu                  sync.Mutex
+	activeConsumers     map[string]*consumerLayerState // consumerID → state (local node)
+	remoteSubscriptions map[string]*TrackSubInfo       // nodeID → aggregated state (other nodes)
+	lastQualities       [3]bool                        // [LOW, MEDIUM, HIGH] last notified
+	publisher           *Participant
 }
 
 type consumerLayerState struct {
@@ -61,6 +62,7 @@ func (t *PublishedTrack) addConsumer(consumerID string) {
 		return
 	}
 	t.activeConsumers[consumerID] = &consumerLayerState{spatialLayer: -1}
+	t.recalcLocked()
 }
 
 // removeConsumer unregisters a consumer and triggers recalculation.
@@ -84,6 +86,7 @@ func (t *PublishedTrack) updateConsumerLayers(consumerID string, spatialLayer in
 	if st, ok := t.activeConsumers[consumerID]; ok {
 		st.spatialLayer = spatialLayer
 	}
+	slog.Info("updateConsumerLayers", "consumerID", consumerID, "spatialLayer", spatialLayer)
 	t.recalcLocked()
 }
 
@@ -100,29 +103,66 @@ func (t *PublishedTrack) updateConsumerPaused(consumerID string, paused bool) {
 	t.recalcLocked()
 }
 
-// recalcLocked computes the aggregate subscription state for video tracks and
+// updateRemoteSubscription updates the subscription state from a remote node.
+func (t *PublishedTrack) updateRemoteSubscription(nodeID string, info *TrackSubInfo) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.remoteSubscriptions == nil {
+		t.remoteSubscriptions = make(map[string]*TrackSubInfo)
+	}
+	if info == nil || info.Layers == [3]bool{} {
+		delete(t.remoteSubscriptions, nodeID)
+	} else {
+		t.remoteSubscriptions[nodeID] = info
+	}
+	t.recalcLocked()
+}
+
+// removeRemoteSubscription removes a remote node's subscription state.
+func (t *PublishedTrack) removeRemoteSubscription(nodeID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.remoteSubscriptions == nil {
+		return
+	}
+	delete(t.remoteSubscriptions, nodeID)
+	t.recalcLocked()
+}
+
+// recalcLocked computes the per-layer subscription state for video tracks and
 // notifies the publisher via track.subscribedQualityChanged. Must be called
 // with mu held. Dynacast only applies to video; audio tracks are ignored.
+//
+// Each layer is tracked independently: a layer is enabled only if at least one
+// (local or remote) subscriber needs it. This avoids sending unused layers in
+// simulcast. For SVC the client uses a single encoding, so any-enabled logic
+// is sufficient.
 func (t *PublishedTrack) recalcLocked() {
 	if t.publisher == nil || t.kind != mediasoup.MediaKindVideo {
 		return
 	}
 
-	maxNeeded := int32(-1)
+	var q [3]bool
+
+	// Local consumers — each consumer marks the specific layer it needs.
 	for _, st := range t.activeConsumers {
 		if st.paused {
 			continue
 		}
 		if st.spatialLayer < 0 {
-			maxNeeded = 2
-		} else if st.spatialLayer > maxNeeded {
-			maxNeeded = st.spatialLayer
+			q[0], q[1], q[2] = true, true, true
+		} else if st.spatialLayer >= 0 && st.spatialLayer <= 2 {
+			q[st.spatialLayer] = true
 		}
 	}
 
-	var q [3]bool
-	for i := int32(0); i <= maxNeeded && i <= 2; i++ {
-		q[i] = true
+	// Remote node subscriptions — already per-layer.
+	for _, rs := range t.remoteSubscriptions {
+		for i, needed := range rs.Layers {
+			if needed {
+				q[i] = true
+			}
+		}
 	}
 
 	if q == t.lastQualities {
@@ -139,6 +179,43 @@ func (t *PublishedTrack) recalcLocked() {
 				{Quality: proto.VideoQuality_HIGH, Enabled: q[2]},
 			},
 		})
+
+	// Sync local consumer state to the shared store so that the publisher's
+	// node (if different) can include it in its dynacast calculation.
+	t.syncLocalSubToStore()
+}
+
+// syncLocalSubToStore writes the per-layer local consumer state for this
+// track to the shared store. Must be called with mu held.
+func (t *PublishedTrack) syncLocalSubToStore() {
+	if t.publisher == nil || t.publisher.room == nil || t.publisher.room.Store() == nil {
+		return
+	}
+
+	var layers [3]bool
+	for _, st := range t.activeConsumers {
+		if st.paused {
+			continue
+		}
+		if st.spatialLayer < 0 {
+			layers = [3]bool{true, true, true}
+			break
+		}
+		if st.spatialLayer >= 0 && st.spatialLayer <= 2 {
+			layers[st.spatialLayer] = true
+		}
+	}
+
+	rs := t.publisher.room.Store()
+	if layers == [3]bool{} {
+		go rs.DeleteTrackSub(t.sid)
+	} else {
+		go rs.PutTrackSub(&TrackSubInfo{
+			TrackSid: t.sid,
+			NodeId:   rs.nodeID,
+			Layers:   layers,
+		})
+	}
 }
 
 // DataPublishedTrack holds a published data track.
@@ -223,14 +300,14 @@ type Participant struct {
 	statsLogger   *slog.Logger
 	statsFile     *os.File
 
-	autoSubscribe                    bool
-	reconnecting                     bool
+	autoSubscribe                     bool
+	reconnecting                      bool
 	allParticipantsAllowedToSubscribe bool
 	trackPermissions                  []proto.TrackPermission
 
 	// Group (breakout room) membership
 	groupId        string                       // empty = main room
-	roomPermission *proto.ParticipantPermission  // saved room-level permission for restore
+	roomPermission *proto.ParticipantPermission // saved room-level permission for restore
 
 	// Node identification for cross-node sync
 	nodeId string
@@ -268,30 +345,30 @@ const msgQueueSize = 256
 
 func NewParticipant(params ParticipantParams) *Participant {
 	p := &Participant{
-		sid:                 params.Sid,
-		identity:            params.Identity,
-		name:                params.Name,
-		metadata:            params.Metadata,
-		attributes:          params.Attributes,
-		grants:              params.Grants,
-		router:              params.Router,
-		state:               proto.ParticipantInfo_JOINING,
-		joinedAt:            time.Now(),
-		publishedTracks:     make(map[string]*PublishedTrack),
-		dataPublishedTracks: make(map[string]*DataPublishedTrack),
-		subscriptions:       make(map[string]*Subscription),
-		dataSubscriptions:   make(map[string]*DataSubscription),
-		pendingRPC:          make(map[string]chan *proto.Message),
-		msgCh:               make(chan *proto.Message, msgQueueSize),
-		done:                make(chan struct{}),
+		sid:                               params.Sid,
+		identity:                          params.Identity,
+		name:                              params.Name,
+		metadata:                          params.Metadata,
+		attributes:                        params.Attributes,
+		grants:                            params.Grants,
+		router:                            params.Router,
+		state:                             proto.ParticipantInfo_JOINING,
+		joinedAt:                          time.Now(),
+		publishedTracks:                   make(map[string]*PublishedTrack),
+		dataPublishedTracks:               make(map[string]*DataPublishedTrack),
+		subscriptions:                     make(map[string]*Subscription),
+		dataSubscriptions:                 make(map[string]*DataSubscription),
+		pendingRPC:                        make(map[string]chan *proto.Message),
+		msgCh:                             make(chan *proto.Message, msgQueueSize),
+		done:                              make(chan struct{}),
 		autoSubscribe:                     params.AutoSubscribe,
 		allParticipantsAllowedToSubscribe: true,
-		pingInterval:        params.PingInterval,
-		pingTimeout:         params.PingTimeout,
-		statsInterval:       params.StatsInterval,
-		nodeId:              params.NodeId,
-		tokenVerifier:       params.TokenVerifier,
-		refreshTokenTTL:     params.RefreshTokenTTL,
+		pingInterval:                      params.PingInterval,
+		pingTimeout:                       params.PingTimeout,
+		statsInterval:                     params.StatsInterval,
+		nodeId:                            params.NodeId,
+		tokenVerifier:                     params.TokenVerifier,
+		refreshTokenTTL:                   params.RefreshTokenTTL,
 		logger: slog.Default().With("component", "Participant",
 			"identity", params.Identity, "sid", params.Sid),
 	}

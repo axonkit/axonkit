@@ -273,7 +273,6 @@ func (p *Participant) handleLeave(msg *proto.Message) (any, int, string) {
 	return nil, proto.StatusOK, ""
 }
 
-
 func (p *Participant) handleTrackPublish(msg *proto.Message) (any, int, string) {
 	var req proto.PublishTrackRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
