@@ -184,6 +184,7 @@ func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, 
 		if req.Room != nil {
 			roomName = req.Room.Name
 		}
+		boolTrue := true
 		anonIdentity := "anon_" + xid.New().String()
 		claims = &auth.Claims{
 			Sub:  anonIdentity,
@@ -193,8 +194,8 @@ func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, 
 				Video: &proto.VideoGrant{
 					RoomJoin:     true,
 					Room:         roomName,
-					CanPublish:   true,
-					CanSubscribe: true,
+					CanPublish:   &boolTrue,
+					CanSubscribe: &boolTrue,
 				},
 			},
 		}
