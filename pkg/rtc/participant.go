@@ -16,6 +16,8 @@ import (
 	"github.com/rs/xid"
 )
 
+const dynacastDowngradeDelay = 5 * time.Second
+
 // PublishedTrack holds a published media track and its signaling metadata.
 type PublishedTrack struct {
 	sid      string
@@ -34,6 +36,8 @@ type PublishedTrack struct {
 	activeConsumers     map[string]*consumerLayerState // consumerID → state (local node)
 	remoteSubscriptions map[string]*TrackSubInfo       // nodeID → aggregated state (other nodes)
 	lastQualities       [3]bool                        // [LOW, MEDIUM, HIGH] last notified
+	pendingQualities    [3]bool                        // qualities to send after debounce
+	debounceTimer       *time.Timer
 	publisher           *Participant
 }
 
@@ -51,6 +55,17 @@ func (t *PublishedTrack) ToProto() *proto.TrackInfo {
 		Width:  t.width,
 		Height: t.height,
 		Source: t.source,
+	}
+}
+
+// stopDebounce cancels any pending debounce timer. Safe to call from outside
+// the mu lock since it acquires mu internally.
+func (t *PublishedTrack) stopDebounce() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.debounceTimer != nil {
+		t.debounceTimer.Stop()
+		t.debounceTimer = nil
 	}
 }
 
@@ -128,14 +143,15 @@ func (t *PublishedTrack) removeRemoteSubscription(nodeID string) {
 	t.recalcLocked()
 }
 
-// recalcLocked computes the per-layer subscription state for video tracks and
-// notifies the publisher via track.subscribedQualityChanged. Must be called
-// with mu held. Dynacast only applies to video; audio tracks are ignored.
+// recalcLocked computes the per-layer subscription state for video tracks.
+// Must be called with mu held. Dynacast only applies to video.
 //
-// Each layer is tracked independently: a layer is enabled only if at least one
-// (local or remote) subscriber needs it. This avoids sending unused layers in
-// simulcast. For SVC the client uses a single encoding, so any-enabled logic
-// is sufficient.
+// Debounce strategy:
+//   - Upgrade (any layer false→true): notify publisher immediately so it can
+//     start sending the layer with minimal latency.
+//   - Downgrade only (some layers true→false, none false→true): delay
+//     notification by dynacastDowngradeDelay so that brief fluctuations
+//     (e.g. window resize, scroll) don't cause unnecessary layer toggling.
 func (t *PublishedTrack) recalcLocked() {
 	if t.publisher == nil || t.kind != mediasoup.MediaKindVideo {
 		return
@@ -165,10 +181,52 @@ func (t *PublishedTrack) recalcLocked() {
 	}
 
 	if q == t.lastQualities {
+		// No change — cancel any pending downgrade timer.
+		if t.debounceTimer != nil {
+			t.debounceTimer.Stop()
+			t.debounceTimer = nil
+		}
 		return
 	}
-	t.lastQualities = q
 
+	// Detect whether any layer is being upgraded (false → true).
+	hasUpgrade := false
+	for i := 0; i < 3; i++ {
+		if q[i] && !t.lastQualities[i] {
+			hasUpgrade = true
+			break
+		}
+	}
+
+	if hasUpgrade {
+		// Upgrade: cancel pending debounce and send immediately.
+		if t.debounceTimer != nil {
+			t.debounceTimer.Stop()
+			t.debounceTimer = nil
+		}
+		t.lastQualities = q
+		t.sendQualityNotification(q)
+	} else {
+		// Downgrade only: debounce — schedule a delayed send.
+		t.pendingQualities = q
+		if t.debounceTimer != nil {
+			t.debounceTimer.Stop()
+		}
+		t.debounceTimer = time.AfterFunc(dynacastDowngradeDelay, func() {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+			pending := t.pendingQualities
+			t.debounceTimer = nil
+			if pending == t.lastQualities {
+				return
+			}
+			t.lastQualities = pending
+			t.sendQualityNotification(pending)
+		})
+	}
+}
+
+func (t *PublishedTrack) sendQualityNotification(q [3]bool) {
 	_ = t.publisher.SendNotification(proto.MethodTrackSubscribedQualityChanged,
 		&proto.SubscribedQualityChangedNotification{
 			TrackSid: t.sid,
@@ -683,6 +741,7 @@ func (p *Participant) PublishTrack(req *proto.PublishTrackRequest) (*PublishedTr
 	p.mu.Unlock()
 
 	producer.OnClose(func(ctx context.Context) {
+		track.stopDebounce()
 		p.mu.Lock()
 		delete(p.publishedTracks, track.sid)
 		p.mu.Unlock()
