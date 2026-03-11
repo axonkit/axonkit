@@ -20,10 +20,11 @@ const (
 	MethodPong  = "pong"
 
 	// Client -> Server: Track operations
-	MethodTrackPublish   = "track.publish"
-	MethodTrackUnpublish = "track.unpublish"
-	MethodTrackMute      = "track.mute"
-	MethodTrackUpdate    = "track.update"
+	MethodTrackPublish       = "track.publish"
+	MethodTrackPublishBackup = "track.publishBackup"
+	MethodTrackUnpublish     = "track.unpublish"
+	MethodTrackMute          = "track.mute"
+	MethodTrackUpdate        = "track.update"
 
 	// Client -> Server: Data track operations
 	MethodDataTrackPublish   = "dataTrack.publish"

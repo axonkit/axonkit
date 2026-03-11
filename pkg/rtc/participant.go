@@ -30,6 +30,17 @@ type PublishedTrack struct {
 	height   uint32
 	appData  map[string]any
 
+	// Backup codec support
+	videoCodec        string
+	backupCodec       string
+	backupCodecPolicy proto.BackupCodecPolicy
+	backupProducer    *mediasoup.Producer
+	backupSid         string
+	regressed         bool                   // true after REGRESSION has fired
+	pendingBackupSubs []*pendingBackupSub    // subscribers waiting for backup producer
+	backupConsumers   map[string]string      // consumerID → codec used ("primary"/"backup")
+	backupRequested   bool                   // true once we've asked the publisher for backup
+
 	// Dynacast: track which consumers are active and their max spatial layer.
 	// Protected by mu.
 	mu                  sync.Mutex
@@ -41,6 +52,13 @@ type PublishedTrack struct {
 	publisher           *Participant
 }
 
+// pendingBackupSub holds a subscriber that failed to consume the primary
+// codec and is waiting for the backup producer to be published.
+type pendingBackupSub struct {
+	subscriber *Participant
+	publisher  *Participant
+}
+
 type consumerLayerState struct {
 	paused       bool
 	spatialLayer int32 // -1 means unset (use all)
@@ -48,13 +66,14 @@ type consumerLayerState struct {
 
 func (t *PublishedTrack) ToProto() *proto.TrackInfo {
 	return &proto.TrackInfo{
-		Sid:    t.sid,
-		Kind:   t.kind,
-		Name:   t.name,
-		Muted:  t.muted,
-		Width:  t.width,
-		Height: t.height,
-		Source: t.source,
+		Sid:               t.sid,
+		Kind:              t.kind,
+		Name:              t.name,
+		Muted:             t.muted,
+		Width:             t.width,
+		Height:            t.height,
+		Source:            t.source,
+		BackupCodecPolicy: t.backupCodecPolicy,
 	}
 }
 
@@ -120,16 +139,29 @@ func (t *PublishedTrack) updateConsumerPaused(consumerID string, paused bool) {
 // updateRemoteSubscription updates the subscription state from a remote node.
 func (t *PublishedTrack) updateRemoteSubscription(nodeID string, info *TrackSubInfo) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if t.remoteSubscriptions == nil {
 		t.remoteSubscriptions = make(map[string]*TrackSubInfo)
 	}
-	if info == nil || info.Layers == [3]bool{} {
+	if info == nil || (info.Layers == [3]bool{} && !info.HasBackupSub) {
 		delete(t.remoteSubscriptions, nodeID)
 	} else {
 		t.remoteSubscriptions[nodeID] = info
 	}
+
+	// If a remote node needs the backup codec and we haven't requested it yet,
+	// trigger the backup codec request.
+	needBackupRequest := false
+	if info != nil && info.HasBackupSub && t.backupCodec != "" && !t.backupRequested && t.backupProducer == nil {
+		needBackupRequest = true
+		t.backupRequested = true
+	}
+
 	t.recalcLocked()
+	t.mu.Unlock()
+
+	if needBackupRequest {
+		t.requestBackupCodec()
+	}
 }
 
 // removeRemoteSubscription removes a remote node's subscription state.
@@ -227,15 +259,51 @@ func (t *PublishedTrack) recalcLocked() {
 }
 
 func (t *PublishedTrack) sendQualityNotification(q [3]bool) {
-	_ = t.publisher.SendNotification(proto.MethodTrackSubscribedQualityChanged,
-		&proto.SubscribedQualityChangedNotification{
-			TrackSid: t.sid,
-			SubscribedQualities: []proto.SubscribedQuality{
-				{Quality: proto.VideoQuality_LOW, Enabled: q[0]},
-				{Quality: proto.VideoQuality_MEDIUM, Enabled: q[1]},
-				{Quality: proto.VideoQuality_HIGH, Enabled: q[2]},
-			},
-		})
+	primaryQualities := []proto.SubscribedQuality{
+		{Quality: proto.VideoQuality_LOW, Enabled: q[0]},
+		{Quality: proto.VideoQuality_MEDIUM, Enabled: q[1]},
+		{Quality: proto.VideoQuality_HIGH, Enabled: q[2]},
+	}
+
+	notification := &proto.SubscribedQualityChangedNotification{
+		TrackSid:            t.sid,
+		SubscribedQualities: primaryQualities,
+	}
+
+	// When backup codec is active, include per-codec quality information
+	if t.backupCodec != "" && t.backupProducer != nil {
+		hasBackupConsumer := false
+		if t.backupConsumers != nil {
+			for _, codec := range t.backupConsumers {
+				if codec == "backup" {
+					hasBackupConsumer = true
+					break
+				}
+			}
+		}
+
+		codecs := []proto.SubscribedCodec{}
+		if t.videoCodec != "" {
+			codecs = append(codecs, proto.SubscribedCodec{
+				Codec:     t.videoCodec,
+				Qualities: primaryQualities,
+			})
+		}
+		if t.backupCodec != "" {
+			backupEnabled := hasBackupConsumer || len(t.pendingBackupSubs) > 0
+			codecs = append(codecs, proto.SubscribedCodec{
+				Codec: t.backupCodec,
+				Qualities: []proto.SubscribedQuality{
+					{Quality: proto.VideoQuality_LOW, Enabled: backupEnabled},
+					{Quality: proto.VideoQuality_MEDIUM, Enabled: backupEnabled},
+					{Quality: proto.VideoQuality_HIGH, Enabled: backupEnabled},
+				},
+			})
+		}
+		notification.SubscribedCodecs = codecs
+	}
+
+	_ = t.publisher.SendNotification(proto.MethodTrackSubscribedQualityChanged, notification)
 
 	// Sync local consumer state to the shared store so that the publisher's
 	// node (if different) can include it in its dynacast calculation.
@@ -263,15 +331,276 @@ func (t *PublishedTrack) syncLocalSubToStore() {
 		}
 	}
 
+	// Track whether any consumer uses the backup codec
+	hasBackupSub := false
+	if t.backupConsumers != nil {
+		for _, codec := range t.backupConsumers {
+			if codec == "backup" {
+				hasBackupSub = true
+				break
+			}
+		}
+	}
+
 	rs := t.publisher.room.Store()
-	if layers == [3]bool{} {
+	if layers == ([3]bool{}) && !hasBackupSub {
 		go rs.DeleteTrackSub(t.sid)
 	} else {
 		go rs.PutTrackSub(&TrackSubInfo{
-			TrackSid: t.sid,
-			NodeId:   rs.nodeID,
-			Layers:   layers,
+			TrackSid:     t.sid,
+			NodeId:       rs.nodeID,
+			Layers:       layers,
+			HasBackupSub: hasBackupSub,
+			BackupLayers: [3]bool{hasBackupSub, hasBackupSub, hasBackupSub},
 		})
+	}
+}
+
+// requestBackupCodec sends a SubscribedQualityChangedNotification with
+// subscribedCodecs to ask the publisher to start sending the backup codec.
+func (t *PublishedTrack) requestBackupCodec() {
+	if t.publisher == nil || t.backupCodec == "" {
+		return
+	}
+
+	notification := &proto.SubscribedQualityChangedNotification{
+		TrackSid:            t.sid,
+		SubscribedQualities: t.currentSubscribedQualities(),
+		SubscribedCodecs: []proto.SubscribedCodec{
+			{
+				Codec: t.videoCodec,
+				Qualities: []proto.SubscribedQuality{
+					{Quality: proto.VideoQuality_LOW, Enabled: true},
+					{Quality: proto.VideoQuality_MEDIUM, Enabled: true},
+					{Quality: proto.VideoQuality_HIGH, Enabled: true},
+				},
+			},
+			{
+				Codec: t.backupCodec,
+				Qualities: []proto.SubscribedQuality{
+					{Quality: proto.VideoQuality_LOW, Enabled: true},
+					{Quality: proto.VideoQuality_MEDIUM, Enabled: true},
+					{Quality: proto.VideoQuality_HIGH, Enabled: true},
+				},
+			},
+		},
+	}
+
+	t.publisher.logger.Info("Requesting backup codec from publisher",
+		"trackSid", t.sid, "backupCodec", t.backupCodec)
+	_ = t.publisher.SendNotification(proto.MethodTrackSubscribedQualityChanged, notification)
+}
+
+// currentSubscribedQualities returns the current quality state for backward compat.
+func (t *PublishedTrack) currentSubscribedQualities() []proto.SubscribedQuality {
+	t.mu.Lock()
+	q := t.lastQualities
+	t.mu.Unlock()
+	return []proto.SubscribedQuality{
+		{Quality: proto.VideoQuality_LOW, Enabled: q[0]},
+		{Quality: proto.VideoQuality_MEDIUM, Enabled: q[1]},
+		{Quality: proto.VideoQuality_HIGH, Enabled: q[2]},
+	}
+}
+
+// enableRegression returns true if the track's backup codec policy indicates
+// that codec regression should be performed.
+func (t *PublishedTrack) enableRegression() bool {
+	if t.publisher == nil || t.publisher.room == nil {
+		return false
+	}
+	switch t.backupCodecPolicy {
+	case proto.BackupCodecPolicy_REGRESSION:
+		return true
+	case proto.BackupCodecPolicy_PREFER_REGRESSION:
+		return t.publisher.room.ShouldRegressCodec()
+	default:
+		return false
+	}
+}
+
+// onBackupProducerReady is called when the backup producer has been created.
+// It processes pending subscribers and applies the regression policy.
+func (t *PublishedTrack) onBackupProducerReady() {
+	t.mu.Lock()
+	pending := t.pendingBackupSubs
+	t.pendingBackupSubs = nil
+	shouldRegress := t.enableRegression()
+	t.mu.Unlock()
+
+	// Subscribe all pending participants from the backup producer
+	for _, ps := range pending {
+		go func(ps *pendingBackupSub) {
+			ps.subscriber.mu.RLock()
+			transport := ps.subscriber.recvTransport
+			caps := ps.subscriber.rtpCapabilities
+			ps.subscriber.mu.RUnlock()
+
+			if transport == nil || caps == nil {
+				return
+			}
+			if err := ps.subscriber.consumeFromBackup(t, ps.publisher, transport, caps); err != nil {
+				t.publisher.logger.Warn("Failed to subscribe pending backup subscriber",
+					"error", err, "subscriber", ps.subscriber.identity)
+			}
+		}(ps)
+	}
+
+	if shouldRegress {
+		t.performRegression()
+	} else {
+		t.sendCodecQualityNotification(true, true)
+	}
+}
+
+// performRegression switches ALL existing primary-codec consumers to the
+// backup producer. After regression, the publisher is told to stop primary.
+func (t *PublishedTrack) performRegression() {
+	t.mu.Lock()
+	if t.regressed {
+		t.mu.Unlock()
+		return
+	}
+	t.regressed = true
+
+	// Collect all subscriptions using the primary codec
+	var primarySubs []*Participant
+	for consumerID, codec := range t.backupConsumers {
+		if codec == "primary" {
+			// Find the participant that owns this consumer
+			if sub := t.findSubscriberByConsumer(consumerID); sub != nil {
+				primarySubs = append(primarySubs, sub)
+			}
+		}
+	}
+	t.mu.Unlock()
+
+	t.publisher.logger.Info("Performing codec regression",
+		"trackSid", t.sid, "from", t.videoCodec, "to", t.backupCodec,
+		"affectedSubscribers", len(primarySubs))
+
+	// Re-subscribe each primary consumer from backup
+	for _, sub := range primarySubs {
+		go func(sub *Participant) {
+			// Close the existing primary subscription
+			sub.mu.RLock()
+			for _, s := range sub.subscriptions {
+				if s.trackSid == t.sid {
+					s.consumer.Close()
+					break
+				}
+			}
+			transport := sub.recvTransport
+			caps := sub.rtpCapabilities
+			sub.mu.RUnlock()
+
+			if transport == nil || caps == nil {
+				return
+			}
+			if err := sub.consumeFromBackup(t, t.publisher, transport, caps); err != nil {
+				t.publisher.logger.Warn("Regression re-subscribe failed",
+					"error", err, "subscriber", sub.identity)
+			}
+		}(sub)
+	}
+
+	// Notify publisher: stop primary, keep backup
+	t.sendCodecQualityNotification(false, true)
+}
+
+// findSubscriberByConsumer finds the participant that owns a given consumer.
+// Must be called with relevant locks held or in a context where the data is stable.
+func (t *PublishedTrack) findSubscriberByConsumer(consumerID string) *Participant {
+	if t.publisher == nil || t.publisher.room == nil {
+		return nil
+	}
+	t.publisher.room.mu.RLock()
+	defer t.publisher.room.mu.RUnlock()
+	for _, p := range t.publisher.room.participants {
+		p.mu.RLock()
+		for _, s := range p.subscriptions {
+			if s.consumer.Id() == consumerID {
+				p.mu.RUnlock()
+				return p
+			}
+		}
+		p.mu.RUnlock()
+	}
+	return nil
+}
+
+// sendCodecQualityNotification tells the publisher which codecs should be active.
+func (t *PublishedTrack) sendCodecQualityNotification(primaryEnabled, backupEnabled bool) {
+	if t.publisher == nil {
+		return
+	}
+
+	buildQualities := func(enabled bool) []proto.SubscribedQuality {
+		return []proto.SubscribedQuality{
+			{Quality: proto.VideoQuality_LOW, Enabled: enabled},
+			{Quality: proto.VideoQuality_MEDIUM, Enabled: enabled},
+			{Quality: proto.VideoQuality_HIGH, Enabled: enabled},
+		}
+	}
+
+	codecs := []proto.SubscribedCodec{}
+	if t.videoCodec != "" {
+		codecs = append(codecs, proto.SubscribedCodec{
+			Codec:     t.videoCodec,
+			Qualities: buildQualities(primaryEnabled),
+		})
+	}
+	if t.backupCodec != "" {
+		codecs = append(codecs, proto.SubscribedCodec{
+			Codec:     t.backupCodec,
+			Qualities: buildQualities(backupEnabled),
+		})
+	}
+
+	_ = t.publisher.SendNotification(proto.MethodTrackSubscribedQualityChanged,
+		&proto.SubscribedQualityChangedNotification{
+			TrackSid:            t.sid,
+			SubscribedQualities: t.currentSubscribedQualities(),
+			SubscribedCodecs:    codecs,
+		})
+}
+
+// checkCodecRegressionReversal checks if all remaining consumers can use
+// the primary codec, and if so, reverts the regression.
+func (t *PublishedTrack) checkCodecRegressionReversal() {
+	if t.backupCodec == "" || t.backupConsumers == nil {
+		return
+	}
+
+	t.mu.Lock()
+	hasBackupConsumer := false
+	for _, codec := range t.backupConsumers {
+		if codec == "backup" {
+			hasBackupConsumer = true
+			break
+		}
+	}
+	// Also consider remote nodes that need backup codec
+	if !hasBackupConsumer {
+		for _, rs := range t.remoteSubscriptions {
+			if rs.HasBackupSub {
+				hasBackupConsumer = true
+				break
+			}
+		}
+	}
+	wasRegressed := t.regressed
+	t.mu.Unlock()
+
+	if !hasBackupConsumer && wasRegressed {
+		t.mu.Lock()
+		t.regressed = false
+		t.mu.Unlock()
+		t.publisher.logger.Info("No backup consumers remain, reverting regression",
+			"trackSid", t.sid)
+		t.sendCodecQualityNotification(true, false)
+	} else if !hasBackupConsumer && t.backupProducer != nil {
+		t.sendCodecQualityNotification(true, false)
 	}
 }
 
@@ -719,16 +1048,23 @@ func (p *Participant) PublishTrack(req *proto.PublishTrackRequest) (*PublishedTr
 	}
 
 	track := &PublishedTrack{
-		sid:       string(types.NewStreamID(p.router.Id(), producer.Id())),
-		name:      req.Name,
-		source:    req.Source,
-		kind:      req.Kind,
-		producer:  producer,
-		muted:     req.Muted,
-		width:     req.Width,
-		height:    req.Height,
-		appData:   req.AppData,
-		publisher: p,
+		sid:               string(types.NewStreamID(p.router.Id(), producer.Id())),
+		name:              req.Name,
+		source:            req.Source,
+		kind:              req.Kind,
+		producer:          producer,
+		muted:             req.Muted,
+		width:             req.Width,
+		height:            req.Height,
+		appData:           req.AppData,
+		videoCodec:        req.VideoCodec,
+		backupCodec:       req.BackupCodec,
+		backupCodecPolicy: req.BackupCodecPolicy,
+		publisher:         p,
+	}
+
+	if req.BackupCodec != "" {
+		track.backupConsumers = make(map[string]string)
 	}
 
 	if p.room != nil && p.room.Dynacast() && req.Kind == mediasoup.MediaKindVideo {
@@ -754,6 +1090,73 @@ func (p *Participant) PublishTrack(req *proto.PublishTrackRequest) (*PublishedTr
 	}
 
 	return track, nil
+}
+
+// PublishBackupTrack creates a secondary producer for the backup codec
+// on an already-published video track and triggers pending subscriptions.
+func (p *Participant) PublishBackupTrack(req *proto.PublishBackupTrackRequest) (string, error) {
+	if !p.CanPublish() {
+		return "", fmt.Errorf("no publish permission")
+	}
+
+	p.mu.RLock()
+	track, ok := p.publishedTracks[req.TrackSid]
+	transport := p.sendTransport
+	p.mu.RUnlock()
+
+	if !ok || track == nil {
+		return "", fmt.Errorf("track not found: %s", req.TrackSid)
+	}
+	if transport == nil {
+		return "", fmt.Errorf("send transport not available")
+	}
+	if track.backupCodec == "" {
+		return "", fmt.Errorf("track has no backup codec configured")
+	}
+
+	track.mu.Lock()
+	if track.backupProducer != nil {
+		sid := track.backupSid
+		track.mu.Unlock()
+		return sid, nil
+	}
+	track.mu.Unlock()
+
+	producer, err := transport.Produce(&mediasoup.ProducerOptions{
+		Kind:          mediasoup.MediaKindVideo,
+		RtpParameters: req.RtpParameters,
+		Paused:        false,
+	})
+	if err != nil {
+		return "", fmt.Errorf("backup produce failed: %w", err)
+	}
+
+	backupSid := string(types.NewStreamID(p.router.Id(), producer.Id()))
+
+	track.mu.Lock()
+	track.backupProducer = producer
+	track.backupSid = backupSid
+	track.mu.Unlock()
+
+	producer.OnClose(func(ctx context.Context) {
+		track.mu.Lock()
+		track.backupProducer = nil
+		track.backupSid = ""
+		track.mu.Unlock()
+	})
+
+	p.logger.Info("Backup track published",
+		"trackSid", req.TrackSid, "backupSid", backupSid, "codec", track.backupCodec)
+
+	// Advertise backup stream for cross-node piping
+	if p.room != nil && p.room.cascade.OnTrackPublished != nil {
+		p.room.cascade.OnTrackPublished(backupSid)
+	}
+
+	// Process pending subscribers and apply regression policy
+	track.onBackupProducerReady()
+
+	return backupSid, nil
 }
 
 func (p *Participant) UnpublishTrack(trackSid string) error {
@@ -924,6 +1327,10 @@ func (p *Participant) GetDataPublishedTracks() []*DataPublishedTrack {
 // Subscribe creates a subscription for the given track on this participant's
 // receive transport. The subscription is created paused, the client is
 // notified via RPC, and only after acknowledgment is media resumed.
+//
+// When the primary codec is unsupported by the subscriber and a backup
+// codec is configured, the method falls back to the backup producer or
+// queues the subscriber until the backup producer becomes available.
 func (p *Participant) Subscribe(track *PublishedTrack, publisher *Participant) error {
 	p.mu.RLock()
 	transport := p.recvTransport
@@ -964,9 +1371,105 @@ func (p *Participant) Subscribe(track *PublishedTrack, publisher *Participant) e
 		Paused:          true,
 	})
 	if err != nil {
+		// Primary consume failed — try backup codec fallback
+		if track.backupCodec != "" {
+			return p.subscribeWithBackupFallback(track, publisher, transport, caps)
+		}
 		return fmt.Errorf("consume failed: %w", err)
 	}
 
+	if track.backupConsumers != nil {
+		track.mu.Lock()
+		track.backupConsumers[consumer.Id()] = "primary"
+		track.mu.Unlock()
+	}
+
+	return p.finishSubscribe(track, publisher, consumer)
+}
+
+// subscribeWithBackupFallback handles the case where the primary codec is
+// unsupported by the subscriber.
+func (p *Participant) subscribeWithBackupFallback(
+	track *PublishedTrack,
+	publisher *Participant,
+	transport *mediasoup.Transport,
+	caps *mediasoup.RtpCapabilities,
+) error {
+	track.mu.Lock()
+
+	// If backup producer already exists, consume from it directly
+	if track.backupProducer != nil {
+		track.mu.Unlock()
+		return p.consumeFromBackup(track, publisher, transport, caps)
+	}
+
+	// Queue subscriber and request backup from publisher if not yet requested
+	track.pendingBackupSubs = append(track.pendingBackupSubs, &pendingBackupSub{
+		subscriber: p,
+		publisher:  publisher,
+	})
+
+	needRequest := !track.backupRequested
+	track.backupRequested = true
+	track.mu.Unlock()
+
+	if needRequest {
+		track.requestBackupCodec()
+	}
+
+	p.logger.Info("Subscriber queued for backup codec",
+		"trackSid", track.sid, "backupCodec", track.backupCodec)
+	return nil
+}
+
+// consumeFromBackup creates a consumer from the backup producer.
+func (p *Participant) consumeFromBackup(
+	track *PublishedTrack,
+	publisher *Participant,
+	transport *mediasoup.Transport,
+	caps *mediasoup.RtpCapabilities,
+) error {
+	backupProducerId := track.backupProducer.Id()
+
+	if publisher.router.Id() != p.router.Id() {
+		res, err := publisher.router.PipeToRouter(&mediasoup.PipeToRouterOptions{
+			ProducerId: backupProducerId,
+			Router:     p.router,
+			ListenInfo: mediasoup.TransportListenInfo{
+				Ip:       "127.0.0.1",
+				Protocol: mediasoup.TransportProtocolUDP,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("cross-router pipe (backup) failed: %w", err)
+		}
+		backupProducerId = res.PipeProducer.Id()
+	}
+
+	consumer, err := transport.Consume(&mediasoup.ConsumerOptions{
+		ProducerId:      backupProducerId,
+		RtpCapabilities: caps,
+		Paused:          true,
+	})
+	if err != nil {
+		return fmt.Errorf("backup consume failed: %w", err)
+	}
+
+	if track.backupConsumers != nil {
+		track.mu.Lock()
+		track.backupConsumers[consumer.Id()] = "backup"
+		track.mu.Unlock()
+	}
+
+	return p.finishSubscribe(track, publisher, consumer)
+}
+
+// finishSubscribe completes subscription setup: RPC to client, resume, callbacks.
+func (p *Participant) finishSubscribe(
+	track *PublishedTrack,
+	publisher *Participant,
+	consumer *mediasoup.Consumer,
+) error {
 	sub := &Subscription{
 		sid:          consumer.Id(),
 		trackSid:     track.sid,
@@ -1014,6 +1517,12 @@ func (p *Participant) Subscribe(track *PublishedTrack, publisher *Participant) e
 
 		track.removeConsumer(consumer.Id())
 
+		if track.backupConsumers != nil {
+			track.mu.Lock()
+			delete(track.backupConsumers, consumer.Id())
+			track.mu.Unlock()
+		}
+
 		if p.room != nil && p.room.cascade.ReleaseStream != nil {
 			p.room.cascade.ReleaseStream(track.sid)
 		}
@@ -1023,6 +1532,9 @@ func (p *Participant) Subscribe(track *PublishedTrack, publisher *Participant) e
 				SubscriptionSid: sub.sid,
 			})
 		}
+
+		// Check if we can stop the backup codec after a consumer leaves
+		track.checkCodecRegressionReversal()
 	})
 
 	consumer.OnLayersChange(func(layers *mediasoup.ConsumerLayers) {
@@ -1620,15 +2132,18 @@ func (p *Participant) permissionFromGrants() *proto.ParticipantPermission {
 		CanPublishData:    true,
 		CanUpdateMetadata: false,
 	}
-	if p.grants == nil || p.grants.Video == nil {
+	if p.grants == nil {
 		return perm
 	}
-	v := p.grants.Video
-	perm.CanPublish = v.GetCanPublish()
-	perm.CanSubscribe = v.GetCanSubscribe()
-	perm.CanPublishData = v.GetCanPublishData()
-	perm.CanUpdateMetadata = v.GetCanUpdateOwnMetadata()
-	perm.CanSubscribeMetrics = v.GetCanSubscribeMetrics()
-	perm.Hidden = v.Hidden
+	if m := p.grants.Media; m != nil {
+		perm.CanPublish = m.GetCanPublish()
+		perm.CanSubscribe = m.GetCanSubscribe()
+		perm.CanPublishData = m.GetCanPublishData()
+		perm.CanUpdateMetadata = m.GetCanUpdateOwnMetadata()
+		perm.CanSubscribeMetrics = m.GetCanSubscribeMetrics()
+	}
+	if r := p.grants.Room; r != nil {
+		perm.Hidden = r.Hidden
+	}
 	return perm
 }

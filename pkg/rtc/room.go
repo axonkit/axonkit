@@ -94,8 +94,23 @@ func (r *Room) Sid() string          { return r.sid }
 func (r *Room) Name() string         { return r.name }
 func (r *Room) Metadata() string     { return r.metadata }
 func (r *Room) SetMetadata(m string) { r.metadata = m }
-func (r *Room) Dynacast() bool       { return r.config.Dynacast }
-func (r *Room) Store() *RoomStore    { return r.roomStore }
+func (r *Room) Dynacast() bool    { return r.config.Dynacast }
+func (r *Room) Store() *RoomStore { return r.roomStore }
+
+// ShouldRegressCodec returns true when the PREFER_REGRESSION policy should
+// behave like REGRESSION. This is the case when codecRegressionThreshold
+// is 0 (always regress) or when the room has fewer participants than the
+// configured threshold.
+func (r *Room) ShouldRegressCodec() bool {
+	threshold := r.config.CodecRegressionThreshold
+	if threshold == 0 {
+		return true
+	}
+	r.mu.RLock()
+	count := len(r.participants)
+	r.mu.RUnlock()
+	return count < threshold
+}
 
 func (r *Room) SetOnClose(fn func(*Room)) { r.onClose = fn }
 

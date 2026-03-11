@@ -35,6 +35,11 @@ type RoomConfig struct {
 	PingInterval  time.Duration `json:"pingInterval"`
 	PingTimeout   time.Duration `json:"pingTimeout"`
 	StatsInterval time.Duration `json:"statsInterval"`
+	// CodecRegressionThreshold controls when PREFER_REGRESSION policy
+	// triggers codec regression. When 0 (default) or when the room's
+	// participant count is below this threshold, regression is used.
+	// Otherwise the system falls back to simulcast behaviour.
+	CodecRegressionThreshold int `json:"codecRegressionThreshold"`
 }
 
 type MediaConfig struct {

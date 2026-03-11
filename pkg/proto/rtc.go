@@ -140,19 +140,34 @@ type PongResponse struct {
 // ClientTrackId is a client-generated correlation ID used to match the
 // server response back to the local track object on the client side.
 type PublishTrackRequest struct {
-	ClientTrackId string                   `json:"clientTrackId"`
-	Name          string                   `json:"name,omitempty"`
-	Kind          mediasoup.MediaKind      `json:"kind"`
-	RtpParameters *mediasoup.RtpParameters `json:"rtpParameters"`
-	Source        TrackSource              `json:"source,omitempty"`
-	Width         uint32                   `json:"width,omitempty"`
-	Height        uint32                   `json:"height,omitempty"`
-	Muted         bool                     `json:"muted,omitempty"`
-	AppData       map[string]any           `json:"appData,omitempty"`
+	ClientTrackId     string                   `json:"clientTrackId"`
+	Name              string                   `json:"name,omitempty"`
+	Kind              mediasoup.MediaKind      `json:"kind"`
+	RtpParameters     *mediasoup.RtpParameters `json:"rtpParameters"`
+	Source            TrackSource              `json:"source,omitempty"`
+	Width             uint32                   `json:"width,omitempty"`
+	Height            uint32                   `json:"height,omitempty"`
+	Muted             bool                     `json:"muted,omitempty"`
+	VideoCodec        string                   `json:"videoCodec,omitempty"`
+	BackupCodec       string                   `json:"backupCodec,omitempty"`
+	BackupCodecPolicy BackupCodecPolicy        `json:"backupCodecPolicy,omitempty"`
+	AppData           map[string]any           `json:"appData,omitempty"`
 }
 
 type PublishTrackResponse struct {
 	TrackSid string `json:"trackSid"`
+}
+
+// PublishBackupTrackRequest is sent by the client to publish a backup codec
+// stream for an already-published video track.
+type PublishBackupTrackRequest struct {
+	TrackSid      string                   `json:"trackSid"`
+	ClientTrackId string                   `json:"clientTrackId"`
+	RtpParameters *mediasoup.RtpParameters `json:"rtpParameters"`
+}
+
+type PublishBackupTrackResponse struct {
+	BackupTrackSid string `json:"backupTrackSid"`
 }
 
 type UnpublishTrackRequest struct {

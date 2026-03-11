@@ -40,6 +40,9 @@ func (p *Participant) dispatchRPC(msg *proto.Message) {
 	case proto.MethodTrackPublish:
 		body, status, errMsg = p.handleTrackPublish(msg)
 
+	case proto.MethodTrackPublishBackup:
+		body, status, errMsg = p.handleTrackPublishBackup(msg)
+
 	case proto.MethodTrackUnpublish:
 		body, status, errMsg = p.handleTrackUnpublish(msg)
 
@@ -285,6 +288,20 @@ func (p *Participant) handleTrackPublish(msg *proto.Message) (any, int, string) 
 	}
 
 	return &proto.PublishTrackResponse{TrackSid: track.sid}, proto.StatusOK, ""
+}
+
+func (p *Participant) handleTrackPublishBackup(msg *proto.Message) (any, int, string) {
+	var req proto.PublishBackupTrackRequest
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
+	}
+
+	backupSid, err := p.PublishBackupTrack(&req)
+	if err != nil {
+		return nil, proto.StatusInternalError, err.Error()
+	}
+
+	return &proto.PublishBackupTrackResponse{BackupTrackSid: backupSid}, proto.StatusOK, ""
 }
 
 func (p *Participant) handleTrackUnpublish(msg *proto.Message) (any, int, string) {
