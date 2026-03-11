@@ -219,6 +219,8 @@ type UnpublishDataTrackRequest struct {
 type CreateSubscriptionRequest struct {
 	SubscriptionSid  string                   `json:"subscriptionSid"`
 	TrackSid         string                   `json:"trackSid"`
+	TrackName        string                   `json:"trackName"`
+	TrackSource      TrackSource              `json:"trackSource"`
 	PublisherSid     string                   `json:"publisherSid"`
 	Kind             mediasoup.MediaKind      `json:"kind"`
 	RtpParameters    *mediasoup.RtpParameters `json:"rtpParameters"`

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -788,6 +789,10 @@ func (p *Participant) CanPublish() bool {
 	return p.permission != nil && p.permission.CanPublish
 }
 
+func (p *Participant) AutoSubscribe() bool {
+	return p.autoSubscribe
+}
+
 // SetRefreshToken stores the refresh token and starts the background refresh scheduler.
 func (p *Participant) SetRefreshToken(token string) {
 	p.mu.Lock()
@@ -1027,6 +1032,11 @@ func (p *Participant) SetRtpCapabilities(caps *mediasoup.RtpCapabilities) {
 func (p *Participant) PublishTrack(req *proto.PublishTrackRequest) (*PublishedTrack, error) {
 	if !p.CanPublish() {
 		return nil, fmt.Errorf("no publish permission")
+	}
+	if p.permission != nil && len(p.permission.CanPublishSources) > 0 {
+		if !slices.Contains(p.permission.CanPublishSources, req.Source) {
+			return nil, fmt.Errorf("source %q is not allowed by CanPublishSources", req.Source)
+		}
 	}
 
 	p.mu.RLock()
@@ -1480,6 +1490,8 @@ func (p *Participant) finishSubscribe(
 	req := &proto.CreateSubscriptionRequest{
 		SubscriptionSid:  sub.sid,
 		TrackSid:         track.sid,
+		TrackName:        track.name,
+		TrackSource:      track.source,
 		PublisherSid:     publisher.sid,
 		Kind:             consumer.Kind(),
 		RtpParameters:    consumer.RtpParameters(),
@@ -2141,9 +2153,23 @@ func (p *Participant) permissionFromGrants() *proto.ParticipantPermission {
 		perm.CanPublishData = m.GetCanPublishData()
 		perm.CanUpdateMetadata = m.GetCanUpdateOwnMetadata()
 		perm.CanSubscribeMetrics = m.GetCanSubscribeMetrics()
+		if m.CanPublishSources != nil {
+			perm.CanPublishSources = make([]proto.TrackSource, len(m.CanPublishSources))
+			for i, s := range m.CanPublishSources {
+				perm.CanPublishSources[i] = proto.TrackSource(s)
+			}
+		}
 	}
 	if r := p.grants.Room; r != nil {
 		perm.Hidden = r.Hidden
+		if r.Admin {
+			perm.CanManageGroups = true
+		}
+	}
+	if a := p.grants.Agent; a != nil {
+		if a.Admin {
+			perm.CanManageAgentSession = true
+		}
 	}
 	return perm
 }

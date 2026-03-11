@@ -594,7 +594,7 @@ func (r *Room) OnTrackPublished(publisher *Participant, track *PublishedTrack) {
 	publisherGroupId := publisher.GetGroupId()
 	others := r.GetOtherParticipants(publisher.sid)
 	for _, sub := range others {
-		if !sub.IsReady() || !sub.CanSubscribe() {
+		if !sub.IsReady() || !sub.CanSubscribe() || !sub.AutoSubscribe() {
 			continue
 		}
 		if !r.shouldPeerSubscribe(publisherGroupId, sub.GetGroupId()) {
@@ -642,7 +642,7 @@ func (r *Room) OnDataTrackPublished(publisher *Participant, track *DataPublished
 
 	others := r.GetOtherParticipants(publisher.sid)
 	for _, sub := range others {
-		if !sub.IsReady() || !sub.CanSubscribe() {
+		if !sub.IsReady() || !sub.CanSubscribe() || !sub.AutoSubscribe() {
 			continue
 		}
 		go func(subscriber *Participant) {
@@ -664,7 +664,7 @@ func (r *Room) OnDataTrackUnpublished(publisher *Participant, dataTrackSid strin
 // SubscribeExistingTracks subscribes a new participant to all existing tracks
 // from peers in the same group (or all in the main room when groupId == "").
 func (r *Room) SubscribeExistingTracks(subscriber *Participant) {
-	if !r.config.AutoSubscribe || !subscriber.CanSubscribe() {
+	if !r.config.AutoSubscribe || !subscriber.CanSubscribe() || !subscriber.AutoSubscribe() {
 		return
 	}
 
@@ -897,7 +897,7 @@ func (r *Room) shouldPeerSubscribe(groupA, groupB string) bool {
 }
 
 func (r *Room) ensureCrossSubscription(a, b *Participant) {
-	if a.IsReady() && a.CanSubscribe() {
+	if a.IsReady() && a.CanSubscribe() && a.AutoSubscribe() {
 		for _, track := range b.GetPublishedTracks() {
 			if !a.HasSubscription(track.sid) {
 				go func(t *PublishedTrack, pub *Participant) {
@@ -909,7 +909,7 @@ func (r *Room) ensureCrossSubscription(a, b *Participant) {
 			}
 		}
 	}
-	if b.IsReady() && b.CanSubscribe() {
+	if b.IsReady() && b.CanSubscribe() && b.AutoSubscribe() {
 		for _, track := range a.GetPublishedTracks() {
 			if !b.HasSubscription(track.sid) {
 				go func(t *PublishedTrack, pub *Participant) {
