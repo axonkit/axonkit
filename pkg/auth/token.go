@@ -14,8 +14,9 @@ import (
 )
 
 var (
-	ErrInvalidToken = errors.New("invalid token")
-	ErrExpiredToken = errors.New("token expired")
+	ErrInvalidToken      = errors.New("invalid token")
+	ErrExpiredToken      = errors.New("token expired")
+	ErrTokenNotYetValid  = errors.New("token not yet valid")
 )
 
 type jwtHeader struct {
@@ -37,8 +38,6 @@ type Claims struct {
 func (c *Claims) Identity() string { return c.Sub }
 
 // AccessToken creates and signs JWT tokens for room access.
-// Design follows the LiveKit token pattern: the token encodes
-// identity, display name, and permission grants (room join/publish/subscribe).
 type AccessToken struct {
 	apiKey    string
 	apiSecret string
@@ -83,6 +82,54 @@ func (t *AccessToken) SetTokenID(jti string) *AccessToken {
 	return t
 }
 
+func (t *AccessToken) SetRoomGrant(grant *proto.RoomGrant) *AccessToken {
+	t.ensureGrants()
+	t.claims.Grants.Room = grant
+	return t
+}
+
+func (t *AccessToken) SetMediaGrant(grant *proto.MediaGrant) *AccessToken {
+	t.ensureGrants()
+	t.claims.Grants.Media = grant
+	return t
+}
+
+func (t *AccessToken) SetSIPGrant(grant *proto.SIPGrant) *AccessToken {
+	t.ensureGrants()
+	t.claims.Grants.SIP = grant
+	return t
+}
+
+func (t *AccessToken) SetMetadata(metadata string) *AccessToken {
+	t.ensureGrants()
+	t.claims.Grants.Metadata = metadata
+	return t
+}
+
+func (t *AccessToken) SetAttributes(attrs map[string]string) *AccessToken {
+	t.ensureGrants()
+	t.claims.Grants.Attributes = attrs
+	return t
+}
+
+func (t *AccessToken) SetKind(kind string) *AccessToken {
+	t.ensureGrants()
+	t.claims.Grants.Kind = kind
+	return t
+}
+
+func (t *AccessToken) SetRoomConfig(config *proto.RoomConfiguration) *AccessToken {
+	t.ensureGrants()
+	t.claims.Grants.RoomConfig = config
+	return t
+}
+
+func (t *AccessToken) ensureGrants() {
+	if t.claims.Grants == nil {
+		t.claims.Grants = &proto.ClaimGrants{}
+	}
+}
+
 func (t *AccessToken) Sign() (string, error) {
 	if t.claims.Exp == 0 {
 		t.claims.Exp = time.Now().Add(6 * time.Hour).Unix()
@@ -108,7 +155,11 @@ func (v *TokenVerifier) Verify(tokenStr string) (*Claims, error) {
 	if claims.Iss != v.apiKey {
 		return nil, fmt.Errorf("%w: issuer mismatch", ErrInvalidToken)
 	}
-	if claims.Exp < time.Now().Unix() {
+	now := time.Now().Unix()
+	if claims.Nbf > 0 && now < claims.Nbf {
+		return nil, ErrTokenNotYetValid
+	}
+	if claims.Exp < now {
 		return nil, ErrExpiredToken
 	}
 	return claims, nil
@@ -122,17 +173,18 @@ func (v *TokenVerifier) RefreshToken(tokenStr string, ttl time.Duration) (string
 	if err != nil && !errors.Is(err, ErrExpiredToken) {
 		return "", err
 	}
-	// Re-verify without expiration check for refresh
 	if claims == nil {
 		claims, err = verifyJWT(v.apiSecret, tokenStr)
 		if err != nil {
 			return "", err
 		}
 	}
+	now := time.Now()
 	at := NewAccessToken(v.apiKey, v.apiSecret)
 	at.claims = *claims
-	at.claims.Iat = time.Now().Unix()
-	at.claims.Exp = time.Now().Add(ttl).Unix()
+	at.claims.Iat = now.Unix()
+	at.claims.Nbf = now.Unix()
+	at.claims.Exp = now.Add(ttl).Unix()
 	return at.Sign()
 }
 
@@ -142,6 +194,12 @@ func b64Encode(data []byte) string {
 
 func b64Decode(s string) ([]byte, error) {
 	return base64.RawURLEncoding.DecodeString(s)
+}
+
+// B64Decode exposes base64url decoding for CLI tools that need
+// to inspect raw JWT payloads.
+func B64Decode(s string) ([]byte, error) {
+	return b64Decode(s)
 }
 
 func signJWT(secret string, claims Claims) (string, error) {

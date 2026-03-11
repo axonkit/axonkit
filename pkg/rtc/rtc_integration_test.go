@@ -83,7 +83,7 @@ func TestIntegration_PublishTrack(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid:      "pub-p1",
 		Identity: "publisher",
-		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 		Router:   router,
 	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
@@ -138,7 +138,7 @@ func TestIntegration_MuteTrack(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid:      "mute-p1",
 		Identity: "muter",
-		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 		Router:   router,
 	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
@@ -184,7 +184,7 @@ func TestIntegration_UpdateTrack(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid:      "upd-p1",
 		Identity: "updater",
-		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 		Router:   router,
 	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
@@ -225,7 +225,7 @@ func TestIntegration_PublishDataTrack(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid:      "dpub-p1",
 		Identity: "data-publisher",
-		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 		Router:   router,
 	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
@@ -260,7 +260,7 @@ func TestIntegration_Subscribe(t *testing.T) {
 	publisher := NewParticipant(ParticipantParams{
 		Sid:      "sub-pub",
 		Identity: "pub-alice",
-		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 		Router:   router,
 	})
 	defer publisher.Close(proto.DisconnectReason_CLIENT_INITIATED)
@@ -284,7 +284,7 @@ func TestIntegration_Subscribe(t *testing.T) {
 	subscriber := NewParticipant(ParticipantParams{
 		Sid:      "sub-sub",
 		Identity: "sub-bob",
-		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 		Router:   router,
 	})
 	defer subscriber.Close(proto.DisconnectReason_CLIENT_INITIATED)
@@ -311,7 +311,7 @@ func TestIntegration_SubscribeData(t *testing.T) {
 	publisher := NewParticipant(ParticipantParams{
 		Sid:      "dsub-pub",
 		Identity: "dpub-alice",
-		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 		Router:   router,
 	})
 	defer publisher.Close(proto.DisconnectReason_CLIENT_INITIATED)
@@ -331,7 +331,7 @@ func TestIntegration_SubscribeData(t *testing.T) {
 	subscriber := NewParticipant(ParticipantParams{
 		Sid:      "dsub-sub",
 		Identity: "dsub-bob",
-		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 		Router:   router,
 	})
 	defer subscriber.Close(proto.DisconnectReason_CLIENT_INITIATED)
@@ -352,7 +352,7 @@ func TestIntegration_SetTransportsWithICE(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid:      "ice-p1",
 		Identity: "ice-test",
-		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 		Router:   router,
 	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
@@ -382,7 +382,7 @@ func TestIntegration_SetSignalAndMessage(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid:      "sig-p1",
 		Identity: "sig-test",
-		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 		Router:   router,
 	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
@@ -440,7 +440,7 @@ func TestIntegration_RestartIce(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid:          "recon-int",
 		Identity:     "recon-user",
-		Grants:       &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:       &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 		Router:       router,
 		PingTimeout:  10 * time.Second,
 		PingInterval: 5 * time.Second,

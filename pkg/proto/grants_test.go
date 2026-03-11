@@ -13,13 +13,15 @@ func TestClaimGrants_Clone(t *testing.T) {
 	g := &ClaimGrants{
 		Identity: "alice",
 		Name:     "Alice",
-		Video: &VideoGrant{
-			RoomJoin: true,
+		Room: &RoomGrant{
+			Name: "room1",
+			Join: true,
 		},
+		Media:      &MediaGrant{},
 		Attributes: map[string]string{"key": "val"},
 	}
 	c := g.Clone()
-	if c.Identity != "alice" || c.Video == nil || !c.Video.RoomJoin {
+	if c.Identity != "alice" || c.Room == nil || !c.Room.Join {
 		t.Fatal("clone mismatch")
 	}
 	c.Attributes["key"] = "changed"
@@ -28,47 +30,62 @@ func TestClaimGrants_Clone(t *testing.T) {
 	}
 }
 
-func TestVideoGrant_GetDefaults(t *testing.T) {
-	v := &VideoGrant{RoomJoin: true}
-	if !v.GetCanPublish() || !v.GetCanSubscribe() || !v.GetCanPublishData() {
+func TestRoomGrant_Clone(t *testing.T) {
+	r := &RoomGrant{Name: "room1", Join: true, Admin: true, Hidden: true}
+	c := r.Clone()
+	if c.Name != "room1" || !c.Join || !c.Admin || !c.Hidden {
+		t.Fatal("clone mismatch")
+	}
+}
+
+func TestRoomGrant_Clone_Nil(t *testing.T) {
+	var r *RoomGrant
+	if r.Clone() != nil {
+		t.Fatal("expected nil")
+	}
+}
+
+func TestMediaGrant_GetDefaults(t *testing.T) {
+	m := &MediaGrant{}
+	if !m.GetCanPublish() || !m.GetCanSubscribe() || !m.GetCanPublishData() {
 		t.Fatal("expected defaults to true")
 	}
-	if v.GetCanUpdateOwnMetadata() || v.GetCanSubscribeMetrics() {
+	if m.GetCanUpdateOwnMetadata() || m.GetCanSubscribeMetrics() {
 		t.Fatal("expected defaults to false")
 	}
 }
 
-func TestVideoGrant_SetAndGet(t *testing.T) {
-	v := &VideoGrant{RoomJoin: true}
-	v.SetCanPublish(false)
-	if v.GetCanPublish() {
+func TestMediaGrant_SetAndGet(t *testing.T) {
+	m := &MediaGrant{}
+	m.SetCanPublish(false)
+	if m.GetCanPublish() {
 		t.Fatal("expected false")
 	}
-	v.SetCanSubscribe(false)
-	if v.GetCanSubscribe() {
+	m.SetCanSubscribe(false)
+	if m.GetCanSubscribe() {
 		t.Fatal("expected false")
 	}
-	v.SetCanPublishData(false)
-	if v.GetCanPublishData() {
+	m.SetCanPublishData(false)
+	if m.GetCanPublishData() {
 		t.Fatal("expected false")
 	}
-	v.SetCanUpdateOwnMetadata(true)
-	if !v.GetCanUpdateOwnMetadata() {
+	m.SetCanUpdateOwnMetadata(true)
+	if !m.GetCanUpdateOwnMetadata() {
 		t.Fatal("expected true")
 	}
-	v.SetCanSubscribeMetrics(true)
-	if !v.GetCanSubscribeMetrics() {
+	m.SetCanSubscribeMetrics(true)
+	if !m.GetCanSubscribeMetrics() {
 		t.Fatal("expected true")
 	}
 }
 
-func TestVideoGrant_Clone(t *testing.T) {
-	v := &VideoGrant{RoomJoin: true}
-	v.SetCanPublish(false)
-	v.CanPublishSources = []string{"camera"}
+func TestMediaGrant_Clone(t *testing.T) {
+	m := &MediaGrant{}
+	m.SetCanPublish(false)
+	m.CanPublishSources = []string{"camera"}
 
-	c := v.Clone()
-	if c.GetCanPublish() != false || c.RoomJoin != true {
+	c := m.Clone()
+	if c.GetCanPublish() != false {
 		t.Fatal("clone mismatch")
 	}
 	if len(c.CanPublishSources) != 1 || c.CanPublishSources[0] != "camera" {
@@ -76,15 +93,78 @@ func TestVideoGrant_Clone(t *testing.T) {
 	}
 
 	c.CanPublishSources[0] = "screen"
-	if v.CanPublishSources[0] != "camera" {
+	if m.CanPublishSources[0] != "camera" {
 		t.Fatal("clone should not share slice")
 	}
 }
 
-func TestVideoGrant_Clone_Nil(t *testing.T) {
-	var v *VideoGrant
-	if v.Clone() != nil {
+func TestMediaGrant_Clone_Nil(t *testing.T) {
+	var m *MediaGrant
+	if m.Clone() != nil {
 		t.Fatal("expected nil")
+	}
+}
+
+func TestMediaGrant_ToPermission(t *testing.T) {
+	m := &MediaGrant{}
+	m.SetCanPublish(true)
+	m.SetCanSubscribe(true)
+	m.CanPublishSources = []string{"camera", "microphone"}
+
+	room := &RoomGrant{Hidden: true}
+	perm := m.ToPermission(room)
+
+	if !perm.CanPublish || !perm.CanSubscribe || !perm.Hidden {
+		t.Fatal("permission mismatch")
+	}
+	if len(perm.CanPublishSources) != 2 {
+		t.Fatal("sources mismatch")
+	}
+}
+
+func TestMediaGrant_ToPermission_NilRoom(t *testing.T) {
+	m := &MediaGrant{}
+	perm := m.ToPermission(nil)
+	if !perm.CanPublish || !perm.CanSubscribe || perm.Hidden {
+		t.Fatal("permission mismatch with nil room")
+	}
+}
+
+func TestMediaGrant_MatchesPermission(t *testing.T) {
+	m := &MediaGrant{}
+	room := &RoomGrant{}
+	perm := m.ToPermission(room)
+	if !m.MatchesPermission(perm, room) {
+		t.Fatal("should match")
+	}
+
+	perm.CanPublish = false
+	if m.MatchesPermission(perm, room) {
+		t.Fatal("should not match after change")
+	}
+}
+
+func TestMediaGrant_UpdateFromPermission(t *testing.T) {
+	m := &MediaGrant{}
+	room := &RoomGrant{}
+	perm := &ParticipantPermission{
+		CanPublish:        false,
+		CanSubscribe:      true,
+		CanPublishData:    false,
+		CanUpdateMetadata: true,
+		Hidden:            true,
+		CanPublishSources: []TrackSource{TrackSource_CAMERA},
+	}
+	m.UpdateFromPermission(perm, room)
+
+	if m.GetCanPublish() || !m.GetCanSubscribe() || m.GetCanPublishData() || !m.GetCanUpdateOwnMetadata() {
+		t.Fatal("update mismatch")
+	}
+	if !room.Hidden {
+		t.Fatal("hidden should be updated on room grant")
+	}
+	if len(m.CanPublishSources) != 1 || m.CanPublishSources[0] != string(TrackSource_CAMERA) {
+		t.Fatal("sources mismatch")
 	}
 }
 

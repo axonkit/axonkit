@@ -24,7 +24,7 @@ func newSignalTestParticipant(t *testing.T) *Participant {
 		Sid:           "sig-p1",
 		Identity:      "sig-alice",
 		Name:          "Alice",
-		Grants:        &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:        &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 		AutoSubscribe: true,
 		PingInterval:  5 * time.Second,
 		PingTimeout:   15 * time.Second,
@@ -301,7 +301,7 @@ func TestDispatchRPC_Ready(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid:           "ready-p1",
 		Identity:      "ready-alice",
-		Grants:        &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:        &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 		PingTimeout:   10 * time.Second,
 		PingInterval:  5 * time.Second,
 		AutoSubscribe: true,
@@ -328,7 +328,7 @@ func TestDispatchRPC_Ready_BadJSON(t *testing.T) {
 
 	p := NewParticipant(ParticipantParams{
 		Sid: "ready-bad-p1", Identity: "ready-bad-alice",
-		Grants: &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants: &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 	})
 	room.AddParticipant(p)
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
@@ -385,7 +385,7 @@ func TestProcessReconnectSync(t *testing.T) {
 
 	p := NewParticipant(ParticipantParams{
 		Sid: "sync-p1", Identity: "sync-alice",
-		Grants: &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants: &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 	})
 	p.SetState(proto.ParticipantInfo_CONNECTED)
 	room.AddParticipant(p)
@@ -400,7 +400,7 @@ func TestProcessReconnectSync(t *testing.T) {
 func TestProcessReconnectSync_NilRoom(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid: "sync-nilroom", Identity: "orphan",
-		Grants: &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants: &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
@@ -468,14 +468,14 @@ func TestProcessReconnectSync_WithTracks(t *testing.T) {
 
 	p := NewParticipant(ParticipantParams{
 		Sid: "recon-sub", Identity: "alice",
-		Grants: &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants: &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 	room.AddParticipant(p)
 
 	pub := NewParticipant(ParticipantParams{
 		Sid: "recon-pub", Identity: "bob",
-		Grants: &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants: &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 	})
 	defer pub.Close(proto.DisconnectReason_CLIENT_INITIATED)
 	room.AddParticipant(pub)
@@ -500,7 +500,7 @@ func TestProcessReconnectSync_WithTracks(t *testing.T) {
 func TestHandleIncomingMessage_QueueFull(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid: "queue-full", Identity: "overflow",
-		Grants: &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants: &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 	})
 
 	// Close the done channel without calling Close, to stop messageLoop

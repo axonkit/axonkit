@@ -17,9 +17,8 @@ func TestAccessToken_SignAndVerify(t *testing.T) {
 	at := NewAccessToken(testAPIKey, testAPISecret).
 		SetIdentity("alice").
 		SetName("Alice").
-		SetGrants(&proto.ClaimGrants{
-			Video: &proto.VideoGrant{RoomJoin: true, Room: "test-room"},
-		}).
+		SetRoomGrant(&proto.RoomGrant{Name: "test-room", Join: true}).
+		SetMediaGrant(&proto.MediaGrant{}).
 		SetTTL(time.Hour).
 		SetTokenID("jti-1")
 
@@ -42,11 +41,64 @@ func TestAccessToken_SignAndVerify(t *testing.T) {
 	if claims.Name != "Alice" {
 		t.Fatalf("expected Alice, got %s", claims.Name)
 	}
-	if claims.Grants == nil || claims.Grants.Video == nil || claims.Grants.Video.Room != "test-room" {
-		t.Fatal("grants mismatch")
+	if claims.Grants == nil || claims.Grants.Room == nil || claims.Grants.Room.Name != "test-room" {
+		t.Fatal("room grant mismatch")
+	}
+	if !claims.Grants.Room.Join {
+		t.Fatal("expected room join to be true")
 	}
 	if claims.Jti != "jti-1" {
 		t.Fatalf("expected jti-1, got %s", claims.Jti)
+	}
+}
+
+func TestAccessToken_SetterChain(t *testing.T) {
+	at := NewAccessToken(testAPIKey, testAPISecret).
+		SetIdentity("bob").
+		SetName("Bob").
+		SetRoomGrant(&proto.RoomGrant{Name: "room1", Join: true}).
+		SetMediaGrant(&proto.MediaGrant{}).
+		SetSIPGrant(&proto.SIPGrant{Admin: true}).
+		SetMetadata("test-meta").
+		SetAttributes(map[string]string{"role": "admin"}).
+		SetKind("agent").
+		SetRoomConfig(&proto.RoomConfiguration{}).
+		SetTTL(time.Hour)
+
+	tokenStr, err := at.Sign()
+	if err != nil {
+		t.Fatalf("Sign failed: %v", err)
+	}
+
+	v := NewTokenVerifier(testAPIKey, testAPISecret)
+	claims, err := v.Verify(tokenStr)
+	if err != nil {
+		t.Fatalf("Verify failed: %v", err)
+	}
+	g := claims.Grants
+	if g == nil {
+		t.Fatal("expected non-nil grants")
+	}
+	if g.Room == nil || g.Room.Name != "room1" || !g.Room.Join {
+		t.Fatal("room grant mismatch")
+	}
+	if g.Media == nil {
+		t.Fatal("expected non-nil media grant")
+	}
+	if g.SIP == nil || !g.SIP.Admin {
+		t.Fatal("SIP grant mismatch")
+	}
+	if g.Metadata != "test-meta" {
+		t.Fatalf("expected test-meta, got %s", g.Metadata)
+	}
+	if g.Attributes["role"] != "admin" {
+		t.Fatal("attributes mismatch")
+	}
+	if g.Kind != "agent" {
+		t.Fatalf("expected agent kind, got %s", g.Kind)
+	}
+	if g.RoomConfig == nil {
+		t.Fatal("expected non-nil room config")
 	}
 }
 
@@ -109,10 +161,34 @@ func TestTokenVerifier_ExpiredToken(t *testing.T) {
 	}
 }
 
+func TestTokenVerifier_NotYetValid(t *testing.T) {
+	at := NewAccessToken(testAPIKey, testAPISecret).SetIdentity("alice").SetTTL(time.Hour)
+	at.claims.Nbf = time.Now().Add(time.Hour).Unix()
+	tokenStr, _ := at.Sign()
+
+	v := NewTokenVerifier(testAPIKey, testAPISecret)
+	_, err := v.Verify(tokenStr)
+	if err == nil || !errors.Is(err, ErrTokenNotYetValid) {
+		t.Fatalf("expected ErrTokenNotYetValid, got %v", err)
+	}
+}
+
+func TestTokenVerifier_NbfZeroSkipped(t *testing.T) {
+	at := NewAccessToken(testAPIKey, testAPISecret).SetIdentity("alice").SetTTL(time.Hour)
+	at.claims.Nbf = 0
+	tokenStr, _ := at.Sign()
+
+	v := NewTokenVerifier(testAPIKey, testAPISecret)
+	_, err := v.Verify(tokenStr)
+	if err != nil {
+		t.Fatalf("expected no error when nbf is 0, got %v", err)
+	}
+}
+
 func TestTokenVerifier_RefreshToken(t *testing.T) {
 	at := NewAccessToken(testAPIKey, testAPISecret).
 		SetIdentity("alice").
-		SetGrants(&proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}}).
+		SetRoomGrant(&proto.RoomGrant{Join: true}).
 		SetTTL(time.Hour)
 	tokenStr, _ := at.Sign()
 

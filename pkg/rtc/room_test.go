@@ -25,8 +25,8 @@ func newTestParticipant(identity string) *Participant {
 		Identity: identity,
 		Name:     identity,
 		Grants: &proto.ClaimGrants{
-			Video: &proto.VideoGrant{
-				RoomJoin: true,
+			Room: &proto.RoomGrant{
+				Join: true,
 			},
 		},
 		AutoSubscribe: true,
@@ -116,7 +116,7 @@ func TestRoom_AddParticipant_DuplicateIdentity(t *testing.T) {
 		Sid:      "sid-1",
 		Identity: "alice",
 		Name:     "alice",
-		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 	})
 	defer p1.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
@@ -124,7 +124,7 @@ func TestRoom_AddParticipant_DuplicateIdentity(t *testing.T) {
 		Sid:      "sid-2",
 		Identity: "alice",
 		Name:     "alice",
-		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 	})
 	defer p2.Close(proto.DisconnectReason_CLIENT_INITIATED)
 

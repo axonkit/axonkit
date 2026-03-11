@@ -17,7 +17,7 @@ func TestParticipant_NewParticipant(t *testing.T) {
 			"role": "host",
 		},
 		Grants: &proto.ClaimGrants{
-			Video: &proto.VideoGrant{RoomJoin: true},
+			Room: &proto.RoomGrant{Join: true},
 		},
 		PingInterval: 5 * time.Second,
 		PingTimeout:  15 * time.Second,
@@ -54,7 +54,7 @@ func TestParticipant_SetState(t *testing.T) {
 func TestParticipant_IsReady(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid: "sid-1", Identity: "alice",
-		Grants: &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants: &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
@@ -101,7 +101,7 @@ func TestParticipant_Permissions(t *testing.T) {
 			canPubData: true,
 		},
 		{
-			name:       "nil video defaults to all true",
+			name:       "nil media defaults to all true",
 			grants:     &proto.ClaimGrants{},
 			canPub:     true,
 			canSub:     true,
@@ -109,24 +109,24 @@ func TestParticipant_Permissions(t *testing.T) {
 		},
 		{
 			name:   "explicit grant",
-			grants: &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+			grants: &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}, Media: &proto.MediaGrant{}},
 			canPub: true, canSub: true, canPubData: true,
 		},
 		{
 			name: "restricted publish",
 			grants: func() *proto.ClaimGrants {
-				v := &proto.VideoGrant{RoomJoin: true}
-				v.SetCanPublish(false)
-				return &proto.ClaimGrants{Video: v}
+				m := &proto.MediaGrant{}
+				m.SetCanPublish(false)
+				return &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}, Media: m}
 			}(),
 			canPub: false, canSub: true, canPubData: false,
 		},
 		{
 			name: "restricted subscribe",
 			grants: func() *proto.ClaimGrants {
-				v := &proto.VideoGrant{RoomJoin: true}
-				v.SetCanSubscribe(false)
-				return &proto.ClaimGrants{Video: v}
+				m := &proto.MediaGrant{}
+				m.SetCanSubscribe(false)
+				return &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}, Media: m}
 			}(),
 			canPub: true, canSub: false, canPubData: true,
 		},
@@ -185,7 +185,7 @@ func TestParticipant_ToProto(t *testing.T) {
 		Attributes: map[string]string{
 			"role": "speaker",
 		},
-		Grants: &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants: &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
@@ -267,7 +267,7 @@ func TestParticipant_Close_CleansUpStreams(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid:      "sid-cleanup",
 		Identity: "cleanup-user",
-		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 	})
 	room.AddParticipant(p)
 
@@ -295,7 +295,7 @@ func TestParticipant_Close_CleansUpStreams_NoRoom(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid:      "sid-noroom",
 		Identity: "noroom-user",
-		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 	})
 
 	p.mu.Lock()
@@ -325,7 +325,7 @@ func TestParticipant_Close_PassesCorrectReason(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid:      "sid-reason",
 		Identity: "reason-user",
-		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 	})
 	room.AddParticipant(p)
 
@@ -333,7 +333,7 @@ func TestParticipant_Close_PassesCorrectReason(t *testing.T) {
 	observer := NewParticipant(ParticipantParams{
 		Sid:      "sid-observer",
 		Identity: "observer",
-		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 	})
 	observer.SetState(proto.ParticipantInfo_CONNECTED)
 	room.AddParticipant(observer)
@@ -357,7 +357,7 @@ func TestParticipant_HandlePing(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid:          "sid-1",
 		Identity:     "alice",
-		Grants:       &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:       &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 		PingTimeout:  500 * time.Millisecond,
 		PingInterval: 200 * time.Millisecond,
 	})
@@ -376,7 +376,7 @@ func TestParticipant_StartHeartbeat_Timeout(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid:          "sid-1",
 		Identity:     "alice",
-		Grants:       &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:       &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 		PingTimeout:  100 * time.Millisecond,
 		PingInterval: 50 * time.Millisecond,
 	})
@@ -390,12 +390,12 @@ func TestParticipant_StartHeartbeat_Timeout(t *testing.T) {
 }
 
 func TestParticipant_PublishTrack_NoPermission(t *testing.T) {
-	v := &proto.VideoGrant{RoomJoin: true}
-	v.SetCanPublish(false)
+	m := &proto.MediaGrant{}
+	m.SetCanPublish(false)
 	p := NewParticipant(ParticipantParams{
 		Sid:      "sid-1",
 		Identity: "alice",
-		Grants:   &proto.ClaimGrants{Video: v},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}, Media: m},
 	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
@@ -416,12 +416,12 @@ func TestParticipant_PublishTrack_NoTransport(t *testing.T) {
 }
 
 func TestParticipant_PublishDataTrack_NoPermission(t *testing.T) {
-	v := &proto.VideoGrant{RoomJoin: true}
-	v.SetCanPublish(false)
+	m := &proto.MediaGrant{}
+	m.SetCanPublish(false)
 	p := NewParticipant(ParticipantParams{
 		Sid:      "sid-1",
 		Identity: "alice",
-		Grants:   &proto.ClaimGrants{Video: v},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}, Media: m},
 	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
@@ -717,7 +717,7 @@ func TestParticipant_HandleIceStateChange(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid:      "sid-1",
 		Identity: "alice",
-		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
@@ -750,7 +750,7 @@ func TestParticipant_HandleIceStateChange_Closed(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid:      "sid-ice",
 		Identity: "bob",
-		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 	})
 
 	// ICE closed triggers participant close
@@ -765,7 +765,7 @@ func TestParticipant_HandleIceStateChange_Reconnecting(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid:      "sid-recon",
 		Identity: "carol",
-		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
@@ -833,7 +833,7 @@ func TestParticipant_RestartIce_NilTransports(t *testing.T) {
 	p := NewParticipant(ParticipantParams{
 		Sid:      "sid-recon",
 		Identity: "alice",
-		Grants:   &proto.ClaimGrants{Video: &proto.VideoGrant{RoomJoin: true}},
+		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 

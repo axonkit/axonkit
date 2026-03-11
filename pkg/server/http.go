@@ -191,9 +191,11 @@ func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, 
 			Name: anonIdentity,
 			Grants: &proto.ClaimGrants{
 				Identity: anonIdentity,
-				Video: &proto.VideoGrant{
-					RoomJoin:     true,
-					Room:         roomName,
+				Room: &proto.RoomGrant{
+					Name: roomName,
+					Join: true,
+				},
+				Media: &proto.MediaGrant{
 					CanPublish:   &boolTrue,
 					CanSubscribe: &boolTrue,
 				},
@@ -209,6 +211,20 @@ func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, 
 		writeJSON(w, http.StatusBadRequest, proto.ErrorResponse{
 			Code: proto.ErrCodeInvalidRequest, Error: "room name required"})
 		return
+	}
+
+	if claims.Grants != nil && claims.Grants.Room != nil {
+		rg := claims.Grants.Room
+		if !rg.Join {
+			writeJSON(w, http.StatusForbidden, proto.ErrorResponse{
+				Code: proto.ErrCodePermissionDenied, Error: "token does not grant room join permission"})
+			return
+		}
+		if rg.Name != "" && rg.Name != req.Room.Name {
+			writeJSON(w, http.StatusForbidden, proto.ErrorResponse{
+				Code: proto.ErrCodePermissionDenied, Error: "token is scoped to a different room"})
+			return
+		}
 	}
 
 	room := s.roomManager.GetOrCreateRoom(
