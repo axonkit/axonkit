@@ -62,8 +62,16 @@ const (
 	MethodGroupJoin   = "group.join"
 	MethodGroupLeave  = "group.leave"
 
-	// Client -> Server: Chat, P2P RPC (notifications, server relays)
-	MethodChatMessage = "chat.message"
+	// Client -> Server: Message (chat, whiteboard, document, etc.)
+	MethodMessage            = "message.send"
+	MethodMessageDelete      = "message.delete"
+	MethodMessageDeleteByType = "message.deleteByType"
+
+	// Client -> Server: Room shared state
+	MethodStateUpdate = "state.update"
+	MethodStateDelete = "state.delete"
+
+	// Client -> Server: P2P RPC (notifications, server relays)
 	MethodRpcRequest  = "rpc.request"
 	MethodRpcResponse = "rpc.response"
 
@@ -91,6 +99,14 @@ const (
 
 	// Server -> Client: Token refresh
 	MethodTokenRefreshed = "token.refreshed"
+
+	// Server -> Client: Message notifications
+	MethodMessageReceived = "message.received"
+	MethodMessageDeleted  = "message.deleted"
+
+	// Server -> Client: Room shared state notifications
+	MethodStateUpdated = "state.updated"
+	MethodStateDeleted = "state.deleted"
 
 	// Server -> Client: Group notifications
 	MethodGroupCreated           = "group.created"

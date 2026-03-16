@@ -19,7 +19,7 @@ func (p *Participant) dispatchRPC(msg *proto.Message) {
 
 	switch msg.Method {
 	case proto.MethodPing, proto.MethodStatsReport,
-		proto.MethodChatMessage, proto.MethodRpcRequest, proto.MethodRpcResponse:
+		proto.MethodMessage, proto.MethodRpcRequest, proto.MethodRpcResponse:
 	default:
 		p.logger.Info("dispatchRPC", "method", msg.Method, "log_id", msg.LogId, "data", string(msg.Data))
 	}
@@ -109,8 +109,20 @@ func (p *Participant) dispatchRPC(msg *proto.Message) {
 	case proto.MethodGroupLeave:
 		body, status, errMsg = p.handleGroupLeave(msg)
 
-	case proto.MethodChatMessage:
-		p.handleChatMessageRelay(msg)
+	case proto.MethodMessage:
+		p.handleMessageRelay(msg)
+
+	case proto.MethodMessageDelete:
+		body, status, errMsg = p.handleMessageDelete(msg)
+
+	case proto.MethodMessageDeleteByType:
+		body, status, errMsg = p.handleMessageDeleteByType(msg)
+
+	case proto.MethodStateUpdate:
+		body, status, errMsg = p.handleStateUpdate(msg)
+
+	case proto.MethodStateDelete:
+		body, status, errMsg = p.handleStateDelete(msg)
 
 	case proto.MethodRpcRequest:
 		p.handleRpcRequest(msg)
@@ -149,13 +161,14 @@ func (p *Participant) handleReady(msg *proto.Message) (any, int, string) {
 	p.SetState(proto.ParticipantInfo_JOINED)
 	p.StartHeartbeat()
 
-	// Fetch participants, groups and messages from both local node and
-	// shared store so the response covers all nodes in the cluster.
+	// Fetch participants, groups, messages and shared state from both
+	// local node and shared store so the response covers all nodes.
 	otherInfos := p.room.GetAllParticipantInfos(p.sid)
 	groupInfos := p.room.GetAllGroupInfos()
+	sharedState := p.room.GetAllSharedState()
 
-	// For reconnect, deliver chat messages the client missed.
-	var missedMessages []*proto.ChatMessageNotification
+	// For reconnect, deliver messages the client missed.
+	var missedMessages []*proto.MessageNotification
 	if req.SyncState != nil {
 		missedMessages = p.room.GetAllMessagesSince(req.SyncState.LastMessageTimestamp)
 		go p.processReconnectSync(req.SyncState)
@@ -170,6 +183,7 @@ func (p *Participant) handleReady(msg *proto.Message) (any, int, string) {
 		Room:              p.room.ToProto(),
 		Groups:            groupInfos,
 		Messages:          missedMessages,
+		SharedState:       sharedState,
 	}, proto.StatusOK, ""
 }
 
@@ -576,25 +590,98 @@ func (p *Participant) handleSubscriptionUpdatePermissions(msg *proto.Message) (a
 }
 
 // ============================================================
-// Chat Message Relay
+// Message Relay (chat, whiteboard, document, etc.)
 // ============================================================
 
-func (p *Participant) handleChatMessageRelay(msg *proto.Message) {
+func (p *Participant) handleMessageRelay(msg *proto.Message) {
 	if p.room == nil {
 		return
 	}
 
-	var chatMsg proto.ChatMessageNotification
-	if err := json.Unmarshal(msg.Data, &chatMsg); err != nil {
-		p.logger.Warn("Invalid chat message", "error", err)
+	var m proto.MessageNotification
+	if err := json.Unmarshal(msg.Data, &m); err != nil {
+		p.logger.Warn("Invalid message", "error", err)
 		return
 	}
 
-	chatMsg.ParticipantSid = p.sid
-	chatMsg.ParticipantIdentity = p.identity
+	m.ParticipantSid = p.sid
+	m.ParticipantIdentity = p.identity
 
-	p.room.StoreChatMessage(&chatMsg)
-	p.room.BroadcastNotification(proto.MethodChatMessage, &chatMsg, p.sid)
+	p.room.StoreMessage(&m)
+	p.room.BroadcastNotification(proto.MethodMessageReceived, &m, p.sid)
+}
+
+func (p *Participant) handleMessageDelete(msg *proto.Message) (any, int, string) {
+	if p.room == nil {
+		return nil, proto.StatusBadRequest, "not in a room"
+	}
+
+	var req proto.MessageDeleteRequest
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		return nil, proto.StatusBadRequest, "invalid request body"
+	}
+
+	if !p.room.DeleteMessage(req.ID) {
+		return nil, proto.StatusNotFound, "message not found"
+	}
+
+	p.room.BroadcastNotification(proto.MethodMessageDeleted, &proto.MessageDeletedNotification{
+		IDs: []string{req.ID},
+	}, "")
+
+	return nil, proto.StatusOK, ""
+}
+
+func (p *Participant) handleMessageDeleteByType(msg *proto.Message) (any, int, string) {
+	if p.room == nil {
+		return nil, proto.StatusBadRequest, "not in a room"
+	}
+
+	var req proto.MessageDeleteByTypeRequest
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		return nil, proto.StatusBadRequest, "invalid request body"
+	}
+
+	ids := p.room.DeleteMessagesByType(req.Type)
+
+	p.room.BroadcastNotification(proto.MethodMessageDeleted, &proto.MessageDeletedNotification{
+		IDs:  ids,
+		Type: req.Type,
+	}, "")
+
+	return nil, proto.StatusOK, ""
+}
+
+// ============================================================
+// Room Shared State
+// ============================================================
+
+func (p *Participant) handleStateUpdate(msg *proto.Message) (any, int, string) {
+	if p.room == nil {
+		return nil, proto.StatusBadRequest, "not in a room"
+	}
+
+	var req proto.StateUpdateRequest
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		return nil, proto.StatusBadRequest, "invalid request body"
+	}
+
+	p.room.UpdateState(req.Key, req.Value, p.sid, p.identity)
+	return nil, proto.StatusOK, ""
+}
+
+func (p *Participant) handleStateDelete(msg *proto.Message) (any, int, string) {
+	if p.room == nil {
+		return nil, proto.StatusBadRequest, "not in a room"
+	}
+
+	var req proto.StateDeleteRequest
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		return nil, proto.StatusBadRequest, "invalid request body"
+	}
+
+	p.room.DeleteState(req.Key, p.sid, p.identity)
+	return nil, proto.StatusOK, ""
 }
 
 // ============================================================

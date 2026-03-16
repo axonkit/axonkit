@@ -51,8 +51,9 @@ type Room struct {
 	participants       map[string]*Participant
 	remoteParticipants map[string]bool   // SIDs of participants on other nodes
 	groups             map[string]*Group // groupSid -> Group
-	chatMessages       []*proto.ChatMessageNotification
-	remoteMsgIds       map[string]bool // dedup remote chat messages
+	messages           []*proto.MessageNotification
+	remoteMsgIds       map[string]bool   // dedup remote messages
+	sharedState        map[string]string // room-level KV for collaboration features
 	mu                 sync.RWMutex
 
 	cascade    CascadeCallbacks
@@ -85,9 +86,17 @@ func NewRoom(params RoomParams) *Room {
 		remoteParticipants: make(map[string]bool),
 		groups:             make(map[string]*Group),
 		remoteMsgIds:       make(map[string]bool),
+		sharedState:        make(map[string]string),
 		creationTime:       params.CreationTime,
 		logger:             slog.Default().With("component", "Room", "room", params.Name, "roomSid", params.Sid),
 	}
+}
+
+func (r *Room) maxMessages() int {
+	if r.config.MaxMessages > 0 {
+		return r.config.MaxMessages
+	}
+	return 10000
 }
 
 func (r *Room) Sid() string          { return r.sid }
@@ -142,12 +151,11 @@ func (r *Room) processStoreEvents(ch <-chan RoomStoreEvent, localNodeID string) 
 			}
 			r.handleRemoteParticipantEvent(evt)
 		case "group":
-			// Groups are authoritative from the store — we always sync.
 			r.handleRemoteGroupEvent(evt)
 		case "msg":
-			if evt.Message != nil {
-				r.handleRemoteChatEvent(evt)
-			}
+			r.handleRemoteMessageEvent(evt)
+		case "state":
+			r.handleRemoteStateEvent(evt)
 		case "tracksub":
 			if evt.TrackSub != nil && evt.TrackSub.NodeId != localNodeID {
 				r.handleRemoteTrackSubEvent(evt)
@@ -211,21 +219,56 @@ func (r *Room) handleRemoteGroupEvent(evt RoomStoreEvent) {
 	r.mu.Unlock()
 }
 
-func (r *Room) handleRemoteChatEvent(evt RoomStoreEvent) {
-	if evt.Message == nil {
-		return
-	}
-
-	r.mu.Lock()
-	if r.remoteMsgIds[evt.Message.ID] {
+func (r *Room) handleRemoteMessageEvent(evt RoomStoreEvent) {
+	switch evt.Operation {
+	case store.OpPut:
+		if evt.Message == nil {
+			return
+		}
+		r.mu.Lock()
+		if r.remoteMsgIds[evt.Message.ID] {
+			r.mu.Unlock()
+			return
+		}
+		r.remoteMsgIds[evt.Message.ID] = true
+		r.messages = append(r.messages, evt.Message)
 		r.mu.Unlock()
-		return
-	}
-	r.remoteMsgIds[evt.Message.ID] = true
-	r.chatMessages = append(r.chatMessages, evt.Message)
-	r.mu.Unlock()
 
-	r.BroadcastNotification(proto.MethodChatMessage, evt.Message, "")
+		r.BroadcastNotification(proto.MethodMessageReceived, evt.Message, "")
+
+	case store.OpDelete:
+		r.mu.Lock()
+		msgID := evt.Key
+		for i, m := range r.messages {
+			if m.ID == msgID {
+				r.messages = append(r.messages[:i], r.messages[i+1:]...)
+				break
+			}
+		}
+		delete(r.remoteMsgIds, msgID)
+		r.mu.Unlock()
+	}
+}
+
+func (r *Room) handleRemoteStateEvent(evt RoomStoreEvent) {
+	r.mu.Lock()
+	switch evt.Operation {
+	case store.OpPut:
+		r.sharedState[evt.Key] = evt.StateValue
+		r.mu.Unlock()
+		r.BroadcastNotification(proto.MethodStateUpdated, &proto.StateUpdatedNotification{
+			Key:   evt.Key,
+			Value: evt.StateValue,
+		}, "")
+	case store.OpDelete:
+		delete(r.sharedState, evt.Key)
+		r.mu.Unlock()
+		r.BroadcastNotification(proto.MethodStateDeleted, &proto.StateDeletedNotification{
+			Key: evt.Key,
+		}, "")
+	default:
+		r.mu.Unlock()
+	}
 }
 
 func (r *Room) handleRemoteTrackSubEvent(evt RoomStoreEvent) {
@@ -418,6 +461,14 @@ func (r *Room) ToProto() *proto.Room {
 		}
 	}
 
+	var ss map[string]string
+	if len(r.sharedState) > 0 {
+		ss = make(map[string]string, len(r.sharedState))
+		for k, v := range r.sharedState {
+			ss[k] = v
+		}
+	}
+
 	return &proto.Room{
 		Sid:              r.sid,
 		Name:             r.name,
@@ -428,6 +479,7 @@ func (r *Room) ToProto() *proto.Room {
 		Metadata:         r.metadata,
 		NumParticipants:  uint32(len(r.participants)),
 		NumPublishers:    numPublishers,
+		SharedState:      ss,
 	}
 }
 
@@ -481,13 +533,13 @@ func (r *Room) GetAllGroupInfos() []*proto.GroupInfo {
 	return result
 }
 
-// GetAllMessagesSince returns chat messages across all nodes since the given
+// GetAllMessagesSince returns messages across all nodes since the given
 // timestamp. Local messages come from in-memory cache; remote from the store.
-func (r *Room) GetAllMessagesSince(since int64) []*proto.ChatMessageNotification {
+func (r *Room) GetAllMessagesSince(since int64) []*proto.MessageNotification {
 	r.mu.RLock()
-	localIds := make(map[string]bool, len(r.chatMessages))
-	var result []*proto.ChatMessageNotification
-	for _, m := range r.chatMessages {
+	localIds := make(map[string]bool, len(r.messages))
+	var result []*proto.MessageNotification
+	for _, m := range r.messages {
 		ts := m.Timestamp
 		if m.EditTimestamp != nil && *m.EditTimestamp > ts {
 			ts = *m.EditTimestamp
@@ -511,6 +563,26 @@ func (r *Room) GetAllMessagesSince(since int64) []*proto.ChatMessageNotification
 	return result
 }
 
+// GetAllSharedState returns the merged shared state from local and store.
+func (r *Room) GetAllSharedState() map[string]string {
+	r.mu.RLock()
+	result := make(map[string]string, len(r.sharedState))
+	for k, v := range r.sharedState {
+		result[k] = v
+	}
+	r.mu.RUnlock()
+
+	if r.roomStore != nil {
+		remote := r.roomStore.GetAllState()
+		for k, v := range remote {
+			if _, exists := result[k]; !exists {
+				result[k] = v
+			}
+		}
+	}
+	return result
+}
+
 // BroadcastNotification sends a notification to all participants except the excluded one.
 func (r *Room) BroadcastNotification(method string, body any, excludeSid string) {
 	r.mu.RLock()
@@ -527,16 +599,21 @@ func (r *Room) BroadcastNotification(method string, body any, excludeSid string)
 	}
 }
 
-// StoreChatMessage appends a chat message to the room's history.
+// StoreMessage appends a message to the room's history.
 // Messages with an EditTimestamp update the existing message in-place.
-func (r *Room) StoreChatMessage(msg *proto.ChatMessageNotification) {
+// Transient messages are skipped (not stored).
+func (r *Room) StoreMessage(msg *proto.MessageNotification) {
+	if msg.Transient {
+		return
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if msg.EditTimestamp != nil {
-		for i, m := range r.chatMessages {
+		for i, m := range r.messages {
 			if m.ID == msg.ID {
-				r.chatMessages[i] = msg
+				r.messages[i] = msg
 				if r.roomStore != nil {
 					go r.roomStore.PutMessage(msg)
 				}
@@ -544,26 +621,124 @@ func (r *Room) StoreChatMessage(msg *proto.ChatMessageNotification) {
 			}
 		}
 	}
-	r.chatMessages = append(r.chatMessages, msg)
+
+	r.messages = append(r.messages, msg)
 	if r.roomStore != nil {
 		go r.roomStore.PutMessage(msg)
 	}
+
+	r.evictOldMessages()
 }
 
-// GetMessagesSince returns all chat messages with a timestamp strictly
+// evictOldMessages removes the oldest messages when the limit is exceeded.
+// Must be called with r.mu held.
+func (r *Room) evictOldMessages() {
+	maxMsg := r.maxMessages()
+	if len(r.messages) <= maxMsg {
+		return
+	}
+	overflow := len(r.messages) - maxMsg
+	evicted := r.messages[:overflow]
+	r.messages = r.messages[overflow:]
+
+	if r.roomStore != nil {
+		ids := make([]string, len(evicted))
+		for i, m := range evicted {
+			ids[i] = m.ID
+		}
+		go r.roomStore.DeleteMessagesByIDs(ids)
+	}
+}
+
+// DeleteMessage removes a single message by ID. Returns true if found.
+func (r *Room) DeleteMessage(id string) bool {
+	r.mu.Lock()
+	found := false
+	for i, m := range r.messages {
+		if m.ID == id {
+			r.messages = append(r.messages[:i], r.messages[i+1:]...)
+			found = true
+			break
+		}
+	}
+	r.mu.Unlock()
+
+	if found && r.roomStore != nil {
+		go r.roomStore.DeleteMessage(id)
+	}
+	return found
+}
+
+// DeleteMessagesByType removes all messages of a given type and returns their IDs.
+func (r *Room) DeleteMessagesByType(msgType string) []string {
+	r.mu.Lock()
+	var ids []string
+	filtered := r.messages[:0]
+	for _, m := range r.messages {
+		if m.Type == msgType {
+			ids = append(ids, m.ID)
+		} else {
+			filtered = append(filtered, m)
+		}
+	}
+	r.messages = filtered
+	r.mu.Unlock()
+
+	if len(ids) > 0 && r.roomStore != nil {
+		go r.roomStore.DeleteMessagesByIDs(ids)
+	}
+	return ids
+}
+
+// UpdateState sets a key in the room's shared state and broadcasts the change.
+func (r *Room) UpdateState(key, value, participantSid, participantIdentity string) {
+	r.mu.Lock()
+	r.sharedState[key] = value
+	r.mu.Unlock()
+
+	if r.roomStore != nil {
+		go r.roomStore.PutState(key, value)
+	}
+
+	r.BroadcastNotification(proto.MethodStateUpdated, &proto.StateUpdatedNotification{
+		Key:                 key,
+		Value:               value,
+		ParticipantSid:      participantSid,
+		ParticipantIdentity: participantIdentity,
+	}, "")
+}
+
+// DeleteState removes a key from the room's shared state and broadcasts the change.
+func (r *Room) DeleteState(key, participantSid, participantIdentity string) {
+	r.mu.Lock()
+	delete(r.sharedState, key)
+	r.mu.Unlock()
+
+	if r.roomStore != nil {
+		go r.roomStore.DeleteState(key)
+	}
+
+	r.BroadcastNotification(proto.MethodStateDeleted, &proto.StateDeletedNotification{
+		Key:                 key,
+		ParticipantSid:      participantSid,
+		ParticipantIdentity: participantIdentity,
+	}, "")
+}
+
+// GetMessagesSince returns all messages with a timestamp strictly
 // greater than the provided value. If since is 0 all messages are returned.
-func (r *Room) GetMessagesSince(since int64) []*proto.ChatMessageNotification {
+func (r *Room) GetMessagesSince(since int64) []*proto.MessageNotification {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	if since == 0 {
-		out := make([]*proto.ChatMessageNotification, len(r.chatMessages))
-		copy(out, r.chatMessages)
+		out := make([]*proto.MessageNotification, len(r.messages))
+		copy(out, r.messages)
 		return out
 	}
 
-	var out []*proto.ChatMessageNotification
-	for _, m := range r.chatMessages {
+	var out []*proto.MessageNotification
+	for _, m := range r.messages {
 		ts := m.Timestamp
 		if m.EditTimestamp != nil && *m.EditTimestamp > ts {
 			ts = *m.EditTimestamp

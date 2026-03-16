@@ -38,18 +38,19 @@ const (
 )
 
 type Room struct {
-	Sid              string        `json:"sid,omitempty"`
-	Name             string        `json:"name,omitempty"`
-	EmptyTimeout     uint32        `json:"emptyTimeout,omitempty"`
-	DepartureTimeout uint32        `json:"departureTimeout,omitempty"`
-	MaxParticipants  uint32        `json:"maxParticipants,omitempty"`
-	CreationTime     int64         `json:"creationTime,omitempty"`
-	Metadata         string        `json:"metadata,omitempty"`
-	NumParticipants  uint32        `json:"numParticipants,omitempty"`
-	NumPublishers    uint32        `json:"numPublishers,omitempty"`
-	ActiveRecording  bool          `json:"activeRecording,omitempty"`
-	ActiveStreaming  bool          `json:"activeStreaming,omitempty"`
-	Version          *TimedVersion `json:"version,omitempty"`
+	Sid              string            `json:"sid,omitempty"`
+	Name             string            `json:"name,omitempty"`
+	EmptyTimeout     uint32            `json:"emptyTimeout,omitempty"`
+	DepartureTimeout uint32            `json:"departureTimeout,omitempty"`
+	MaxParticipants  uint32            `json:"maxParticipants,omitempty"`
+	CreationTime     int64             `json:"creationTime,omitempty"`
+	Metadata         string            `json:"metadata,omitempty"`
+	NumParticipants  uint32            `json:"numParticipants,omitempty"`
+	NumPublishers    uint32            `json:"numPublishers,omitempty"`
+	ActiveRecording  bool              `json:"activeRecording,omitempty"`
+	ActiveStreaming  bool              `json:"activeStreaming,omitempty"`
+	Version          *TimedVersion     `json:"version,omitempty"`
+	SharedState      map[string]string `json:"sharedState,omitempty"`
 }
 
 type ParticipantInfo struct {

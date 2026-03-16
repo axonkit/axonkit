@@ -62,14 +62,15 @@ func DeleteRoomMeta(kv store.Store, roomName string) {
 }
 
 // RoomStore provides cross-node synchronisation of room-level metadata
-// (participants, groups, chat messages) via a shared KV store (NATS JetStream).
+// (participants, groups, messages, shared state) via a shared KV store (NATS JetStream).
 //
 // Key layout:
 //
 //	room.<roomName>._meta              → JSON RoomMeta
 //	room.<roomName>.participant.<sid>  → JSON ParticipantInfo
 //	room.<roomName>.group.<groupId>   → JSON GroupInfo
-//	room.<roomName>.msg.<id>          → JSON ChatMessageNotification
+//	room.<roomName>.msg.<id>          → JSON MessageNotification
+//	room.<roomName>.state.<key>       → plain string value
 type RoomStore struct {
 	kv       store.Store
 	roomName string
@@ -186,9 +187,9 @@ func (s *RoomStore) GetAllGroups() []*proto.GroupInfo {
 	return result
 }
 
-// --- Chat Messages ---
+// --- Messages ---
 
-func (s *RoomStore) PutMessage(msg *proto.ChatMessageNotification) {
+func (s *RoomStore) PutMessage(msg *proto.MessageNotification) {
 	key := fmt.Sprintf("%s.msg.%s", s.prefix(), msg.ID)
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -202,7 +203,25 @@ func (s *RoomStore) PutMessage(msg *proto.ChatMessageNotification) {
 	}
 }
 
-func (s *RoomStore) GetMessagesSince(since int64) []*proto.ChatMessageNotification {
+func (s *RoomStore) DeleteMessage(id string) {
+	key := fmt.Sprintf("%s.msg.%s", s.prefix(), id)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.kv.Delete(ctx, key); err != nil {
+		s.logger.Warn("Failed to delete message", "id", id, "error", err)
+	}
+}
+
+func (s *RoomStore) DeleteMessagesByIDs(ids []string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, id := range ids {
+		key := fmt.Sprintf("%s.msg.%s", s.prefix(), id)
+		_ = s.kv.Delete(ctx, key)
+	}
+}
+
+func (s *RoomStore) GetMessagesSince(since int64) []*proto.MessageNotification {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	pattern := fmt.Sprintf("%s.msg.*", s.prefix())
@@ -211,13 +230,13 @@ func (s *RoomStore) GetMessagesSince(since int64) []*proto.ChatMessageNotificati
 		s.logger.Warn("Failed to list message keys", "error", err)
 		return nil
 	}
-	var result []*proto.ChatMessageNotification
+	var result []*proto.MessageNotification
 	for _, k := range keys {
 		entry, err := s.kv.Get(ctx, k)
 		if err != nil {
 			continue
 		}
-		var msg proto.ChatMessageNotification
+		var msg proto.MessageNotification
 		if err := json.Unmarshal(entry.Value(), &msg); err != nil {
 			continue
 		}
@@ -228,6 +247,47 @@ func (s *RoomStore) GetMessagesSince(since int64) []*proto.ChatMessageNotificati
 		if ts > since {
 			result = append(result, &msg)
 		}
+	}
+	return result
+}
+
+// --- Room Shared State ---
+
+func (s *RoomStore) PutState(key, value string) {
+	storeKey := fmt.Sprintf("%s.state.%s", s.prefix(), key)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.kv.Put(ctx, storeKey, []byte(value)); err != nil {
+		s.logger.Warn("Failed to put state", "key", key, "error", err)
+	}
+}
+
+func (s *RoomStore) DeleteState(key string) {
+	storeKey := fmt.Sprintf("%s.state.%s", s.prefix(), key)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.kv.Delete(ctx, storeKey); err != nil {
+		s.logger.Warn("Failed to delete state", "key", key, "error", err)
+	}
+}
+
+func (s *RoomStore) GetAllState() map[string]string {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	pattern := fmt.Sprintf("%s.state.*", s.prefix())
+	keys, err := s.kv.Keys(ctx, pattern)
+	if err != nil {
+		return nil
+	}
+	result := make(map[string]string, len(keys))
+	prefix := fmt.Sprintf("%s.state.", s.prefix())
+	for _, k := range keys {
+		entry, err := s.kv.Get(ctx, k)
+		if err != nil {
+			continue
+		}
+		stateKey := strings.TrimPrefix(k, prefix)
+		result[stateKey] = string(entry.Value())
 	}
 	return result
 }
@@ -266,14 +326,15 @@ func (s *RoomStore) DeleteTrackSub(trackSid string) {
 
 // RoomStoreEvent represents a change observed from the shared store.
 type RoomStoreEvent struct {
-	Type      string // "participant", "group", "msg", "tracksub"
+	Type      string // "participant", "group", "msg", "tracksub", "state"
 	Operation store.Operation
-	Key       string // the sub-key (sid, groupId, msgId, trackSid.nodeId)
+	Key       string // the sub-key (sid, groupId, msgId, trackSid.nodeId, stateKey)
 
 	Participant *proto.ParticipantInfo
 	Group       *proto.GroupInfo
-	Message     *proto.ChatMessageNotification
+	Message     *proto.MessageNotification
 	TrackSub    *TrackSubInfo
+	StateValue  string // populated for "state" Put events
 }
 
 // Watch starts watching all keys under this room prefix. Events from the
@@ -337,7 +398,7 @@ func (s *RoomStore) parseEvent(entry store.Entry) (RoomStoreEvent, bool) {
 				evt.Group = &info
 			}
 		case "msg":
-			var msg proto.ChatMessageNotification
+			var msg proto.MessageNotification
 			if json.Unmarshal(entry.Value(), &msg) == nil {
 				evt.Message = &msg
 			}
@@ -346,6 +407,8 @@ func (s *RoomStore) parseEvent(entry store.Entry) (RoomStoreEvent, bool) {
 			if json.Unmarshal(entry.Value(), &info) == nil {
 				evt.TrackSub = &info
 			}
+		case "state":
+			evt.StateValue = string(entry.Value())
 		}
 	}
 

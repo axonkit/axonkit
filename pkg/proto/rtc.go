@@ -113,10 +113,11 @@ type ReadyRequest struct {
 }
 
 type ReadyResponse struct {
-	OtherParticipants []*ParticipantInfo         `json:"otherParticipants,omitempty"`
-	Room              *Room                      `json:"room,omitempty"`
-	Groups            []*GroupInfo               `json:"groups,omitempty"`
-	Messages          []*ChatMessageNotification `json:"messages,omitempty"`
+	OtherParticipants []*ParticipantInfo     `json:"otherParticipants,omitempty"`
+	Room              *Room                  `json:"room,omitempty"`
+	Groups            []*GroupInfo           `json:"groups,omitempty"`
+	Messages          []*MessageNotification `json:"messages,omitempty"`
+	SharedState       map[string]string      `json:"sharedState,omitempty"`
 }
 
 type LeaveRequest struct {
@@ -425,14 +426,51 @@ type UnsubscribeRequest struct {
 }
 
 // ============================================================
-// Client -> Server: Chat, Data Stream, P2P RPC (relay payloads)
+// Client -> Server: Message, Room State, P2P RPC (relay payloads)
 // ============================================================
 
-type ChatMessageNotification struct {
+type MessageNotification struct {
 	ID                  string `json:"id"`
+	Type                string `json:"type,omitempty"`
 	Message             string `json:"message"`
 	Timestamp           int64  `json:"timestamp"`
 	EditTimestamp       *int64 `json:"editTimestamp,omitempty"`
+	Transient           bool   `json:"transient,omitempty"`
+	ParticipantSid      string `json:"participantSid,omitempty"`
+	ParticipantIdentity string `json:"participantIdentity,omitempty"`
+}
+
+type MessageDeleteRequest struct {
+	ID string `json:"id"`
+}
+
+type MessageDeleteByTypeRequest struct {
+	Type string `json:"type"`
+}
+
+type MessageDeletedNotification struct {
+	IDs  []string `json:"ids"`
+	Type string   `json:"type,omitempty"`
+}
+
+type StateUpdateRequest struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type StateDeleteRequest struct {
+	Key string `json:"key"`
+}
+
+type StateUpdatedNotification struct {
+	Key                 string `json:"key"`
+	Value               string `json:"value"`
+	ParticipantSid      string `json:"participantSid,omitempty"`
+	ParticipantIdentity string `json:"participantIdentity,omitempty"`
+}
+
+type StateDeletedNotification struct {
+	Key                 string `json:"key"`
 	ParticipantSid      string `json:"participantSid,omitempty"`
 	ParticipantIdentity string `json:"participantIdentity,omitempty"`
 }

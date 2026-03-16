@@ -40,6 +40,9 @@ type RoomConfig struct {
 	// participant count is below this threshold, regression is used.
 	// Otherwise the system falls back to simulcast behaviour.
 	CodecRegressionThreshold int `json:"codecRegressionThreshold"`
+	// MaxMessages is the maximum number of messages kept in room history.
+	// Oldest messages are evicted when the limit is exceeded. 0 means use default (10000).
+	MaxMessages int `json:"maxMessages"`
 }
 
 type MediaConfig struct {
