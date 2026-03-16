@@ -37,10 +37,10 @@ type PublishedTrack struct {
 	backupCodecPolicy proto.BackupCodecPolicy
 	backupProducer    *mediasoup.Producer
 	backupSid         string
-	regressed         bool                   // true after REGRESSION has fired
-	pendingBackupSubs []*pendingBackupSub    // subscribers waiting for backup producer
-	backupConsumers   map[string]string      // consumerID → codec used ("primary"/"backup")
-	backupRequested   bool                   // true once we've asked the publisher for backup
+	regressed         bool                // true after REGRESSION has fired
+	pendingBackupSubs []*pendingBackupSub // subscribers waiting for backup producer
+	backupConsumers   map[string]string   // consumerID → codec used ("primary"/"backup")
+	backupRequested   bool                // true once we've asked the publisher for backup
 
 	// Dynacast: track which consumers are active and their max spatial layer.
 	// Protected by mu.

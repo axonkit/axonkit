@@ -431,10 +431,10 @@ func TestPublishedTrack_CurrentSubscribedQualities(t *testing.T) {
 
 func TestPublishedTrack_SendCodecQualityNotification_NilPublisher(t *testing.T) {
 	track := &PublishedTrack{
-		sid:        "track-scqn-nil",
-		videoCodec: "vp9",
+		sid:         "track-scqn-nil",
+		videoCodec:  "vp9",
 		backupCodec: "vp8",
-		publisher:  nil,
+		publisher:   nil,
 	}
 	// Should not panic
 	track.sendCodecQualityNotification(true, false)
@@ -445,10 +445,10 @@ func TestPublishedTrack_SendCodecQualityNotification_NoCodecs(t *testing.T) {
 	defer pub.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
 	track := &PublishedTrack{
-		sid:        "track-scqn-empty",
-		videoCodec: "",
+		sid:         "track-scqn-empty",
+		videoCodec:  "",
 		backupCodec: "",
-		publisher:  pub,
+		publisher:   pub,
 	}
 	// Should not panic even with empty codecs
 	track.sendCodecQualityNotification(true, true)

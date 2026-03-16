@@ -103,8 +103,8 @@ func (r *Room) Sid() string          { return r.sid }
 func (r *Room) Name() string         { return r.name }
 func (r *Room) Metadata() string     { return r.metadata }
 func (r *Room) SetMetadata(m string) { r.metadata = m }
-func (r *Room) Dynacast() bool    { return r.config.Dynacast }
-func (r *Room) Store() *RoomStore { return r.roomStore }
+func (r *Room) Dynacast() bool       { return r.config.Dynacast }
+func (r *Room) Store() *RoomStore    { return r.roomStore }
 
 // ShouldRegressCodec returns true when the PREFER_REGRESSION policy should
 // behave like REGRESSION. This is the case when codecRegressionThreshold

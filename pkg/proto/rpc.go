@@ -63,8 +63,8 @@ const (
 	MethodGroupLeave  = "group.leave"
 
 	// Client -> Server: Message (chat, whiteboard, document, etc.)
-	MethodMessage            = "message.send"
-	MethodMessageDelete      = "message.delete"
+	MethodMessage             = "message.send"
+	MethodMessageDelete       = "message.delete"
 	MethodMessageDeleteByType = "message.deleteByType"
 
 	// Client -> Server: Room shared state

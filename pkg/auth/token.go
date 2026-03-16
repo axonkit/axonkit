@@ -14,9 +14,9 @@ import (
 )
 
 var (
-	ErrInvalidToken      = errors.New("invalid token")
-	ErrExpiredToken      = errors.New("token expired")
-	ErrTokenNotYetValid  = errors.New("token not yet valid")
+	ErrInvalidToken     = errors.New("invalid token")
+	ErrExpiredToken     = errors.New("token expired")
+	ErrTokenNotYetValid = errors.New("token not yet valid")
 )
 
 type jwtHeader struct {

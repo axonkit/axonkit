@@ -297,11 +297,11 @@ func (s *RoomStore) GetAllState() map[string]string {
 // TrackSubInfo is the per-layer subscription state for one track on one node.
 // Key: room.<roomName>.tracksub.<trackSid>.<nodeId>
 type TrackSubInfo struct {
-	TrackSid        string  `json:"trackSid"`
-	NodeId          string  `json:"nodeId"`
-	Layers          [3]bool `json:"layers"`          // [LOW, MEDIUM, HIGH] — which layers have active subscribers
-	HasBackupSub    bool    `json:"hasBackupSub"`    // true if any consumer on this node uses the backup codec
-	BackupLayers    [3]bool `json:"backupLayers"`    // per-layer state for backup codec consumers
+	TrackSid     string  `json:"trackSid"`
+	NodeId       string  `json:"nodeId"`
+	Layers       [3]bool `json:"layers"`       // [LOW, MEDIUM, HIGH] — which layers have active subscribers
+	HasBackupSub bool    `json:"hasBackupSub"` // true if any consumer on this node uses the backup codec
+	BackupLayers [3]bool `json:"backupLayers"` // per-layer state for backup codec consumers
 }
 
 func (s *RoomStore) PutTrackSub(info *TrackSubInfo) {
