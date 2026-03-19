@@ -2,7 +2,10 @@ module github.com/axonkit/axonkit
 
 go 1.25.6
 
+replace github.com/axonkit/protocol => ../protocol
+
 require (
+	github.com/axonkit/protocol v0.0.0
 	github.com/jiyeyuran/mediasoup-go/v2 v2.3.1
 	github.com/nats-io/nats-server/v2 v2.12.4
 	github.com/nats-io/nats.go v1.48.0

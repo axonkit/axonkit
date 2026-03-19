@@ -1826,10 +1826,7 @@ func (p *Participant) sendMessage(msg *proto.Message) error {
 		return fmt.Errorf("signal channel not established")
 	}
 
-	data, err := msg.Encode()
-	if err != nil {
-		return err
-	}
+	data := msg.Encode()
 
 	return producer.Send(data)
 }

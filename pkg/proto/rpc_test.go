@@ -62,10 +62,7 @@ func TestEncodeDecodeRequest(t *testing.T) {
 	body := []byte(`{"key":"value"}`)
 	msg := NewRequest("ping", "abc-123", body)
 
-	data, err := msg.Encode()
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
+	data := msg.Encode()
 
 	decoded, err := DecodeMessage(data)
 	if err != nil {
@@ -90,10 +87,7 @@ func TestEncodeDecodeResponse(t *testing.T) {
 	body := []byte(`{"ok":true}`)
 	msg := NewResponse("abc-123", 200, body)
 
-	data, err := msg.Encode()
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
+	data := msg.Encode()
 
 	decoded, err := DecodeMessage(data)
 	if err != nil {
@@ -112,10 +106,7 @@ func TestEncodeDecodeNotification(t *testing.T) {
 	body := []byte(`{"event":"joined"}`)
 	msg := NewNotification("participant.joined", body)
 
-	data, err := msg.Encode()
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
+	data := msg.Encode()
 
 	decoded, err := DecodeMessage(data)
 	if err != nil {
@@ -139,10 +130,7 @@ func TestEncodeDecodeNotificationWithLogId(t *testing.T) {
 		Data:   []byte("payload"),
 	}
 
-	data, err := msg.Encode()
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
+	data := msg.Encode()
 
 	decoded, err := DecodeMessage(data)
 	if err != nil {
@@ -158,10 +146,7 @@ func TestEncodeDecodeWithHeaders(t *testing.T) {
 	msg.Header.Set("Encoding", "gzip")
 	msg.Header.Set("Custom", "value")
 
-	data, err := msg.Encode()
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
+	data := msg.Encode()
 
 	decoded, err := DecodeMessage(data)
 	if err != nil {
@@ -206,10 +191,7 @@ func TestDecodeMessage_Errors(t *testing.T) {
 func TestEncodeDecodeErrorResponse(t *testing.T) {
 	msg := NewErrorResponse("log1", 500, "server error")
 
-	data, err := msg.Encode()
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
+	data := msg.Encode()
 
 	decoded, err := DecodeMessage(data)
 	if err != nil {
@@ -252,8 +234,12 @@ func TestNewJSONNotification(t *testing.T) {
 }
 
 func TestMarshalBody_Nil(t *testing.T) {
-	data, err := marshalBody(nil)
-	if err != nil || data != nil {
-		t.Fatalf("expected nil, got %v %v", data, err)
+	// nil body via NewJSONNotification produces message with nil Data
+	msg, err := NewJSONNotification("event", nil)
+	if err != nil {
+		t.Fatalf("NewJSONNotification(nil): %v", err)
+	}
+	if msg.Data != nil {
+		t.Fatalf("expected nil Data for nil body, got %q", msg.Data)
 	}
 }

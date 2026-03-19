@@ -419,7 +419,7 @@ func TestHandleIncomingMessage_Request(t *testing.T) {
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
 	msg := makeRequest(proto.MethodPing, "log-hm", &proto.PingRequest{Timestamp: 123})
-	data, _ := msg.Encode()
+	data := msg.Encode()
 	p.handleIncomingMessage(data)
 	time.Sleep(50 * time.Millisecond)
 }
@@ -434,7 +434,7 @@ func TestHandleIncomingMessage_Response(t *testing.T) {
 	p.mu.Unlock()
 
 	resp := proto.NewResponse("test-log", 200, []byte(`{}`))
-	data, _ := resp.Encode()
+	data := resp.Encode()
 	p.handleIncomingMessage(data)
 
 	select {
@@ -452,7 +452,7 @@ func TestHandleIncomingMessage_ResponseUnknownLogId(t *testing.T) {
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
 	resp := proto.NewResponse("unknown-log", 200, []byte(`{}`))
-	data, _ := resp.Encode()
+	data := resp.Encode()
 	p.handleIncomingMessage(data) // no pending RPC, should not panic
 }
 
@@ -515,7 +515,7 @@ func TestHandleIncomingMessage_QueueFull(t *testing.T) {
 
 	// This message should hit the "queue full" branch
 	msg := makeRequest(proto.MethodPing, "overflow-log", &proto.PingRequest{Timestamp: 1})
-	data, _ := msg.Encode()
+	data := msg.Encode()
 	p.handleIncomingMessage(data)
 
 	// Clean up
