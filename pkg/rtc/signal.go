@@ -138,7 +138,6 @@ func (p *Participant) dispatchRPC(msg *proto.Message) {
 	if msg.IsRequest() {
 		var resp *proto.Message
 		if errMsg != "" {
-			p.logger.Error("dispatchRPC", "method", msg.Method, "log_id", msg.LogId, "status", status, "err_msg", errMsg)
 			resp = proto.NewErrorResponse(msg.LogId, status, errMsg)
 		} else {
 			var err error
@@ -147,6 +146,7 @@ func (p *Participant) dispatchRPC(msg *proto.Message) {
 				resp = proto.NewErrorResponse(msg.LogId, proto.StatusInternalError, "marshal response failed")
 			}
 		}
+		resp.Method = msg.Method
 		_ = p.sendMessage(resp)
 	}
 }

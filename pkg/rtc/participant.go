@@ -1819,12 +1819,21 @@ func (p *Participant) sendMessage(msg *proto.Message) error {
 	p.mu.RUnlock()
 
 	if suspended {
+		p.logger.Warn("Participant is suspended, dropping message", "method", msg.Method)
 		return nil
 	}
 
 	if producer == nil {
+		p.logger.Error("Signal channel not established", "method", msg.Method, "logId", msg.LogId)
 		return fmt.Errorf("signal channel not established")
 	}
+
+	log := p.logger.Info
+	if msg.Error() != "" {
+		log = p.logger.Error
+	}
+
+	log("Sending message", "type", msg.Type, "method", msg.Method, "logId", msg.LogId, "status", msg.Status, "data", string(msg.Data))
 
 	data := msg.Encode()
 
