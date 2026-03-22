@@ -1131,16 +1131,8 @@ func (r *Room) stopEmptyTimer() {
 // deleteLocalParticipantKV removes this participant's dynacast tracksub rows and
 // participant row for the local node only (no KV key listing).
 func (r *Room) deleteLocalParticipantKV(p *Participant) {
-	if r.roomStore == nil || p == nil {
-		return
-	}
 	for _, t := range p.GetPublishedTracks() {
-		if t == nil {
-			continue
-		}
-		if sid := t.ToProto().Sid; sid != "" {
-			r.roomStore.DeleteTrackSub(sid)
-		}
+		r.roomStore.DeleteTrackSub(t.sid)
 	}
 	r.roomStore.DeleteParticipant(p.Sid())
 }
