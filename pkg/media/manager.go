@@ -287,7 +287,6 @@ func (m *Manager) buildWebRtcServerListenInfos() []*mediasoup.TransportListenInf
 }
 
 func (m *Manager) launchWorker(index int) error {
-	m.logger.Info("Launching worker", "index", index)
 	worker, err := mediasoup.NewWorker(m.workerBin, func(o *mediasoup.WorkerSettings) {
 		o.LogLevel = mediasoup.WorkerLogLevelWarn
 	})
@@ -319,8 +318,6 @@ func (m *Manager) launchWorker(index int) error {
 	m.webRtcServers[index] = webRtcServer
 	m.workerMu.Unlock()
 
-	m.logger.Info("Worker started", "index", index, "pid", worker.Pid())
-
 	// Wait for death
 	worker.OnClose(func(context.Context) {
 		if m.closed.Load() {
@@ -340,6 +337,7 @@ func (m *Manager) restartWorker(index int) {
 			return
 		}
 		time.Sleep(1 * time.Second)
+		m.logger.Info("Restarting worker", "index", index)
 		if err := m.launchWorker(index); err == nil {
 			m.logger.Info("Worker restarted", "index", index)
 			return
