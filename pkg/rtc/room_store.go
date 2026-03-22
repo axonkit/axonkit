@@ -13,6 +13,12 @@ import (
 	"github.com/axonkit/axonkit/pkg/store"
 )
 
+// RoomStateBucketTTL is the JetStream KV max age for the ROOM_STATE bucket.
+// Each key's timer resets on Put; use a long horizon so idle participants are
+// not dropped while still connected. This TTL mainly retires orphans after
+// crashes (alongside explicit deletes and node-offline cleanup).
+const RoomStateBucketTTL = 7 * 24 * time.Hour
+
 // RoomMeta is the authoritative room state stored in the shared KV so that
 // every node creates the local Room instance with identical configuration.
 //
@@ -413,57 +419,4 @@ func (s *RoomStore) parseEvent(entry store.Entry) (RoomStoreEvent, bool) {
 	}
 
 	return evt, true
-}
-
-// CleanupLocal removes participants belonging to this node from the store.
-// After removing local participants, if no participants remain at all it also
-// removes the room meta key so the room sid can be recycled.
-func (s *RoomStore) CleanupLocal() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Remove local participants.
-	pattern := fmt.Sprintf("%s.participant.>", s.prefix())
-	keys, err := s.kv.Keys(ctx, pattern)
-	if err != nil {
-		return
-	}
-	for _, k := range keys {
-		entry, err := s.kv.Get(ctx, k)
-		if err != nil {
-			continue
-		}
-		var info proto.ParticipantInfo
-		if json.Unmarshal(entry.Value(), &info) == nil && info.NodeId == s.nodeID {
-			_ = s.kv.Delete(ctx, k)
-		}
-	}
-
-	// Remove local track subscriptions.
-	subPattern := fmt.Sprintf("%s.tracksub.>", s.prefix())
-	subKeys, _ := s.kv.Keys(ctx, subPattern)
-	for _, k := range subKeys {
-		// tracksub.<trackSid>.<nodeId> — last segment is nodeId
-		if strings.HasSuffix(k, "."+s.nodeID) {
-			_ = s.kv.Delete(ctx, k)
-		}
-	}
-
-	// If no participants remain across all nodes, clean up everything.
-	remaining, _ := s.kv.Keys(ctx, pattern)
-	if len(remaining) == 0 {
-		s.cleanupAll(ctx)
-	}
-}
-
-// cleanupAll removes every key under this room (including _meta).
-func (s *RoomStore) cleanupAll(ctx context.Context) {
-	pattern := fmt.Sprintf("%s.>", s.prefix())
-	keys, err := s.kv.Keys(ctx, pattern)
-	if err != nil {
-		return
-	}
-	for _, k := range keys {
-		_ = s.kv.Delete(ctx, k)
-	}
 }
