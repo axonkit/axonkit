@@ -1,6 +1,8 @@
 package rtc
 
 import (
+	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -310,5 +312,103 @@ func TestRoomManager_ConcurrentGetOrCreate(t *testing.T) {
 		if r.Sid() != sid {
 			t.Fatal("expected all goroutines to get the same room")
 		}
+	}
+}
+
+func TestValidateRoomName(t *testing.T) {
+	for _, name := range []string{
+		"r", "Room1", "test-room", "under_score", "a1B2c3",
+		"中文", "会议室", "umlaut-ä", "Café_1",
+	} {
+		if err := ValidateRoomName(name); err != nil {
+			t.Errorf("ValidateRoomName(%q): %v", name, err)
+		}
+	}
+	for _, name := range []string{"", "bad.room", "bad room", "x!", "a@b", "emoji🔥"} {
+		if err := ValidateRoomName(name); err == nil {
+			t.Errorf("ValidateRoomName(%q): expected error", name)
+		}
+	}
+	long := strings.Repeat("a", MaxRoomNameLen+1)
+	if err := ValidateRoomName(long); err == nil {
+		t.Fatal("expected error for length")
+	}
+	okLen := strings.Repeat("a", MaxRoomNameLen)
+	if err := ValidateRoomName(okLen); err != nil {
+		t.Fatal(err)
+	}
+	longUnicode := strings.Repeat("世", MaxRoomNameLen+1)
+	if err := ValidateRoomName(longUnicode); err == nil {
+		t.Fatal("expected error for unicode length")
+	}
+}
+
+func TestMetaKeyRoomName(t *testing.T) {
+	tests := []struct {
+		key  string
+		want string
+		ok   bool
+	}{
+		{"room.foo.meta", "foo", true},
+		{"room.a.b.meta", "a.b", true},
+		{"room..meta", "", false},
+		{"x.meta", "", false},
+		{"room.foo.bar", "", false},
+	}
+	for _, tc := range tests {
+		got, ok := MetaKeyRoomName(tc.key)
+		if ok != tc.ok || got != tc.want {
+			t.Errorf("MetaKeyRoomName(%q) = (%q, %v), want (%q, %v)", tc.key, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+func TestRoomManager_SweeperPurgesMetaWithoutLease(t *testing.T) {
+	kv := store.NewMemoryStore(0)
+	rm := NewRoomManager(RoomManagerParams{Config: defaultRMConfig(), KV: kv})
+	defer rm.Close()
+
+	old := time.Now().Add(-time.Hour).UnixMilli()
+	PutRoomMeta(kv, &RoomMeta{
+		Name:         "orphan",
+		Sid:          "rm_test",
+		CreationTime: old,
+		Config:       defaultRMConfig(),
+	})
+	ctx := context.Background()
+	if err := kv.Put(ctx, "room.orphan.participant.p1", []byte("{}")); err != nil {
+		t.Fatal(err)
+	}
+
+	rm.sweepOrphanRoomMeta(ctx)
+
+	if _, err := GetRoomMeta(kv, "orphan"); err == nil {
+		t.Fatal("expected meta purged")
+	}
+	keys, err := kv.Keys(ctx, "room.orphan.>")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 0 {
+		t.Fatalf("expected subkeys purged, got %v", keys)
+	}
+}
+
+func TestRoomManager_SweeperSkipsFreshMetaWithoutLease(t *testing.T) {
+	kv := store.NewMemoryStore(0)
+	rm := NewRoomManager(RoomManagerParams{Config: defaultRMConfig(), KV: kv})
+	defer rm.Close()
+
+	PutRoomMeta(kv, &RoomMeta{
+		Name:         "brand-new",
+		Sid:          "rm_new",
+		CreationTime: time.Now().UnixMilli(),
+		Config:       defaultRMConfig(),
+	})
+	ctx := context.Background()
+	rm.sweepOrphanRoomMeta(ctx)
+
+	if _, err := GetRoomMeta(kv, "brand-new"); err != nil {
+		t.Fatal("expected meta kept during orphan grace window")
 	}
 }

@@ -215,6 +215,12 @@ func (s *HTTPServer) handleJoinLocal(w http.ResponseWriter, req *proto.JoinReque
 		return
 	}
 
+	if err := rtc.ValidateRoomName(req.Room.Name); err != nil {
+		writeJSON(w, http.StatusBadRequest, proto.ErrorResponse{
+			Code: proto.ErrCodeInvalidRequest, Error: err.Error()})
+		return
+	}
+
 	if claims.Grants != nil && claims.Grants.Room != nil {
 		rg := claims.Grants.Room
 		if !rg.Join {

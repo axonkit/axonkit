@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/axonkit/axonkit/pkg/config"
 	"github.com/axonkit/axonkit/pkg/proto"
@@ -18,6 +20,41 @@ import (
 // not dropped while still connected. This TTL mainly retires orphans after
 // crashes (alongside explicit deletes and node-offline cleanup).
 const RoomStateBucketTTL = 7 * 24 * time.Hour
+
+// OrphanRoomMetaGrace is how long room meta may exist without a lease before
+// the sweeper purges the room prefix. This avoids racing GetOrCreateRoom,
+// which writes meta before the heartbeat goroutine creates the lease key.
+const OrphanRoomMetaGrace = 15 * time.Second
+
+// RoomStateSweeperInterval is how often nodes scan for meta-without-lease orphans.
+const RoomStateSweeperInterval = time.Minute
+
+// MaxRoomNameLen is the maximum length of a room name accepted on join.
+const MaxRoomNameLen = 128
+
+// ValidateRoomName returns an error if name is not allowed for /rtc/join.
+// Names must be at most MaxRoomNameLen Unicode code points. Allowed runes are
+// letters (any script), decimal digits, hyphen, and underscore; punctuation,
+// symbols, spaces, and other non-alphanumeric characters are rejected. This
+// keeps one KV subject segment (matches room.*.meta sweeper pattern).
+func ValidateRoomName(name string) error {
+	if utf8.RuneCountInString(name) > MaxRoomNameLen {
+		return fmt.Errorf("room name exceeds %d characters", MaxRoomNameLen)
+	}
+	if name == "" {
+		return fmt.Errorf("room name may only contain letters, digits, hyphen and underscore")
+	}
+	for _, r := range name {
+		if r == '-' || r == '_' {
+			continue
+		}
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			continue
+		}
+		return fmt.Errorf("room name may only contain letters, digits, hyphen and underscore")
+	}
+	return nil
+}
 
 // RoomMeta is the authoritative room state stored in the shared KV so that
 // every node creates the local Room instance with identical configuration.
@@ -65,6 +102,41 @@ func DeleteRoomMeta(kv store.Store, roomName string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = kv.Delete(ctx, key)
+}
+
+// RoomLeaseKey returns the JetStream KV key for a room's liveness lease.
+func RoomLeaseKey(roomName string) string {
+	return fmt.Sprintf("room.%s.lease", roomName)
+}
+
+// PurgeRoomKV removes room.<roomName>.meta (best-effort) and every key under
+// room.<roomName>.>. Used after lease loss or when the sweeper finds meta
+// without a lease (orphan).
+func PurgeRoomKV(ctx context.Context, kv store.Store, roomName string) {
+	DeleteRoomMeta(kv, roomName)
+	pattern := fmt.Sprintf("room.%s.>", roomName)
+	keys, err := kv.Keys(ctx, pattern)
+	if err != nil {
+		return
+	}
+	for _, k := range keys {
+		_ = kv.Delete(ctx, k)
+	}
+}
+
+// MetaKeyRoomName parses room.<roomName>.meta and returns roomName.
+// Join enforces a single segment without dots; this still accepts dotted
+// segments for legacy keys.
+func MetaKeyRoomName(metaKey string) (roomName string, ok bool) {
+	const suffix = ".meta"
+	if !strings.HasPrefix(metaKey, "room.") || !strings.HasSuffix(metaKey, suffix) {
+		return "", false
+	}
+	name := strings.TrimSuffix(metaKey[len("room."):], suffix)
+	if name == "" {
+		return "", false
+	}
+	return name, true
 }
 
 // RoomStore provides cross-node synchronization of room-level metadata

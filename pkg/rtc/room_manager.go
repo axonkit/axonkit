@@ -68,6 +68,7 @@ func NewRoomManager(params RoomManagerParams) *RoomManager {
 // Start starts the RoomManager background tasks.
 func (rm *RoomManager) Start(ctx context.Context) {
 	go rm.watchLeases(ctx)
+	go rm.runRoomStateSweeper(ctx)
 }
 
 func (rm *RoomManager) watchLeases(ctx context.Context) {
@@ -98,16 +99,74 @@ func (rm *RoomManager) watchLeases(ctx context.Context) {
 				roomName := keyParts[1]
 
 				time.Sleep(time.Duration(rand.Intn(1000)) * time.Millisecond)
+				purgeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 				if _, err := GetRoomMeta(rm.kv, roomName); err == nil {
-					DeleteRoomMeta(rm.kv, roomName)
-					keys, _ := rm.kv.Keys(ctx, fmt.Sprintf("room.%s.>", roomName))
-					for _, k := range keys {
-						_ = rm.kv.Delete(ctx, k)
-					}
+					PurgeRoomKV(purgeCtx, rm.kv, roomName)
+					rm.logger.Info("Purged room KV after lease delete", "room", roomName)
 				}
+				cancel()
 			}
 		}
 	}
+}
+
+func (rm *RoomManager) runRoomStateSweeper(ctx context.Context) {
+	ticker := time.NewTicker(RoomStateSweeperInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			rm.sweepOrphanRoomMeta(ctx)
+		}
+	}
+}
+
+// sweepOrphanRoomMeta removes rooms where meta exists but lease does not.
+// Any node may perform the delete; jitter + re-check reduces duplicate work.
+// A grace period after meta CreationTime avoids racing initial lease Create.
+func (rm *RoomManager) sweepOrphanRoomMeta(parentCtx context.Context) {
+	sweepCtx, cancel := context.WithTimeout(parentCtx, 45*time.Second)
+	defer cancel()
+
+	// Join restricts room names to one segment (ValidateRoomName), so
+	// room.*.meta is a valid JetStream filter and lists only meta keys.
+	keys, err := rm.kv.Keys(sweepCtx, "room.*.meta")
+	if err != nil {
+		rm.logger.Warn("Room state sweeper: list keys", "error", err)
+		return
+	}
+	for _, k := range keys {
+		roomName, ok := MetaKeyRoomName(k)
+		if !ok {
+			continue
+		}
+		rm.tryPurgeMetaWithoutLease(sweepCtx, roomName)
+	}
+}
+
+func (rm *RoomManager) tryPurgeMetaWithoutLease(ctx context.Context, roomName string) {
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt == 1 {
+			time.Sleep(time.Duration(rand.Intn(500)) * time.Millisecond)
+		}
+		meta, err := GetRoomMeta(rm.kv, roomName)
+		if err != nil || meta == nil {
+			return
+		}
+		if _, leaseErr := rm.kv.Get(ctx, RoomLeaseKey(roomName)); leaseErr == nil {
+			return
+		}
+		if time.Since(time.UnixMilli(meta.CreationTime)) < OrphanRoomMetaGrace {
+			return
+		}
+	}
+	purgeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	PurgeRoomKV(purgeCtx, rm.kv, roomName)
+	cancel()
+	rm.logger.Info("Purged orphan room KV (meta without lease)", "room", roomName)
 }
 
 // GetOrCreateRoom returns an existing room by name, or creates one using
