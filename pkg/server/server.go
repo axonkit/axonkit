@@ -142,7 +142,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		return nil, fmt.Errorf("node watcher: %w", err)
 	}
 
-	roomKV, err := store.NewNatsStore(context.Background(), js, "ROOM_STATE", 0)
+	roomKV, err := store.NewNatsStore(context.Background(), js, "ROOM_STATE", rtc.RoomStateBucketTTL)
 	if err != nil {
 		n.closeDeps()
 		return nil, fmt.Errorf("room state store: %w", err)
@@ -248,48 +248,15 @@ func (n *Server) Start(ctx context.Context) error {
 
 // Stop shuts down HTTP, subscriptions, rooms, media, routing, and NATS.
 func (n *Server) Stop(ctx context.Context) error {
-	if n == nil {
-		return nil
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	n.closeDeps()
 	if n.probeCancel != nil {
 		n.probeCancel()
 		n.probeCancel = nil
 	}
-	var errs []error
 	if n.httpServer != nil {
 		if err := n.httpServer.Shutdown(ctx); err != nil {
-			errs = append(errs, err)
+			return err
 		}
 	}
-	if n.rpcSub != nil {
-		_ = n.rpcSub.Unsubscribe()
-		n.rpcSub = nil
-	}
-	if n.fib != nil {
-		n.fib.Close()
-	}
-	if n.rib != nil {
-		n.rib.Close()
-	}
-	if n.roomManager != nil {
-		n.roomManager.Close()
-	}
-	if n.mediaMgr != nil {
-		n.mediaMgr.Close()
-	}
-	if n.registry != nil {
-		n.registry.Close()
-	}
-	if n.nc != nil {
-		n.nc.Close()
-		n.nc = nil
-	}
-	if n.embeddedNats != nil {
-		n.embeddedNats.Shutdown()
-		n.embeddedNats = nil
-	}
-	return errors.Join(errs...)
+	return nil
 }
