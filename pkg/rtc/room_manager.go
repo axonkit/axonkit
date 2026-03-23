@@ -163,9 +163,7 @@ func (rm *RoomManager) tryPurgeMetaWithoutLease(ctx context.Context, roomName st
 			return
 		}
 	}
-	purgeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	PurgeRoomKV(purgeCtx, rm.kv, roomName)
-	cancel()
+	PurgeRoomKV(ctx, rm.kv, roomName)
 	rm.logger.Info("Purged orphan room KV (meta without lease)", "room", roomName)
 }
 
