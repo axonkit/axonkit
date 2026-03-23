@@ -7,6 +7,7 @@ import (
 
 	"github.com/axonkit/axonkit/pkg/config"
 	"github.com/axonkit/axonkit/pkg/proto"
+	"github.com/jiyeyuran/mediasoup-go/v2"
 )
 
 func defaultRoomConfig() config.RoomConfig {
@@ -304,9 +305,9 @@ func TestRoom_CascadeCallbacks_Publish(t *testing.T) {
 
 	var published, unpublished []string
 	r.cascade = CascadeCallbacks{
-		OnTrackPublished:       func(sid string) { published = append(published, sid) },
+		OnTrackPublished:       func(sid string, p *mediasoup.Producer) { published = append(published, sid) },
 		OnTrackUnpublished:     func(sid string) { unpublished = append(unpublished, sid) },
-		OnDataTrackPublished:   func(sid string) { published = append(published, sid) },
+		OnDataTrackPublished:   func(sid string, dp *mediasoup.DataProducer) { published = append(published, sid) },
 		OnDataTrackUnpublished: func(sid string) { unpublished = append(unpublished, sid) },
 	}
 
@@ -378,7 +379,7 @@ func TestRoom_OnTrackPublished(t *testing.T) {
 
 	var published []string
 	r.cascade = CascadeCallbacks{
-		OnTrackPublished: func(sid string) { published = append(published, sid) },
+		OnTrackPublished: func(sid string, p *mediasoup.Producer) { published = append(published, sid) },
 	}
 
 	pub := newTestParticipant("alice")
@@ -449,7 +450,7 @@ func TestRoom_OnDataTrackPublished(t *testing.T) {
 
 	var published []string
 	r.cascade = CascadeCallbacks{
-		OnDataTrackPublished: func(sid string) { published = append(published, sid) },
+		OnDataTrackPublished: func(sid string, dp *mediasoup.DataProducer) { published = append(published, sid) },
 	}
 
 	pub := newTestParticipant("alice")
@@ -503,7 +504,7 @@ func TestRoom_SubscribeExistingTracks(t *testing.T) {
 	r.AddParticipant(pub)
 	r.AddParticipant(sub)
 
-	r.SubscribeExistingTracks(sub) // no tracks, exercises path
+	r.SubscribeExistingTracks(sub, nil) // no tracks, exercises path
 }
 
 func TestRoom_SubscribeExistingTracks_NoAutoSubscribe(t *testing.T) {
@@ -520,7 +521,7 @@ func TestRoom_SubscribeExistingTracks_NoAutoSubscribe(t *testing.T) {
 	defer sub.Close(proto.DisconnectReason_CLIENT_INITIATED)
 	r.AddParticipant(sub)
 
-	r.SubscribeExistingTracks(sub) // should return early
+	r.SubscribeExistingTracks(sub, nil) // should return early
 }
 
 func TestRoom_FindPublishedTrack_MultiParticipant(t *testing.T) {
@@ -599,9 +600,9 @@ func TestRoom_CascadeCallbacks_Advertise(t *testing.T) {
 	dataUnpublished := make([]string, 0)
 
 	r.cascade = CascadeCallbacks{
-		OnTrackPublished:       func(sid string) { published = append(published, sid) },
+		OnTrackPublished:       func(sid string, p *mediasoup.Producer) { published = append(published, sid) },
 		OnTrackUnpublished:     func(sid string) { unpublished = append(unpublished, sid) },
-		OnDataTrackPublished:   func(sid string) { dataPublished = append(dataPublished, sid) },
+		OnDataTrackPublished:   func(sid string, dp *mediasoup.DataProducer) { dataPublished = append(dataPublished, sid) },
 		OnDataTrackUnpublished: func(sid string) { dataUnpublished = append(dataUnpublished, sid) },
 	}
 

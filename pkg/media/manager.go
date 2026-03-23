@@ -90,10 +90,9 @@ type ServingDataConsumerInfo struct {
 
 type LocalProducer struct {
 	StreamID           types.StreamID
-	RouterIdx          int
 	Producer           *mediasoup.Producer
 	DataProducer       *mediasoup.DataProducer
-	RouterId           string
+	Router             *mediasoup.Router
 	UpstreamNode       types.NodeID
 	UpstreamConsumerId string
 }
@@ -159,6 +158,15 @@ func (m *Manager) Routers() []*mediasoup.Router {
 	m.workerMu.RLock()
 	defer m.workerMu.RUnlock()
 	return m.routers
+}
+
+func (m *Manager) GetRouter(routerId string) *mediasoup.Router {
+	for _, r := range m.routers {
+		if r.Id() == routerId {
+			return r
+		}
+	}
+	return nil
 }
 
 // WebRtcServers returns the WebRtcServers managed by this Manager (one per worker).
@@ -247,12 +255,17 @@ func (m *Manager) Close() {
 
 	// 1. Cleanup all streams (Unadvertise)
 	m.producersMu.Lock()
+	streamIDs := make([]types.StreamID, 0, len(m.producers))
 	for streamID := range m.producers {
+		streamIDs = append(streamIDs, streamID)
+	}
+	m.producersMu.Unlock()
+
+	for _, streamID := range streamIDs {
 		if m.OnStreamClosed != nil {
 			m.OnStreamClosed(streamID)
 		}
 	}
-	m.producersMu.Unlock()
 
 	m.workerMu.Lock()
 	defer m.workerMu.Unlock()
@@ -359,7 +372,7 @@ func (m *Manager) ConnectPipe(streamID types.StreamID, upstreamNode types.NodeID
 		}
 
 		// Return original producer ID. Consume will handle routing.
-		m.logger.Info("Stream is local", "stream_id", streamID, "router_id", lp.RouterId)
+		m.logger.Info("Stream is local", "stream_id", streamID, "router_id", lp.Router.Id())
 		return lp.Id(), nil
 	}
 
@@ -431,9 +444,8 @@ func (m *Manager) ConnectPipe(streamID types.StreamID, upstreamNode types.NodeID
 			m.producersMu.Lock()
 			m.producers[streamID] = &LocalProducer{
 				StreamID:           streamID,
-				RouterIdx:          idx,
 				DataProducer:       dataProducer,
-				RouterId:           localRouter.Id(),
+				Router:             localRouter,
 				UpstreamNode:       upstreamNode,
 				UpstreamConsumerId: resp.PipeConsumerId,
 			}
@@ -459,9 +471,8 @@ func (m *Manager) ConnectPipe(streamID types.StreamID, upstreamNode types.NodeID
 		m.producersMu.Lock()
 		m.producers[streamID] = &LocalProducer{
 			StreamID:           streamID,
-			RouterIdx:          idx,
 			Producer:           pipeProducer,
-			RouterId:           localRouter.Id(),
+			Router:             localRouter,
 			UpstreamNode:       upstreamNode,
 			UpstreamConsumerId: resp.PipeConsumerId,
 		}
@@ -922,12 +933,7 @@ func (m *Manager) handleEstablishPipe(req PipeRequest) PipeResponse {
 		return resp
 	}
 
-	router := m.routers[int(crc32.ChecksumIEEE([]byte(req.RequesterNode)))%len(m.routers)]
-	if lp != nil {
-		router = m.routers[lp.RouterIdx]
-	}
-
-	pipe, err := m.getOrCreateLocalPipe(router, req.RequesterRouterId, req.RequesterNode)
+	pipe, err := m.getOrCreateLocalPipe(lp.Router, req.RequesterRouterId, req.RequesterNode)
 	if err != nil {
 		resp.Error = err.Error()
 		return resp
@@ -1212,7 +1218,7 @@ func (m *Manager) cleanupWorkerResources(deadRouterID string) {
 	// 1. Clean Producers
 	m.producersMu.Lock()
 	for streamID, lp := range m.producers {
-		if lp.RouterId == deadRouterID {
+		if lp.Router.Id() == deadRouterID {
 			delete(m.producers, streamID)
 			if m.OnStreamClosed != nil {
 				go m.OnStreamClosed(streamID)

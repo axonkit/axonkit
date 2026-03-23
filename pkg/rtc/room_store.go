@@ -22,7 +22,7 @@ const RoomStateBucketTTL = 7 * 24 * time.Hour
 // RoomMeta is the authoritative room state stored in the shared KV so that
 // every node creates the local Room instance with identical configuration.
 //
-// Key: room.<roomName>._meta
+// Key: room.<roomName>.meta
 type RoomMeta struct {
 	Sid          string            `json:"sid"`
 	Name         string            `json:"name"`
@@ -33,7 +33,7 @@ type RoomMeta struct {
 
 // GetRoomMeta reads the room meta from the shared KV (nil if not found).
 func GetRoomMeta(kv store.Store, roomName string) (*RoomMeta, error) {
-	key := fmt.Sprintf("room.%s._meta", roomName)
+	key := fmt.Sprintf("room.%s.meta", roomName)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	entry, err := kv.Get(ctx, key)
@@ -49,7 +49,7 @@ func GetRoomMeta(kv store.Store, roomName string) (*RoomMeta, error) {
 
 // PutRoomMeta writes the room meta to the shared KV.
 func PutRoomMeta(kv store.Store, meta *RoomMeta) {
-	key := fmt.Sprintf("room.%s._meta", meta.Name)
+	key := fmt.Sprintf("room.%s.meta", meta.Name)
 	data, err := json.Marshal(meta)
 	if err != nil {
 		return
@@ -61,19 +61,22 @@ func PutRoomMeta(kv store.Store, meta *RoomMeta) {
 
 // DeleteRoomMeta removes the room meta from the shared KV.
 func DeleteRoomMeta(kv store.Store, roomName string) {
-	key := fmt.Sprintf("room.%s._meta", roomName)
+	key := fmt.Sprintf("room.%s.meta", roomName)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = kv.Delete(ctx, key)
 }
 
-// RoomStore provides cross-node synchronisation of room-level metadata
+// RoomStore provides cross-node synchronization of room-level metadata
 // (participants, groups, messages, shared state) via a shared KV store (NATS JetStream).
 //
 // Key layout:
 //
-//	room.<roomName>._meta              → JSON RoomMeta
+//	room.<roomName>.meta              → JSON RoomMeta
+//	room.<roomName>.lease             → (empty, with TTL)
 //	room.<roomName>.participant.<sid>  → JSON ParticipantInfo
+//	room.<roomName>.track.<participantSid>.<trackSid>       → JSON TrackInfo
+//	room.<roomName>.dataTrack.<participantSid>.<dataTrackSid> → JSON DataTrackInfo
 //	room.<roomName>.group.<groupId>   → JSON GroupInfo
 //	room.<roomName>.msg.<id>          → JSON MessageNotification
 //	room.<roomName>.state.<key>       → plain string value
@@ -90,6 +93,37 @@ func NewRoomStore(kv store.Store, roomName, nodeID string) *RoomStore {
 		roomName: roomName,
 		nodeID:   nodeID,
 		logger:   slog.Default().With("component", "RoomStore", "room", roomName),
+	}
+}
+
+// StartHeartbeat maintains a lease for the room and cleans up if the lease expires.
+// It should be called by the room creator/manager.
+func (s *RoomStore) StartHeartbeat(ctx context.Context) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	leaseKey := fmt.Sprintf("%s.lease", s.prefix())
+
+	// Create the lease key once with a TTL.
+	ctxCreate, cancelCreate := context.WithTimeout(ctx, 2*time.Second)
+	_ = s.kv.Create(ctxCreate, leaseKey, []byte(s.nodeID), store.WithCreateTTL(5*time.Second))
+	cancelCreate()
+
+	updateLease := func() {
+		ctxPut, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		_ = s.kv.Put(ctxPut, leaseKey, []byte(s.nodeID))
+	}
+
+	updateLease()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			updateLease()
+		}
 	}
 }
 
@@ -111,6 +145,21 @@ func (s *RoomStore) PutParticipant(info *proto.ParticipantInfo) {
 	if err := s.kv.Put(ctx, key, data); err != nil {
 		s.logger.Warn("Failed to put participant", "sid", info.Sid, "error", err)
 	}
+}
+
+func (s *RoomStore) GetParticipant(sid string) *proto.ParticipantInfo {
+	key := fmt.Sprintf("%s.participant.%s", s.prefix(), sid)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	entry, err := s.kv.Get(ctx, key)
+	if err != nil {
+		return nil
+	}
+	var info proto.ParticipantInfo
+	if err := json.Unmarshal(entry.Value(), &info); err == nil {
+		return &info
+	}
+	return nil
 }
 
 func (s *RoomStore) DeleteParticipant(sid string) {
@@ -140,6 +189,106 @@ func (s *RoomStore) GetAllParticipants() []*proto.ParticipantInfo {
 		var info proto.ParticipantInfo
 		if err := json.Unmarshal(entry.Value(), &info); err == nil {
 			result = append(result, &info)
+		}
+	}
+	return result
+}
+
+// --- Track & DataTrack ---
+
+func (s *RoomStore) PutTrack(participantSid string, info *proto.TrackInfo) {
+	key := fmt.Sprintf("%s.track.%s.%s", s.prefix(), participantSid, info.Sid)
+	data, err := json.Marshal(info)
+	if err != nil {
+		s.logger.Warn("Failed to marshal track", "error", err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.kv.Put(ctx, key, data); err != nil {
+		s.logger.Warn("Failed to put track", "sid", info.Sid, "error", err)
+	}
+}
+
+func (s *RoomStore) DeleteTrack(participantSid, trackSid string) {
+	key := fmt.Sprintf("%s.track.%s.%s", s.prefix(), participantSid, trackSid)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.kv.Delete(ctx, key); err != nil {
+		s.logger.Warn("Failed to delete track", "sid", trackSid, "error", err)
+	}
+}
+
+func (s *RoomStore) GetAllTracks() map[string][]*proto.TrackInfo {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	pattern := fmt.Sprintf("%s.track.>", s.prefix())
+	keys, err := s.kv.Keys(ctx, pattern)
+	if err != nil {
+		return nil
+	}
+	result := make(map[string][]*proto.TrackInfo)
+	for _, k := range keys {
+		entry, err := s.kv.Get(ctx, k)
+		if err != nil {
+			continue
+		}
+		var info proto.TrackInfo
+		if err := json.Unmarshal(entry.Value(), &info); err == nil {
+			parts := strings.Split(k, ".")
+			if len(parts) >= 4 {
+				participantSid := parts[3]
+				result[participantSid] = append(result[participantSid], &info)
+			}
+		}
+	}
+	return result
+}
+
+func (s *RoomStore) PutDataTrack(participantSid string, info *proto.DataTrackInfo) {
+	key := fmt.Sprintf("%s.dataTrack.%s.%s", s.prefix(), participantSid, info.Sid)
+	data, err := json.Marshal(info)
+	if err != nil {
+		s.logger.Warn("Failed to marshal dataTrack", "error", err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.kv.Put(ctx, key, data); err != nil {
+		s.logger.Warn("Failed to put dataTrack", "sid", info.Sid, "error", err)
+	}
+}
+
+func (s *RoomStore) DeleteDataTrack(participantSid, trackSid string) {
+	key := fmt.Sprintf("%s.dataTrack.%s.%s", s.prefix(), participantSid, trackSid)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.kv.Delete(ctx, key); err != nil {
+		s.logger.Warn("Failed to delete dataTrack", "sid", trackSid, "error", err)
+	}
+}
+
+func (s *RoomStore) GetAllDataTracks() map[string][]*proto.DataTrackInfo {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	pattern := fmt.Sprintf("%s.dataTrack.>", s.prefix())
+	keys, err := s.kv.Keys(ctx, pattern)
+	if err != nil {
+		return nil
+	}
+	result := make(map[string][]*proto.DataTrackInfo)
+	for _, k := range keys {
+		entry, err := s.kv.Get(ctx, k)
+		if err != nil {
+			continue
+		}
+		var info proto.DataTrackInfo
+		if err := json.Unmarshal(entry.Value(), &info); err == nil {
+			parts := strings.Split(k, ".")
+			if len(parts) >= 4 {
+				participantSid := parts[3]
+				result[participantSid] = append(result[participantSid], &info)
+			}
 		}
 	}
 	return result
@@ -332,15 +481,18 @@ func (s *RoomStore) DeleteTrackSub(trackSid string) {
 
 // RoomStoreEvent represents a change observed from the shared store.
 type RoomStoreEvent struct {
-	Type      string // "participant", "group", "msg", "tracksub", "state"
+	Type      string // "participant", "group", "msg", "tracksub", "state", "lease", "track", "dataTrack"
 	Operation store.Operation
-	Key       string // the sub-key (sid, groupId, msgId, trackSid.nodeId, stateKey)
+	Key       string // the sub-key (sid, groupId, msgId, participantSid, stateKey)
+	SubKey    string // the second sub-key (e.g. trackSid for track/dataTrack)
 
 	Participant *proto.ParticipantInfo
 	Group       *proto.GroupInfo
 	Message     *proto.MessageNotification
 	TrackSub    *TrackSubInfo
 	StateValue  string // populated for "state" Put events
+	Track       *proto.TrackInfo
+	DataTrack   *proto.DataTrackInfo
 }
 
 // Watch starts watching all keys under this room prefix. Events from the
@@ -373,22 +525,24 @@ func (s *RoomStore) Watch(ctx context.Context) (<-chan RoomStoreEvent, error) {
 }
 
 func (s *RoomStore) parseEvent(entry store.Entry) (RoomStoreEvent, bool) {
-	// Key format: room.<roomName>.<type>.<id>
+	// Key format: room.<roomName>.<type>.<id> or room.<roomName>.<type>.<participantSid>.<trackSid>
 	key := entry.Key()
 	prefix := s.prefix() + "."
 	if !strings.HasPrefix(key, prefix) {
 		return RoomStoreEvent{}, false
 	}
 	rest := key[len(prefix):]
-	parts := strings.SplitN(rest, ".", 2)
-	if len(parts) != 2 {
-		return RoomStoreEvent{}, false
-	}
+	parts := strings.SplitN(rest, ".", 3)
 
 	evt := RoomStoreEvent{
 		Type:      parts[0],
 		Operation: entry.Operation(),
-		Key:       parts[1],
+	}
+	if len(parts) > 1 {
+		evt.Key = parts[1]
+	}
+	if len(parts) > 2 {
+		evt.SubKey = parts[2]
 	}
 
 	if entry.Operation() == store.OpPut {
@@ -415,6 +569,16 @@ func (s *RoomStore) parseEvent(entry store.Entry) (RoomStoreEvent, bool) {
 			}
 		case "state":
 			evt.StateValue = string(entry.Value())
+		case "track":
+			var info proto.TrackInfo
+			if json.Unmarshal(entry.Value(), &info) == nil {
+				evt.Track = &info
+			}
+		case "dataTrack":
+			var info proto.DataTrackInfo
+			if json.Unmarshal(entry.Value(), &info) == nil {
+				evt.DataTrack = &info
+			}
 		}
 	}
 

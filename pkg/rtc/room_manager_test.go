@@ -197,7 +197,7 @@ func TestRoomManager_CascadeCallbacks_WithRIBAndMedia(t *testing.T) {
 	room := rm.GetOrCreateRoom("cascade-room", 0, "")
 
 	// OnTrackPublished callback should register with media and RIB
-	room.cascade.OnTrackPublished("rt-aaa.pr-bbb")
+	room.cascade.OnTrackPublished("rt-aaa.pr-bbb", nil)
 	time.Sleep(100 * time.Millisecond)
 
 	streamID := types.StreamID("rt-aaa.pr-bbb")
@@ -214,7 +214,7 @@ func TestRoomManager_CascadeCallbacks_WithRIBAndMedia(t *testing.T) {
 	}
 
 	// OnDataTrackPublished
-	room.cascade.OnDataTrackPublished("rt-aaa.dp-ccc")
+	room.cascade.OnDataTrackPublished("rt-aaa.dp-ccc", nil)
 	time.Sleep(100 * time.Millisecond)
 
 	dStreamID := types.StreamID("rt-aaa.dp-ccc")

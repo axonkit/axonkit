@@ -6,29 +6,49 @@ import (
 	"sync"
 	"time"
 
-	"github.com/axonkit/axonkit/pkg/store/ttl"
-
 	"github.com/nats-io/nats.go/jetstream"
 )
+
+type NatsStoreOptions struct {
+	Description    string
+	LimitMarkerTTL time.Duration
+}
+
+type NatsStoreOption func(*NatsStoreOptions)
+
+func WithDescription(desc string) NatsStoreOption {
+	return func(o *NatsStoreOptions) { o.Description = desc }
+}
+
+func WithLimitMarkerTTL(ttl time.Duration) NatsStoreOption {
+	return func(o *NatsStoreOptions) { o.LimitMarkerTTL = ttl }
+}
 
 type NatsStore struct {
 	kv       jetstream.KeyValue
 	ttl      time.Duration
 	bucket   string
 	logger   *slog.Logger
-	ttlMgr   *ttl.Manager[string, uint64]
 	watchers []*natsWatcher
 	mu       sync.RWMutex
 }
 
 // NewNatsStore creates a new NATS-backed KV store.
 // It ensures the bucket exists with the given configuration.
-func NewNatsStore(ctx context.Context, js jetstream.JetStream, bucket string, ttlDuration time.Duration) (*NatsStore, error) {
+func NewNatsStore(ctx context.Context, js jetstream.JetStream, bucket string, ttlDuration time.Duration, opts ...NatsStoreOption) (*NatsStore, error) {
+	options := NatsStoreOptions{
+		LimitMarkerTTL: 3 * time.Second,
+	}
+	for _, opt := range opts {
+		opt(&options)
+	}
+
 	kv, err := js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
-		Bucket:      bucket,
-		Description: "Routing Information Base",
-		TTL:         ttlDuration,
-		History:     1,
+		Bucket:         bucket,
+		Description:    options.Description,
+		TTL:            ttlDuration,
+		History:        1,
+		LimitMarkerTTL: options.LimitMarkerTTL,
 	})
 	if err != nil {
 		return nil, err
@@ -41,49 +61,22 @@ func NewNatsStore(ctx context.Context, js jetstream.JetStream, bucket string, tt
 		logger: slog.Default().With("component", "NatsStore", "bucket", bucket),
 	}
 
-	if ttlDuration > 0 {
-		// Use local TTL Manager
-		s.ttlMgr = ttl.NewManager(func(key string, rev uint64) {
-			// Check if key still exists
-			if _, err := kv.Get(context.Background(), key); err == nil {
-				s.logger.Warn("Key still exists, ignore expiration", "key", key, "rev", rev)
-				return
-			}
-			s.logger.Info("Expired key", "key", key, "rev", rev)
+	return s, nil
+}
 
-			// Notify local watchers
-			s.mu.RLock()
-			defer s.mu.RUnlock()
-
-			for _, w := range s.watchers {
-				if matchSubject(w.pattern, key) {
-					// Create local delete event
-					e := &localEntry{
-						key: key,
-						op:  OpDelete,
-					}
-
-					// Attempt to send, but don't block forever
-					// Note: nw.ch is unbuffered usually?
-					// In Watch(), we created it with make(chan Entry). Unbuffered.
-					// If the consumer is slow, we might block here.
-					// But we hold RLock, so we block other operations?
-					// Ideally we should use select with default or timeout.
-					// But if we drop, the watcher misses the expiration.
-
-					// Let's use a non-blocking send to be safe against deadlocks/blocking,
-					// assuming watchers are consuming.
-					select {
-					case w.ch <- e:
-					case <-time.After(100 * time.Millisecond):
-						s.logger.Warn("Failed to notify watcher of expiration (timeout)", "key", key)
-					}
-				}
-			}
-		})
+func (s *NatsStore) Create(ctx context.Context, key string, value []byte, opts ...CreateOption) error {
+	var o CreateOptions
+	for _, opt := range opts {
+		opt(&o)
 	}
 
-	return s, nil
+	if o.TTL > 0 {
+		_, err := s.kv.Create(ctx, key, value, jetstream.KeyTTL(o.TTL))
+		return err
+	}
+
+	_, err := s.kv.Create(ctx, key, value)
+	return err
 }
 
 func (s *NatsStore) Put(ctx context.Context, key string, value []byte) error {
@@ -141,16 +134,6 @@ func (s *NatsStore) Watch(ctx context.Context, pattern string, opts ...WatchOpti
 		for e := range w.Updates() {
 			if e == nil {
 				continue
-			}
-
-			// Handle TTL for externally watched keys
-			if s.ttlMgr != nil {
-				switch e.Operation() {
-				case jetstream.KeyValuePut:
-					s.ttlMgr.Add(e.Key(), e.Revision(), s.ttl+time.Second)
-				case jetstream.KeyValueDelete, jetstream.KeyValuePurge:
-					s.ttlMgr.Remove(e.Key())
-				}
 			}
 
 			nw.ch <- &natsEntry{e}

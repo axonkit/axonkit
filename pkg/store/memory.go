@@ -27,12 +27,10 @@ func NewMemoryStore(ttlDuration time.Duration) *MemoryStore {
 		ttl:  ttlDuration,
 	}
 
-	if ttlDuration > 0 {
-		ms.ttlMgr = ttl.NewManager(func(key string, _ struct{}) {
-			// Expired
-			ms.Delete(context.Background(), key)
-		})
-	}
+	ms.ttlMgr = ttl.NewManager(func(key string, _ struct{}) {
+		// Expired
+		ms.Delete(context.Background(), key)
+	})
 
 	return ms
 }
@@ -83,6 +81,38 @@ func (w *memoryWatcher) Stop() {
 	close(w.ch)
 }
 
+func (s *MemoryStore) Create(ctx context.Context, key string, value []byte, opts ...CreateOption) error {
+	var o CreateOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.data[key]; exists {
+		return fmt.Errorf("key exists: %s", key)
+	}
+
+	// Clone value to prevent external modification
+	valCopy := make([]byte, len(value))
+	copy(valCopy, value)
+	s.data[key] = valCopy
+
+	ttl := s.ttl
+
+	if o.TTL > 0 {
+		ttl = o.TTL
+	}
+
+	if ttl > 0 && s.ttlMgr != nil {
+		s.ttlMgr.Add(key, struct{}{}, ttl)
+	}
+
+	s.notify(key, valCopy, OpPut)
+	return nil
+}
+
 func (s *MemoryStore) Put(ctx context.Context, key string, value []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -91,6 +121,10 @@ func (s *MemoryStore) Put(ctx context.Context, key string, value []byte) error {
 	valCopy := make([]byte, len(value))
 	copy(valCopy, value)
 	s.data[key] = valCopy
+
+	if s.ttl > 0 && s.ttlMgr != nil {
+		s.ttlMgr.Add(key, struct{}{}, s.ttl)
+	}
 
 	s.notify(key, valCopy, OpPut)
 	return nil
@@ -124,6 +158,8 @@ func (s *MemoryStore) Delete(ctx context.Context, key string) error {
 		return nil // NATS Delete is idempotent-ish usually, or we can return error
 	}
 	delete(s.data, key)
+
+	s.ttlMgr.Remove(key)
 
 	s.notify(key, nil, OpDelete)
 	return nil
@@ -179,9 +215,7 @@ func (s *MemoryStore) Close() error {
 	defer s.mu.Unlock()
 
 	// Stop all timers
-	if s.ttlMgr != nil {
-		s.ttlMgr.Close()
-	}
+	s.ttlMgr.Close()
 
 	// Stop all watchers
 	for _, w := range s.watchers {
@@ -199,16 +233,6 @@ func (s *MemoryStore) Close() error {
 
 // notify must be called with lock held
 func (s *MemoryStore) notify(key string, value []byte, op Operation) {
-	// Handle TTL globally (once per update)
-	if s.ttlMgr != nil {
-		switch op {
-		case OpPut:
-			s.ttlMgr.Add(key, struct{}{}, s.ttl)
-		case OpDelete:
-			s.ttlMgr.Remove(key)
-		}
-	}
-
 	for _, w := range s.watchers {
 		if w.opts.IgnoreDeletes && op == OpDelete {
 			continue
@@ -245,10 +269,9 @@ func matchSubject(pattern, subject string) bool {
 		if i >= len(sTokens) {
 			return false
 		}
-		sToken := sTokens[i]
-		if pToken != "*" && pToken != sToken {
+		if pToken != "*" && pToken != sTokens[i] {
 			return false
 		}
 	}
-	return len(pTokens) == len(sTokens)
+	return len(pTokens) == len(sTokens) || (len(pTokens) > 0 && pTokens[len(pTokens)-1] == ">")
 }

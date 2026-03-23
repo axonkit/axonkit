@@ -103,6 +103,11 @@ func createAxonkitNode(t *testing.T, srv interface{ ClientURL() string }, nodeID
 	fib.ConnectPipe = mgr.ConnectPipe
 	fib.DisconnectPipe = mgr.DisconnectPipe
 
+	roomKV, err := store.NewNatsStore(context.Background(), js, "ROOM_STATE", 0)
+	if err != nil {
+		t.Fatalf("room state store failed for %s: %v", nodeID, err)
+	}
+
 	roomMgr := rtc.NewRoomManager(rtc.RoomManagerParams{
 		Config: config.RoomConfig{
 			EmptyTimeout:     5 * time.Minute,
@@ -115,6 +120,8 @@ func createAxonkitNode(t *testing.T, srv interface{ ClientURL() string }, nodeID
 		FIB:          fib,
 		Finder:       finder,
 		MediaManager: mgr,
+		KV:           roomKV,
+		NodeID:       string(nodeInfo.ID),
 	})
 
 	return &axonkitNode{

@@ -444,6 +444,9 @@ func (r *RIB) GetCandidates(streamID types.StreamID) ([]types.RouteKVValue, erro
 		if err != nil {
 			continue
 		}
+		if entry.Operation() == store.OpDelete {
+			continue
+		}
 
 		var val types.RouteKVValue
 		if err := json.Unmarshal(entry.Value(), &val); err != nil {

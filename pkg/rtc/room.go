@@ -3,14 +3,17 @@ package rtc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/axonkit/axonkit/pkg/config"
+	"github.com/axonkit/axonkit/pkg/media"
 	"github.com/axonkit/axonkit/pkg/proto"
 	"github.com/axonkit/axonkit/pkg/store"
+	"github.com/jiyeyuran/mediasoup-go/v2"
 )
 
 var (
@@ -25,11 +28,11 @@ var (
 type CascadeCallbacks struct {
 	// OnTrackPublished advertises the stream via RIB and registers
 	// the producer in media.Manager so remote nodes can pipe it.
-	OnTrackPublished func(streamID string)
+	OnTrackPublished func(streamID string, producer *mediasoup.Producer)
 	// OnTrackUnpublished stops the RIB advertisement and unregisters the producer.
 	OnTrackUnpublished func(streamID string)
 	// OnDataTrackPublished advertises a data stream.
-	OnDataTrackPublished func(streamID string)
+	OnDataTrackPublished func(streamID string, dataProducer *mediasoup.DataProducer)
 	// OnDataTrackUnpublished stops the data stream advertisement.
 	OnDataTrackUnpublished func(streamID string)
 	// EnsureStream is called before subscribing. For remote streams it
@@ -39,6 +42,10 @@ type CascadeCallbacks struct {
 	// ReleaseStream is called when a consumer closes. It decrements the
 	// FIB ref-count and tears down the pipe when no consumers remain.
 	ReleaseStream func(streamID string)
+	// GetLocalProducer returns the piped producer for a remote stream.
+	GetLocalProducer func(streamID string) *media.LocalProducer
+	// GetRouter returns a local router by ID.
+	GetRouter func(routerId string) *mediasoup.Router
 }
 
 type Room struct {
@@ -49,8 +56,9 @@ type Room struct {
 	creationTime time.Time
 
 	participants       map[string]*Participant
-	remoteParticipants map[string]bool   // SIDs of participants on other nodes
-	groups             map[string]*Group // groupSid -> Group
+	remoteParticipants map[string]bool             // SIDs of participants on other nodes
+	remoteTracks       map[string]*proto.TrackInfo // trackSid -> TrackInfo (for remote tracks)
+	groups             map[string]*Group           // groupSid -> Group
 	messages           []*proto.MessageNotification
 	remoteMsgIds       map[string]bool   // dedup remote messages
 	sharedState        map[string]string // room-level KV for collaboration features
@@ -66,6 +74,7 @@ type Room struct {
 
 	emptyTimer *time.Timer
 	closed     bool
+	asyncWG    sync.WaitGroup
 }
 
 type RoomParams struct {
@@ -84,6 +93,7 @@ func NewRoom(params RoomParams) *Room {
 		metadata:           params.Metadata,
 		participants:       make(map[string]*Participant),
 		remoteParticipants: make(map[string]bool),
+		remoteTracks:       make(map[string]*proto.TrackInfo),
 		groups:             make(map[string]*Group),
 		remoteMsgIds:       make(map[string]bool),
 		sharedState:        make(map[string]string),
@@ -136,6 +146,7 @@ func (r *Room) SetupStore(kv store.Store, nodeID string) {
 		r.logger.Warn("Failed to start room store watch", "error", err)
 		return
 	}
+	go r.roomStore.StartHeartbeat(ctx)
 	go r.processStoreEvents(ch, nodeID)
 }
 
@@ -162,6 +173,10 @@ func (r *Room) processStoreEvents(ch <-chan RoomStoreEvent, localNodeID string) 
 			} else if evt.Operation == store.OpDelete {
 				r.handleRemoteTrackSubEvent(evt)
 			}
+		case "track":
+			r.handleRemoteTrackEvent(evt)
+		case "dataTrack":
+			r.handleRemoteDataTrackEvent(evt)
 		}
 	}
 }
@@ -295,6 +310,184 @@ func (r *Room) handleRemoteTrackSubEvent(evt RoomStoreEvent) {
 	}
 }
 
+func (r *Room) handleRemoteTrackEvent(evt RoomStoreEvent) {
+	r.mu.Lock()
+	trackSid := evt.SubKey
+	participantSid := evt.Key
+
+	switch evt.Operation {
+	case store.OpPut:
+		if evt.Track == nil {
+			r.mu.Unlock()
+			return
+		}
+		existing := r.remoteTracks[trackSid]
+		r.remoteTracks[trackSid] = evt.Track
+		r.mu.Unlock()
+
+		if participantSid != "" {
+			if existing == nil {
+				r.BroadcastNotification(proto.MethodTrackPublished, &proto.TrackPublishedNotification{
+					ParticipantSid: participantSid,
+					Track:          evt.Track,
+				}, "")
+
+				if r.config.AutoSubscribe {
+					var publisherGroupId string
+					if r.roomStore != nil {
+						if remoteP := r.roomStore.GetParticipant(participantSid); remoteP != nil {
+							publisherGroupId = remoteP.GroupId
+						}
+					}
+
+					others := r.GetOtherParticipants(participantSid)
+					for _, sub := range others {
+						if !sub.IsReady() || !sub.CanSubscribe() || !sub.AutoSubscribe() {
+							continue
+						}
+						if !r.shouldPeerSubscribe(publisherGroupId, sub.GetGroupId()) {
+							continue
+						}
+						go func(subscriber *Participant) {
+							track, publisher, err := r.resolveRemoteTrack(evt.Track, participantSid)
+							if err != nil {
+								r.logger.Warn("Resolve remote track failed",
+									"subscriber", subscriber.identity, "track", trackSid, "error", err)
+								return
+							}
+							if err := subscriber.Subscribe(track, publisher); err != nil {
+								r.logger.Warn("Auto subscribe remote track failed",
+									"subscriber", subscriber.identity, "track", trackSid, "error", err)
+							}
+						}(sub)
+					}
+				}
+			} else if existing.Muted != evt.Track.Muted {
+				r.BroadcastNotification(proto.MethodTrackMuted, &proto.TrackMutedNotification{
+					ParticipantSid: participantSid,
+					TrackSid:       trackSid,
+					Muted:          evt.Track.Muted,
+				}, "")
+			}
+		}
+	case store.OpDelete:
+		delete(r.remoteTracks, trackSid)
+		r.mu.Unlock()
+
+		r.BroadcastNotification(proto.MethodTrackUnpublished, &proto.TrackUnpublishedNotification{
+			ParticipantSid: participantSid,
+			TrackSid:       trackSid,
+		}, "")
+	default:
+		r.mu.Unlock()
+	}
+}
+
+func (r *Room) handleRemoteDataTrackEvent(evt RoomStoreEvent) {
+	r.mu.Lock()
+	trackSid := evt.SubKey
+	participantSid := evt.Key
+
+	switch evt.Operation {
+	case store.OpPut:
+		if evt.DataTrack == nil {
+			r.mu.Unlock()
+			return
+		}
+		r.mu.Unlock()
+
+		if participantSid != "" && r.config.AutoSubscribe {
+			var publisherGroupId string
+			if r.roomStore != nil {
+				if remoteP := r.roomStore.GetParticipant(participantSid); remoteP != nil {
+					publisherGroupId = remoteP.GroupId
+				}
+			}
+
+			others := r.GetOtherParticipants(participantSid)
+			for _, sub := range others {
+				if !sub.IsReady() || !sub.CanSubscribe() || !sub.AutoSubscribe() {
+					continue
+				}
+				if !r.shouldPeerSubscribe(publisherGroupId, sub.GetGroupId()) {
+					continue
+				}
+				go func(subscriber *Participant) {
+					track, publisher, err := r.resolveRemoteDataTrack(evt.DataTrack, participantSid)
+					if err != nil {
+						r.logger.Warn("Resolve remote data track failed",
+							"subscriber", subscriber.identity, "dataTrack", trackSid, "error", err)
+						return
+					}
+					if err := subscriber.SubscribeData(track, publisher); err != nil {
+						r.logger.Warn("Auto subscribe remote data track failed",
+							"subscriber", subscriber.identity, "dataTrack", trackSid, "error", err)
+					}
+				}(sub)
+			}
+		}
+	case store.OpDelete:
+		r.mu.Unlock()
+	default:
+		r.mu.Unlock()
+	}
+}
+
+// resolveRemoteTrack pipes a remote track to the local node and, if the pipe
+// router differs from targetRouter, does a cross-router PipeToRouter so the
+// returned producer is directly consumable on targetRouter.
+func (r *Room) resolveRemoteTrack(trackInfo *proto.TrackInfo, publisherSid string) (*PublishedTrack, *Participant, error) {
+	if r.cascade.EnsureStream == nil || r.cascade.GetLocalProducer == nil {
+		return nil, nil, errors.New("cascade not configured")
+	}
+	if err := r.cascade.EnsureStream(trackInfo.Sid); err != nil {
+		return nil, nil, fmt.Errorf("ensure stream: %w", err)
+	}
+	lp := r.cascade.GetLocalProducer(trackInfo.Sid)
+	if lp == nil || lp.Producer == nil {
+		return nil, nil, fmt.Errorf("local producer not found for %s", trackInfo.Sid)
+	}
+
+	track := &PublishedTrack{
+		sid:      trackInfo.Sid,
+		name:     trackInfo.Name,
+		source:   trackInfo.Source,
+		kind:     trackInfo.Kind,
+		producer: lp.Producer,
+		muted:    trackInfo.Muted,
+	}
+	publisher := &Participant{
+		sid:    publisherSid,
+		router: lp.Router,
+	}
+	return track, publisher, nil
+}
+
+// resolveRemoteDataTrack is the data-track counterpart of resolveRemoteTrack.
+func (r *Room) resolveRemoteDataTrack(trackInfo *proto.DataTrackInfo, publisherSid string) (*DataPublishedTrack, *Participant, error) {
+	if r.cascade.EnsureStream == nil || r.cascade.GetLocalProducer == nil {
+		return nil, nil, errors.New("cascade not configured")
+	}
+	if err := r.cascade.EnsureStream(trackInfo.Sid); err != nil {
+		return nil, nil, fmt.Errorf("ensure stream: %w", err)
+	}
+	lp := r.cascade.GetLocalProducer(trackInfo.Sid)
+	if lp == nil || lp.DataProducer == nil {
+		return nil, nil, fmt.Errorf("local data producer not found for %s", trackInfo.Sid)
+	}
+
+	track := &DataPublishedTrack{
+		sid:          trackInfo.Sid,
+		name:         trackInfo.Name,
+		dataProducer: lp.DataProducer,
+	}
+	publisher := &Participant{
+		sid:    publisherSid,
+		router: lp.Router,
+	}
+	return track, publisher, nil
+}
+
 func (r *Room) AddParticipant(p *Participant) error {
 	// First pass: detect duplicate identity and check capacity.
 	r.mu.Lock()
@@ -347,7 +540,7 @@ func (r *Room) AddParticipant(p *Participant) error {
 		"count", len(r.participants))
 
 	if r.roomStore != nil {
-		go r.roomStore.PutParticipant(p.ToProto())
+		r.runAsync(func() { r.roomStore.PutParticipant(p.ToProto()) })
 	}
 
 	return nil
@@ -367,7 +560,7 @@ func (r *Room) RemoveParticipant(sid string, reason proto.DisconnectReason) {
 	r.logger.Info("Participant removed", "participant", p.identity, "sid", sid, "remaining", count)
 
 	if r.roomStore != nil {
-		go r.roomStore.DeleteParticipant(sid)
+		r.runAsync(func() { r.roomStore.DeleteParticipant(sid) })
 	}
 
 	r.BroadcastNotification(proto.MethodParticipantLeft, &proto.ParticipantLeftNotification{
@@ -483,6 +676,14 @@ func (r *Room) ToProto() *proto.Room {
 	}
 }
 
+func (r *Room) runAsync(f func()) {
+	r.asyncWG.Add(1)
+	go func() {
+		defer r.asyncWG.Done()
+		f()
+	}()
+}
+
 // GetAllParticipantInfos returns ParticipantInfo for all participants across
 // all nodes. Local participants are serialized from in-memory state; remote
 // participants are fetched from the shared store.
@@ -500,10 +701,24 @@ func (r *Room) GetAllParticipantInfos(excludeSid string) []*proto.ParticipantInf
 
 	if r.roomStore != nil {
 		remote := r.roomStore.GetAllParticipants()
+
+		// Fetch all remote tracks and data tracks to populate the remote participants
+		tracksByParticipant := r.roomStore.GetAllTracks()
+		dataTracksByParticipant := r.roomStore.GetAllDataTracks()
+
 		for _, info := range remote {
 			if info.Sid == excludeSid || localSids[info.Sid] {
 				continue
 			}
+
+			// Populate tracks
+			if tracks, ok := tracksByParticipant[info.Sid]; ok {
+				info.Tracks = tracks
+			}
+			if dataTracks, ok := dataTracksByParticipant[info.Sid]; ok {
+				info.DataTracks = dataTracks
+			}
+
 			result = append(result, info)
 		}
 	}
@@ -615,7 +830,7 @@ func (r *Room) StoreMessage(msg *proto.MessageNotification) {
 			if m.ID == msg.ID {
 				r.messages[i] = msg
 				if r.roomStore != nil {
-					go r.roomStore.PutMessage(msg)
+					r.runAsync(func() { r.roomStore.PutMessage(msg) })
 				}
 				return
 			}
@@ -624,7 +839,7 @@ func (r *Room) StoreMessage(msg *proto.MessageNotification) {
 
 	r.messages = append(r.messages, msg)
 	if r.roomStore != nil {
-		go r.roomStore.PutMessage(msg)
+		r.runAsync(func() { r.roomStore.PutMessage(msg) })
 	}
 
 	r.evictOldMessages()
@@ -646,7 +861,7 @@ func (r *Room) evictOldMessages() {
 		for i, m := range evicted {
 			ids[i] = m.ID
 		}
-		go r.roomStore.DeleteMessagesByIDs(ids)
+		r.runAsync(func() { r.roomStore.DeleteMessagesByIDs(ids) })
 	}
 }
 
@@ -697,7 +912,7 @@ func (r *Room) UpdateState(key, value, participantSid, participantIdentity strin
 	r.mu.Unlock()
 
 	if r.roomStore != nil {
-		go r.roomStore.PutState(key, value)
+		r.runAsync(func() { r.roomStore.PutState(key, value) })
 	}
 
 	r.BroadcastNotification(proto.MethodStateUpdated, &proto.StateUpdatedNotification{
@@ -715,7 +930,7 @@ func (r *Room) DeleteState(key, participantSid, participantIdentity string) {
 	r.mu.Unlock()
 
 	if r.roomStore != nil {
-		go r.roomStore.DeleteState(key)
+		r.runAsync(func() { r.roomStore.DeleteState(key) })
 	}
 
 	r.BroadcastNotification(proto.MethodStateDeleted, &proto.StateDeletedNotification{
@@ -754,13 +969,16 @@ func (r *Room) GetMessagesSince(since int64) []*proto.MessageNotification {
 // For auto-subscribe rooms, it creates subscriptions for all other participants.
 func (r *Room) OnTrackPublished(publisher *Participant, track *PublishedTrack) {
 	if r.cascade.OnTrackPublished != nil {
-		r.cascade.OnTrackPublished(track.sid)
+		r.cascade.OnTrackPublished(track.sid, track.producer)
 	}
 
 	r.BroadcastNotification(proto.MethodTrackPublished, &proto.TrackPublishedNotification{
 		ParticipantSid: publisher.sid,
 		Track:          track.ToProto(),
 	}, publisher.sid)
+	if r.roomStore != nil {
+		r.runAsync(func() { r.roomStore.PutTrack(publisher.sid, track.ToProto()) })
+	}
 
 	if !r.config.AutoSubscribe {
 		return
@@ -794,6 +1012,9 @@ func (r *Room) OnTrackUnpublished(publisher *Participant, trackSid string) {
 		ParticipantSid: publisher.sid,
 		TrackSid:       trackSid,
 	}, publisher.sid)
+	if r.roomStore != nil {
+		r.runAsync(func() { r.roomStore.DeleteTrack(publisher.sid, trackSid) })
+	}
 }
 
 // OnTrackMuted handles a track being muted/unmuted.
@@ -803,12 +1024,20 @@ func (r *Room) OnTrackMuted(publisher *Participant, trackSid string, muted bool)
 		TrackSid:       trackSid,
 		Muted:          muted,
 	}, publisher.sid)
+	if r.roomStore != nil {
+		if track := r.FindPublishedTrack(trackSid); track != nil {
+			r.runAsync(func() { r.roomStore.PutTrack(publisher.sid, track.ToProto()) })
+		}
+	}
 }
 
 // OnDataTrackPublished handles auto-subscribe for data tracks.
 func (r *Room) OnDataTrackPublished(publisher *Participant, track *DataPublishedTrack) {
 	if r.cascade.OnDataTrackPublished != nil {
-		r.cascade.OnDataTrackPublished(track.sid)
+		r.cascade.OnDataTrackPublished(track.sid, track.dataProducer)
+	}
+	if r.roomStore != nil {
+		r.runAsync(func() { r.roomStore.PutDataTrack(publisher.sid, track.ToProto()) })
 	}
 
 	if !r.config.AutoSubscribe {
@@ -834,40 +1063,74 @@ func (r *Room) OnDataTrackUnpublished(publisher *Participant, dataTrackSid strin
 	if r.cascade.OnDataTrackUnpublished != nil {
 		r.cascade.OnDataTrackUnpublished(dataTrackSid)
 	}
+	if r.roomStore != nil {
+		r.runAsync(func() { r.roomStore.DeleteDataTrack(publisher.sid, dataTrackSid) })
+	}
 }
 
-// SubscribeExistingTracks subscribes a new participant to all existing tracks
-// from peers in the same group (or all in the main room when groupId == "").
-func (r *Room) SubscribeExistingTracks(subscriber *Participant) {
+// SubscribeExistingTracks subscribes a new participant to all tracks carried
+// in otherInfos (the same slice returned in the ready response), so the
+// server-side subscriptions are consistent with what the client sees.
+func (r *Room) SubscribeExistingTracks(subscriber *Participant, otherInfos []*proto.ParticipantInfo) {
 	if !r.config.AutoSubscribe || !subscriber.CanSubscribe() || !subscriber.AutoSubscribe() {
 		return
 	}
 
 	subscriberGroupId := subscriber.GetGroupId()
-	others := r.GetOtherParticipants(subscriber.sid)
-	for _, publisher := range others {
-		if !r.shouldPeerSubscribe(subscriberGroupId, publisher.GetGroupId()) {
+	for _, info := range otherInfos {
+		if !r.shouldPeerSubscribe(subscriberGroupId, info.GroupId) {
 			continue
 		}
 
-		tracks := publisher.GetPublishedTracks()
-		for _, track := range tracks {
-			go func(t *PublishedTrack, pub *Participant) {
-				if err := subscriber.Subscribe(t, pub); err != nil {
-					r.logger.Warn("Subscribe existing track failed",
-						"subscriber", subscriber.identity, "track", t.sid, "error", err)
-				}
-			}(track, publisher)
+		// Local participant — use real track objects (supports backup codec)
+		if localPub := r.GetParticipant(info.Sid); localPub != nil {
+			for _, t := range localPub.GetPublishedTracks() {
+				go func(track *PublishedTrack, pub *Participant) {
+					if err := subscriber.Subscribe(track, pub); err != nil {
+						r.logger.Warn("Subscribe existing track failed",
+							"subscriber", subscriber.identity, "track", track.sid, "error", err)
+					}
+				}(t, localPub)
+			}
+			for _, dt := range localPub.GetDataPublishedTracks() {
+				go func(track *DataPublishedTrack, pub *Participant) {
+					if err := subscriber.SubscribeData(track, pub); err != nil {
+						r.logger.Warn("Subscribe existing data track failed",
+							"subscriber", subscriber.identity, "dataTrack", track.sid, "error", err)
+					}
+				}(dt, localPub)
+			}
+			continue
 		}
 
-		dataTracks := publisher.GetDataPublishedTracks()
-		for _, dt := range dataTracks {
-			go func(t *DataPublishedTrack, pub *Participant) {
-				if err := subscriber.SubscribeData(t, pub); err != nil {
-					r.logger.Warn("Subscribe existing data track failed",
-						"subscriber", subscriber.identity, "dataTrack", t.sid, "error", err)
+		// Remote participant — resolve via FIB + PipeToRouter
+		for _, ti := range info.Tracks {
+			go func(trackInfo *proto.TrackInfo, pSid string) {
+				track, publisher, err := r.resolveRemoteTrack(trackInfo, pSid)
+				if err != nil {
+					r.logger.Warn("Resolve remote track failed",
+						"subscriber", subscriber.identity, "track", trackInfo.Sid, "error", err)
+					return
 				}
-			}(dt, publisher)
+				if err := subscriber.Subscribe(track, publisher); err != nil {
+					r.logger.Warn("Subscribe existing remote track failed",
+						"subscriber", subscriber.identity, "track", trackInfo.Sid, "error", err)
+				}
+			}(ti, info.Sid)
+		}
+		for _, dti := range info.DataTracks {
+			go func(dataTrackInfo *proto.DataTrackInfo, pSid string) {
+				track, publisher, err := r.resolveRemoteDataTrack(dataTrackInfo, pSid)
+				if err != nil {
+					r.logger.Warn("Resolve remote data track failed",
+						"subscriber", subscriber.identity, "dataTrack", dataTrackInfo.Sid, "error", err)
+					return
+				}
+				if err := subscriber.SubscribeData(track, publisher); err != nil {
+					r.logger.Warn("Subscribe existing remote data track failed",
+						"subscriber", subscriber.identity, "dataTrack", dataTrackInfo.Sid, "error", err)
+				}
+			}(dti, info.Sid)
 		}
 	}
 }
@@ -883,7 +1146,7 @@ func (r *Room) CreateGroup(name string, permissions *proto.ParticipantPermission
 	r.mu.Unlock()
 
 	if r.roomStore != nil {
-		go r.roomStore.PutGroup(g.ToProto())
+		r.runAsync(func() { r.roomStore.PutGroup(g.ToProto()) })
 	}
 
 	r.BroadcastNotification(proto.MethodGroupCreated, &proto.GroupCreatedNotification{
@@ -914,7 +1177,7 @@ func (r *Room) DeleteGroup(groupId string) error {
 	}
 
 	if r.roomStore != nil {
-		go r.roomStore.DeleteGroup(groupId)
+		r.runAsync(func() { r.roomStore.DeleteGroup(groupId) })
 	}
 
 	r.BroadcastNotification(proto.MethodGroupDeleted, &proto.GroupDeletedNotification{
@@ -1023,7 +1286,7 @@ func (r *Room) LeaveGroup(p *Participant) error {
 func (r *Room) participantLeaveGroup(p *Participant, g *Group) {
 	g.RemoveParticipant(p.sid)
 	if r.roomStore != nil {
-		go r.roomStore.PutGroup(g.ToProto())
+		r.runAsync(func() { r.roomStore.PutGroup(g.ToProto()) })
 	}
 	p.SetGroupId("")
 	p.RestoreRoomPermission()
@@ -1031,7 +1294,7 @@ func (r *Room) participantLeaveGroup(p *Participant, g *Group) {
 	r.rewireSubscriptions(p)
 
 	if r.roomStore != nil {
-		go r.roomStore.PutParticipant(p.ToProto())
+		r.runAsync(func() { r.roomStore.PutParticipant(p.ToProto()) })
 	}
 
 	r.logger.Info("Participant left group", "participant", p.identity, "groupId", g.SID())
@@ -1131,8 +1394,15 @@ func (r *Room) stopEmptyTimer() {
 // deleteLocalParticipantKV removes this participant's dynacast tracksub rows and
 // participant row for the local node only (no KV key listing).
 func (r *Room) deleteLocalParticipantKV(p *Participant) {
+	if r.roomStore == nil {
+		return
+	}
 	for _, t := range p.GetPublishedTracks() {
+		r.roomStore.DeleteTrack(p.Sid(), t.sid)
 		r.roomStore.DeleteTrackSub(t.sid)
+	}
+	for _, t := range p.GetDataPublishedTracks() {
+		r.roomStore.DeleteDataTrack(p.Sid(), t.sid)
 	}
 	r.roomStore.DeleteParticipant(p.Sid())
 }
@@ -1156,6 +1426,8 @@ func (r *Room) Close(reason proto.DisconnectReason) {
 		r.deleteLocalParticipantKV(p)
 		p.Close(reason)
 	}
+
+	r.asyncWG.Wait()
 
 	if r.watchClose != nil {
 		r.watchClose()

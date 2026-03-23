@@ -73,14 +73,14 @@ type NatsConfig struct {
 func DefaultConfig() *Config {
 	return &Config{
 		Node: NodeConfig{
-			ID:      xid.New().String(),
+			ID:      "nd_" + xid.New().String(),
 			Region:  "default-region",
 			Cluster: "default-cluster",
 			Port:    7990,
 		},
 		Room: RoomConfig{
-			EmptyTimeout:     5 * time.Minute,
-			DepartureTimeout: 20 * time.Second,
+			EmptyTimeout:     30 * time.Second,
+			DepartureTimeout: 30 * time.Second,
 			MaxParticipants:  100,
 			AutoSubscribe:    true,
 			Dynacast:         true,

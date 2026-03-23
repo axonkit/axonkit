@@ -79,7 +79,7 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-type Server struct {
+type HTTPServer struct {
 	cfg           *config.Config
 	roomManager   *rtc.RoomManager
 	verifier      *auth.TokenVerifier
@@ -89,7 +89,7 @@ type Server struct {
 	webRtcServers []*mediasoup.WebRtcServer
 }
 
-type ServerParams struct {
+type HTTPServerParams struct {
 	Config        *config.Config
 	RoomManager   *rtc.RoomManager
 	Verifier      *auth.TokenVerifier
@@ -99,8 +99,8 @@ type ServerParams struct {
 	WebRtcServers []*mediasoup.WebRtcServer
 }
 
-func NewServer(params ServerParams) *Server {
-	return &Server{
+func NewHTTPServer(params HTTPServerParams) *HTTPServer {
+	return &HTTPServer{
 		cfg:           params.Config,
 		roomManager:   params.RoomManager,
 		verifier:      params.Verifier,
@@ -111,7 +111,7 @@ func NewServer(params ServerParams) *Server {
 	}
 }
 
-func (s *Server) RegisterRoutes(mux *http.ServeMux) {
+func (s *HTTPServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /rtc/join", s.handleJoin)
 	mux.HandleFunc("POST /rtc/connect", s.handleConnect)
 	mux.HandleFunc("OPTIONS /rtc/join", func(w http.ResponseWriter, r *http.Request) {})
@@ -130,7 +130,7 @@ func readRequest(r *http.Request, v any) error {
 	return json.NewDecoder(r.Body).Decode(v)
 }
 
-func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
+func (s *HTTPServer) handleJoin(w http.ResponseWriter, r *http.Request) {
 	logId, _ := r.Context().Value(logIdKey{}).(string)
 
 	var req proto.JoinRequest
@@ -169,8 +169,10 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	s.handleJoinLocal(w, &req, logId)
 }
 
-func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, logId string) {
+func (s *HTTPServer) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, logId string) {
 	var claims *auth.Claims
+	participantSid := "pa_" + xid.New().String()
+
 	if req.Token != "" {
 		var err error
 		claims, err = s.verifier.Verify(req.Token)
@@ -185,7 +187,7 @@ func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, 
 			roomName = req.Room.Name
 		}
 		boolTrue := true
-		anonIdentity := "anon_" + xid.New().String()
+		anonIdentity := participantSid
 		claims = &auth.Claims{
 			Sub:  anonIdentity,
 			Name: anonIdentity,
@@ -239,7 +241,6 @@ func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, 
 	}
 	router := s.routers[routerIdx]
 	webRtcServer := s.webRtcServers[routerIdx]
-	participantSid := "pa_" + xid.New().String()
 
 	identity := claims.Identity()
 	if identity == "" {
@@ -378,7 +379,7 @@ func (s *Server) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, 
 // Transport Helpers
 // ============================================================
 
-func (s *Server) createTransports(router *mediasoup.Router, webRtcServer *mediasoup.WebRtcServer) (send, recv, direct *mediasoup.Transport, err error) {
+func (s *HTTPServer) createTransports(router *mediasoup.Router, webRtcServer *mediasoup.WebRtcServer) (send, recv, direct *mediasoup.Transport, err error) {
 	enableUdp := true
 	webRtcOpts := &mediasoup.WebRtcTransportOptions{
 		WebRtcServer: webRtcServer,
@@ -422,7 +423,7 @@ type signalChannels struct {
 	info        *proto.SignalInfo
 }
 
-func (s *Server) createSignalChannels(send, recv, direct *mediasoup.Transport) (*signalChannels, error) {
+func (s *HTTPServer) createSignalChannels(send, recv, direct *mediasoup.Transport) (*signalChannels, error) {
 	// Server→Client: DataProducer on DirectTransport, DataConsumer on RecvTransport
 	outProducer, err := direct.ProduceData(&mediasoup.DataProducerOptions{
 		Label:    "signal",
@@ -500,7 +501,7 @@ func connectTransports(dtlsParams *mediasoup.DtlsParameters, transports ...*medi
 	return nil
 }
 
-func (s *Server) transportToProto(t *mediasoup.Transport) *proto.TransportInfo {
+func (s *HTTPServer) transportToProto(t *mediasoup.Transport) *proto.TransportInfo {
 	data := t.Data()
 	info := &proto.TransportInfo{
 		Sid: t.Id(),
@@ -517,7 +518,7 @@ func (s *Server) transportToProto(t *mediasoup.Transport) *proto.TransportInfo {
 // handleConnect is the fallback for clients that do not support
 // RTCPeerConnection.generateCertificate() and cannot provide
 // DtlsFingerprints in JoinRequest.
-func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
+func (s *HTTPServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	logId, _ := r.Context().Value(logIdKey{}).(string)
 
 	var req proto.ConnectRequest
@@ -546,7 +547,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	s.handleConnectLocal(w, &req, participant, logId)
 }
 
-func (s *Server) handleConnectLocal(w http.ResponseWriter, req *proto.ConnectRequest, participant *rtc.Participant, logId string) {
+func (s *HTTPServer) handleConnectLocal(w http.ResponseWriter, req *proto.ConnectRequest, participant *rtc.Participant, logId string) {
 	for _, tc := range req.Transports {
 		transport := participant.GetTransportBySid(tc.TransportSid)
 		if transport == nil {
@@ -573,11 +574,11 @@ func (s *Server) handleConnectLocal(w http.ResponseWriter, req *proto.ConnectReq
 // Reconnect
 // ============================================================
 
-func (s *Server) handleReconnect(w http.ResponseWriter, req *proto.JoinRequest, logId string) {
+func (s *HTTPServer) handleReconnect(w http.ResponseWriter, req *proto.JoinRequest, logId string) {
 	s.handleReconnectLocal(w, req, logId)
 }
 
-func (s *Server) handleReconnectLocal(w http.ResponseWriter, req *proto.JoinRequest, logId string) {
+func (s *HTTPServer) handleReconnectLocal(w http.ResponseWriter, req *proto.JoinRequest, logId string) {
 	// Validate reconnect credentials: prefer refreshToken, fall back to original token.
 	// Anonymous users always have a refreshToken from their initial join.
 	tokenToVerify := req.RefreshToken
@@ -610,7 +611,7 @@ func (s *Server) handleReconnectLocal(w http.ResponseWriter, req *proto.JoinRequ
 
 // handleIceRestart performs ICE restart on existing transports without
 // tearing down the participant session.
-func (s *Server) handleIceRestart(w http.ResponseWriter, participant *rtc.Participant, logId string) {
+func (s *HTTPServer) handleIceRestart(w http.ResponseWriter, participant *rtc.Participant, logId string) {
 	iceParams, err := participant.RestartIce()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, proto.ErrorResponse{
@@ -630,7 +631,7 @@ func (s *Server) handleIceRestart(w http.ResponseWriter, participant *rtc.Partic
 // so the client knows to clean up old resources and re-publish tracks.
 // If the original token is missing/expired but a valid refreshToken is present,
 // the refreshToken is promoted to the primary token for the join flow.
-func (s *Server) handleFullReconnect(w http.ResponseWriter, req *proto.JoinRequest, logId string) {
+func (s *HTTPServer) handleFullReconnect(w http.ResponseWriter, req *proto.JoinRequest, logId string) {
 	if req.Token == "" && req.RefreshToken != "" {
 		req.Token = req.RefreshToken
 	}
@@ -642,7 +643,7 @@ func (s *Server) handleFullReconnect(w http.ResponseWriter, req *proto.JoinReque
 // NATS RPC Forwarding
 // ============================================================
 
-func (s *Server) forwardViaNATS(w http.ResponseWriter, targetNode types.NodeID, action string, payload json.RawMessage) error {
+func (s *HTTPServer) forwardViaNATS(w http.ResponseWriter, targetNode types.NodeID, action string, payload json.RawMessage) error {
 	rpcReq := proto.NodeRPCRequest{Action: action, Payload: payload}
 	data, _ := json.Marshal(rpcReq)
 
@@ -669,7 +670,7 @@ func (s *Server) forwardViaNATS(w http.ResponseWriter, targetNode types.NodeID, 
 
 // HandleNodeRPC processes forwarded requests from other nodes via NATS.
 // Each node subscribes to "rtc.rpc.<nodeID>".
-func (s *Server) HandleNodeRPC(msg *nats.Msg) {
+func (s *HTTPServer) HandleNodeRPC(msg *nats.Msg) {
 	var req proto.NodeRPCRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
 		resp := proto.NodeRPCResponse{Status: http.StatusBadRequest}

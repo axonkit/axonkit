@@ -611,6 +611,7 @@ type DataPublishedTrack struct {
 	name         string
 	dataProducer *mediasoup.DataProducer
 	appData      map[string]any
+	publisher    *Participant
 }
 
 func (t *DataPublishedTrack) ToProto() *proto.DataTrackInfo {
@@ -1160,7 +1161,7 @@ func (p *Participant) PublishBackupTrack(req *proto.PublishBackupTrackRequest) (
 
 	// Advertise backup stream for cross-node piping
 	if p.room != nil && p.room.cascade.OnTrackPublished != nil {
-		p.room.cascade.OnTrackPublished(backupSid)
+		p.room.cascade.OnTrackPublished(backupSid, track.backupProducer)
 	}
 
 	// Process pending subscribers and apply regression policy
@@ -1279,6 +1280,7 @@ func (p *Participant) PublishDataTrack(req *proto.PublishDataTrackRequest) (*Dat
 		name:         req.Name,
 		dataProducer: dataProducer,
 		appData:      req.AppData,
+		publisher:    p,
 	}
 
 	p.mu.Lock()
@@ -1349,12 +1351,6 @@ func (p *Participant) Subscribe(track *PublishedTrack, publisher *Participant) e
 
 	if transport == nil || caps == nil {
 		return fmt.Errorf("participant not ready for subscription")
-	}
-
-	if p.room != nil && p.room.cascade.EnsureStream != nil {
-		if err := p.room.cascade.EnsureStream(track.sid); err != nil {
-			return fmt.Errorf("ensure stream failed: %w", err)
-		}
 	}
 
 	producerId := track.producer.Id()
@@ -1568,12 +1564,6 @@ func (p *Participant) SubscribeData(track *DataPublishedTrack, publisher *Partic
 
 	if transport == nil {
 		return fmt.Errorf("participant not ready for data subscription")
-	}
-
-	if p.room != nil && p.room.cascade.EnsureStream != nil {
-		if err := p.room.cascade.EnsureStream(track.sid); err != nil {
-			return fmt.Errorf("ensure data stream failed: %w", err)
-		}
 	}
 
 	dataProducerId := track.dataProducer.Id()
@@ -1833,7 +1823,7 @@ func (p *Participant) sendMessage(msg *proto.Message) error {
 		log = p.logger.Error
 	}
 
-	log("Sending message", "type", msg.Type, "method", msg.Method, "logId", msg.LogId, "status", msg.Status, "data", string(msg.Data))
+	log("Sending message", "type", string(msg.Type), "method", msg.Method, "logId", msg.LogId, "status", msg.Status, "data", string(msg.Data))
 
 	data := msg.Encode()
 

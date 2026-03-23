@@ -394,7 +394,7 @@ func TestProcessReconnectSync(t *testing.T) {
 	p.processReconnectSync(&proto.SyncState{
 		SubscribedTrackSids:     []string{"old-track-1"},
 		SubscribedDataTrackSids: []string{"old-data-1"},
-	})
+	}, nil)
 }
 
 func TestProcessReconnectSync_NilRoom(t *testing.T) {
@@ -404,7 +404,7 @@ func TestProcessReconnectSync_NilRoom(t *testing.T) {
 	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
-	p.processReconnectSync(&proto.SyncState{})
+	p.processReconnectSync(&proto.SyncState{}, nil)
 }
 
 func TestHandleIncomingMessage_InvalidPayload(t *testing.T) {
@@ -494,7 +494,8 @@ func TestProcessReconnectSync_WithTracks(t *testing.T) {
 		SubscribedDataTrackSids: []string{"dt-old"},
 	}
 
-	p.processReconnectSync(syncState)
+	otherInfos := room.GetAllParticipantInfos(p.sid)
+	p.processReconnectSync(syncState, otherInfos)
 }
 
 func TestHandleIncomingMessage_QueueFull(t *testing.T) {

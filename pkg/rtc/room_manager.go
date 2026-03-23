@@ -1,8 +1,11 @@
 package rtc
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
+	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,6 +16,7 @@ import (
 	"github.com/axonkit/axonkit/pkg/routing"
 	"github.com/axonkit/axonkit/pkg/store"
 	"github.com/axonkit/axonkit/pkg/types"
+	"github.com/jiyeyuran/mediasoup-go/v2"
 	"github.com/rs/xid"
 )
 
@@ -58,6 +62,51 @@ func NewRoomManager(params RoomManagerParams) *RoomManager {
 		kv:         params.KV,
 		nodeID:     params.NodeID,
 		logger:     slog.Default().With("component", "RoomManager"),
+	}
+}
+
+// Start starts the RoomManager background tasks.
+func (rm *RoomManager) Start(ctx context.Context) {
+	go rm.watchLeases(ctx)
+}
+
+func (rm *RoomManager) watchLeases(ctx context.Context) {
+	watcher, err := rm.kv.Watch(ctx, "room.*.lease")
+	if err != nil {
+		rm.logger.Error("Failed to watch room leases", "error", err)
+		return
+	}
+	defer watcher.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case entry, ok := <-watcher.Updates():
+			if !ok {
+				return
+			}
+			if entry == nil {
+				continue
+			}
+			if entry.Operation() == store.OpDelete {
+				// Key format: room.<roomName>.lease
+				keyParts := strings.Split(entry.Key(), ".")
+				if len(keyParts) != 3 {
+					continue
+				}
+				roomName := keyParts[1]
+
+				time.Sleep(time.Duration(rand.Intn(1000)) * time.Millisecond)
+				if _, err := GetRoomMeta(rm.kv, roomName); err == nil {
+					DeleteRoomMeta(rm.kv, roomName)
+					keys, _ := rm.kv.Keys(ctx, fmt.Sprintf("room.%s.>", roomName))
+					for _, k := range keys {
+						_ = rm.kv.Delete(ctx, k)
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -149,23 +198,6 @@ func (rm *RoomManager) GetParticipantBySid(sid string) *Participant {
 }
 
 func (rm *RoomManager) setupCascadeCallbacks(room *Room) {
-	advertise := func(sid string) {
-		streamID := types.StreamID(sid)
-		if rm.mediaMgr != nil {
-			rm.mediaMgr.RegisterProducer(streamID, &media.LocalProducer{
-				StreamID: streamID,
-				RouterId: streamID.RouterID(),
-			})
-		}
-		if rm.rib != nil {
-			if err := rm.rib.StartAdvertise(routing.AdvertiseOptions{
-				StreamID: streamID,
-				IsOrigin: true,
-			}); err != nil {
-				rm.logger.Error("Failed to advertise stream", "stream_id", streamID, "error", err)
-			}
-		}
-	}
 	unadvertise := func(sid string) {
 		streamID := types.StreamID(sid)
 		if rm.rib != nil {
@@ -179,9 +211,43 @@ func (rm *RoomManager) setupCascadeCallbacks(room *Room) {
 	}
 
 	room.cascade = CascadeCallbacks{
-		OnTrackPublished:       advertise,
-		OnTrackUnpublished:     unadvertise,
-		OnDataTrackPublished:   advertise,
+		OnTrackPublished: func(sid string, producer *mediasoup.Producer) {
+			streamID := types.StreamID(sid)
+			if rm.mediaMgr != nil {
+				rm.mediaMgr.RegisterProducer(streamID, &media.LocalProducer{
+					StreamID: streamID,
+					Router:   rm.mediaMgr.GetRouter(streamID.RouterID()),
+					Producer: producer,
+				})
+			}
+			if rm.rib != nil {
+				if err := rm.rib.StartAdvertise(routing.AdvertiseOptions{
+					StreamID: streamID,
+					IsOrigin: true,
+				}); err != nil {
+					rm.logger.Error("Failed to advertise stream", "stream_id", streamID, "error", err)
+				}
+			}
+		},
+		OnTrackUnpublished: unadvertise,
+		OnDataTrackPublished: func(sid string, dataProducer *mediasoup.DataProducer) {
+			streamID := types.StreamID(sid)
+			if rm.mediaMgr != nil {
+				rm.mediaMgr.RegisterProducer(streamID, &media.LocalProducer{
+					StreamID:     streamID,
+					Router:       rm.mediaMgr.GetRouter(streamID.RouterID()),
+					DataProducer: dataProducer,
+				})
+			}
+			if rm.rib != nil {
+				if err := rm.rib.StartAdvertise(routing.AdvertiseOptions{
+					StreamID: streamID,
+					IsOrigin: true,
+				}); err != nil {
+					rm.logger.Error("Failed to advertise stream", "stream_id", streamID, "error", err)
+				}
+			}
+		},
 		OnDataTrackUnpublished: unadvertise,
 		EnsureStream: func(sid string) error {
 			streamID := types.StreamID(sid)
@@ -207,6 +273,23 @@ func (rm *RoomManager) setupCascadeCallbacks(room *Room) {
 				return
 			}
 			rm.fib.Unsubscribe(streamID)
+		},
+		GetLocalProducer: func(sid string) *media.LocalProducer {
+			if rm.mediaMgr == nil {
+				return nil
+			}
+			return rm.mediaMgr.GetLocalProducer(types.StreamID(sid))
+		},
+		GetRouter: func(routerId string) *mediasoup.Router {
+			if rm.mediaMgr == nil {
+				return nil
+			}
+			for _, r := range rm.mediaMgr.Routers() {
+				if r.Id() == routerId {
+					return r
+				}
+			}
+			return nil
 		},
 	}
 }

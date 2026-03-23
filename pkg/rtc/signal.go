@@ -171,11 +171,15 @@ func (p *Participant) handleReady(msg *proto.Message) (any, int, string) {
 	var missedMessages []*proto.MessageNotification
 	if req.SyncState != nil {
 		missedMessages = p.room.GetAllMessagesSince(req.SyncState.LastMessageTimestamp)
-		go p.processReconnectSync(req.SyncState)
+		time.AfterFunc(time.Millisecond*10, func() {
+			p.processReconnectSync(req.SyncState, otherInfos)
+		})
 	} else {
 		p.room.BroadcastNotification(proto.MethodParticipantJoined,
 			&proto.ParticipantJoinedNotification{Participant: p.ToProto()}, p.sid)
-		go p.room.SubscribeExistingTracks(p)
+		time.AfterFunc(time.Millisecond*10, func() {
+			p.room.SubscribeExistingTracks(p, otherInfos)
+		})
 	}
 
 	return &proto.ReadyResponse{
@@ -188,14 +192,13 @@ func (p *Participant) handleReady(msg *proto.Message) (any, int, string) {
 }
 
 // processReconnectSync compares the client's last-known state with the current
-// room state, sends notifications about changes, and re-subscribes to all
-// current tracks.
-func (p *Participant) processReconnectSync(syncState *proto.SyncState) {
+// room state (from otherInfos), sends notifications about changes, and
+// re-subscribes to all current tracks.
+func (p *Participant) processReconnectSync(syncState *proto.SyncState, otherInfos []*proto.ParticipantInfo) {
 	if p.room == nil {
 		return
 	}
 
-	// Build set of trackSids the client previously knew about.
 	knownTracks := make(map[string]bool, len(syncState.SubscribedTrackSids))
 	for _, sid := range syncState.SubscribedTrackSids {
 		knownTracks[sid] = true
@@ -205,32 +208,27 @@ func (p *Participant) processReconnectSync(syncState *proto.SyncState) {
 		knownDataTracks[sid] = true
 	}
 
-	// Collect current tracks in the room from all other participants.
 	currentTracks := make(map[string]struct{})
 	currentDataTracks := make(map[string]struct{})
 
-	others := p.room.GetOtherParticipants(p.sid)
-	for _, pub := range others {
-		for _, t := range pub.GetPublishedTracks() {
-			currentTracks[t.sid] = struct{}{}
-			if !knownTracks[t.sid] {
-				// New track the client didn't know about.
+	for _, info := range otherInfos {
+		for _, t := range info.Tracks {
+			currentTracks[t.Sid] = struct{}{}
+			if !knownTracks[t.Sid] {
 				_ = p.SendNotification(proto.MethodTrackPublished, &proto.TrackPublishedNotification{
-					ParticipantSid: pub.sid,
-					Track:          t.ToProto(),
+					ParticipantSid: info.Sid,
+					Track:          t,
 				})
 			}
 		}
-		for _, dt := range pub.GetDataPublishedTracks() {
-			currentDataTracks[dt.sid] = struct{}{}
-			if !knownDataTracks[dt.sid] {
-				// TODO: send data track published notification when protocol is added
-				p.logger.Debug("New data track since disconnect", "dataTrackSid", dt.sid)
+		for _, dt := range info.DataTracks {
+			currentDataTracks[dt.Sid] = struct{}{}
+			if !knownDataTracks[dt.Sid] {
+				p.logger.Debug("New data track since disconnect", "dataTrackSid", dt.Sid)
 			}
 		}
 	}
 
-	// Notify about tracks that were removed while disconnected.
 	for _, sid := range syncState.SubscribedTrackSids {
 		if _, exists := currentTracks[sid]; !exists {
 			_ = p.SendNotification(proto.MethodTrackUnpublished, &proto.TrackUnpublishedNotification{
@@ -246,8 +244,7 @@ func (p *Participant) processReconnectSync(syncState *proto.SyncState) {
 		}
 	}
 
-	// Re-subscribe to all current tracks.
-	p.room.SubscribeExistingTracks(p)
+	p.room.SubscribeExistingTracks(p, otherInfos)
 
 	p.logger.Info("Reconnect sync completed",
 		"knownTracks", len(syncState.SubscribedTrackSids),
