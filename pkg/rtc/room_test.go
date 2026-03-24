@@ -34,7 +34,7 @@ func newTestParticipant(identity string) *Participant {
 		PingInterval:  5 * time.Second,
 		PingTimeout:   15 * time.Second,
 	})
-	p.SetState(proto.ParticipantInfo_CONNECTED)
+	p.SetState(proto.ParticipantInfo_JOINED)
 	return p
 }
 

@@ -688,6 +688,8 @@ type Participant struct {
 	joinedAt   time.Time
 	version    uint32
 
+	disconnectReason proto.DisconnectReason
+
 	grants     *proto.ClaimGrants
 	permission *proto.ParticipantPermission
 
@@ -726,7 +728,6 @@ type Participant struct {
 	statsFile     *os.File
 
 	autoSubscribe                     bool
-	reconnecting                      bool
 	allParticipantsAllowedToSubscribe bool
 	trackPermissions                  []proto.TrackPermission
 
@@ -829,7 +830,7 @@ func (p *Participant) IsPublisher() bool {
 func (p *Participant) IsReady() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.state == proto.ParticipantInfo_JOINED || p.state == proto.ParticipantInfo_CONNECTED
+	return p.state == proto.ParticipantInfo_JOINED
 }
 
 func (p *Participant) CanSubscribe() bool {
@@ -1040,30 +1041,21 @@ func (p *Participant) SetSignal(
 }
 
 func (p *Participant) handleIceStateChange(state mediasoup.IceState) {
-	p.mu.RLock()
-	reconnecting := p.reconnecting
-	p.mu.RUnlock()
-
-	if reconnecting {
-		return
-	}
-
-	p.logger.Info("ICE state changed", "state", state)
-
 	switch state {
 	case mediasoup.IceStateConnected, mediasoup.IceStateCompleted:
+		p.logger.Info("ICE state changed", "state", state)
 		p.mu.Lock()
-		wasSuspended := p.state == proto.ParticipantInfo_SUSPENDED
-		if p.state == proto.ParticipantInfo_JOINING || p.state == proto.ParticipantInfo_SUSPENDED {
-			p.state = proto.ParticipantInfo_CONNECTED
-		}
-		p.mu.Unlock()
-
-		p.syncStateToStore()
-
-		if wasSuspended && p.room != nil {
-			p.room.BroadcastNotification(proto.MethodParticipantUpdated,
-				&proto.ParticipantUpdatedNotification{Participant: p.ToProto()}, p.sid)
+		switch p.state {
+		case proto.ParticipantInfo_SUSPENDED:
+			p.state = proto.ParticipantInfo_JOINED
+			p.mu.Unlock()
+			p.syncStateToStore()
+			if p.room != nil {
+				p.room.BroadcastNotification(proto.MethodParticipantUpdated,
+					&proto.ParticipantUpdatedNotification{Participant: p.ToProto()}, p.sid)
+			}
+		default:
+			p.mu.Unlock()
 		}
 
 	case mediasoup.IceStateDisconnected:
@@ -1989,7 +1981,7 @@ func (p *Participant) sendMessage(msg *proto.Message) error {
 		return fmt.Errorf("signal channel not established")
 	}
 
-	// RPC responses must be delivered during join (CONNECTED) and other edge cases.
+	// RPC responses must be delivered during join (JOINING / pre-ready) and other edge cases.
 	// One-way traffic is only sent after ready (JOINED), except server-initiated disconnect.
 	if !msg.IsResponse() {
 		if state != proto.ParticipantInfo_JOINED {
@@ -2148,20 +2140,21 @@ func (p *Participant) ToProto() *proto.ParticipantInfo {
 	}
 
 	return &proto.ParticipantInfo{
-		Sid:         p.sid,
-		Identity:    p.identity,
-		State:       p.state,
-		Tracks:      tracks,
-		DataTracks:  dataTracks,
-		Metadata:    p.metadata,
-		JoinedAt:    p.joinedAt.UnixMilli(),
-		Name:        p.name,
-		Version:     p.version,
-		Permission:  p.permission,
-		IsPublisher: len(p.publishedTracks) > 0 || len(p.dataPublishedTracks) > 0,
-		Attributes:  p.attributes,
-		GroupId:     p.groupId,
-		NodeId:      p.nodeId,
+		Sid:              p.sid,
+		Identity:         p.identity,
+		State:            p.state,
+		Tracks:           tracks,
+		DataTracks:       dataTracks,
+		Metadata:         p.metadata,
+		JoinedAt:         p.joinedAt.UnixMilli(),
+		Name:             p.name,
+		Version:          p.version,
+		Permission:       p.permission,
+		IsPublisher:      len(p.publishedTracks) > 0 || len(p.dataPublishedTracks) > 0,
+		Attributes:       p.attributes,
+		GroupId:          p.groupId,
+		NodeId:           p.nodeId,
+		DisconnectReason: p.disconnectReason,
 	}
 }
 
@@ -2239,7 +2232,10 @@ func (p *Participant) Close(reason proto.DisconnectReason) {
 		p.mu.Unlock()
 		return
 	}
+	prevState := p.state
+	online := time.Since(p.joinedAt)
 	p.closed = true
+	p.disconnectReason = reason
 	p.state = proto.ParticipantInfo_DISCONNECTED
 
 	if p.pingTimer != nil {
@@ -2310,7 +2306,7 @@ func (p *Participant) Close(reason proto.DisconnectReason) {
 	}
 
 	p.closeStatsLogger()
-	p.logger.Info("Participant closed", "reason", reason)
+	p.logger.Info("Participant closed", "state", prevState, "online", online, "reason", reason)
 }
 
 // ============================================================

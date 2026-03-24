@@ -61,10 +61,6 @@ func TestParticipant_IsReady(t *testing.T) {
 	if p.IsReady() {
 		t.Fatal("JOINING should not be ready")
 	}
-	p.SetState(proto.ParticipantInfo_CONNECTED)
-	if !p.IsReady() {
-		t.Fatal("CONNECTED should be ready")
-	}
 	p.SetState(proto.ParticipantInfo_JOINED)
 	if !p.IsReady() {
 		t.Fatal("JOINED should be ready")
@@ -335,7 +331,7 @@ func TestParticipant_Close_PassesCorrectReason(t *testing.T) {
 		Identity: "observer",
 		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 	})
-	observer.SetState(proto.ParticipantInfo_CONNECTED)
+	observer.SetState(proto.ParticipantInfo_JOINED)
 	room.AddParticipant(observer)
 	defer observer.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
@@ -721,28 +717,29 @@ func TestParticipant_HandleIceStateChange(t *testing.T) {
 	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
-	// Connected -> should transition to CONNECTED
+	// ICE up while JOINING: state stays JOINING (ready moves to JOINED)
 	p.handleIceStateChange("connected")
-	if p.State() != proto.ParticipantInfo_CONNECTED {
-		t.Fatalf("expected CONNECTED after connected, got %d", p.State())
+	if p.State() != proto.ParticipantInfo_JOINING {
+		t.Fatalf("expected JOINING after ICE connected, got %d", p.State())
 	}
 
-	// Completed (while CONNECTED, should stay CONNECTED)
 	p.handleIceStateChange("completed")
-	if p.State() != proto.ParticipantInfo_CONNECTED {
-		t.Fatalf("expected CONNECTED after completed, got %d", p.State())
+	if p.State() != proto.ParticipantInfo_JOINING {
+		t.Fatalf("expected JOINING after ICE completed, got %d", p.State())
 	}
 
-	// Disconnected -> should transition to SUSPENDED
+	p.SetState(proto.ParticipantInfo_JOINED)
+
+	// Disconnected -> SUSPENDED
 	p.handleIceStateChange("disconnected")
 	if p.State() != proto.ParticipantInfo_SUSPENDED {
 		t.Fatalf("expected SUSPENDED after ice disconnected, got %d", p.State())
 	}
 
-	// Connected again -> should transition back to CONNECTED
+	// ICE up again after suspend -> JOINED
 	p.handleIceStateChange("connected")
-	if p.State() != proto.ParticipantInfo_CONNECTED {
-		t.Fatalf("expected CONNECTED after reconnected, got %d", p.State())
+	if p.State() != proto.ParticipantInfo_JOINED {
+		t.Fatalf("expected JOINED after ICE resume, got %d", p.State())
 	}
 }
 
@@ -758,26 +755,6 @@ func TestParticipant_HandleIceStateChange_Closed(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if p.State() != proto.ParticipantInfo_DISCONNECTED {
 		t.Fatalf("expected DISCONNECTED after ice closed, got %d", p.State())
-	}
-}
-
-func TestParticipant_HandleIceStateChange_Reconnecting(t *testing.T) {
-	p := NewParticipant(ParticipantParams{
-		Sid:      "sid-recon",
-		Identity: "carol",
-		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
-	})
-	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
-
-	// Set reconnecting flag
-	p.mu.Lock()
-	p.reconnecting = true
-	p.mu.Unlock()
-
-	// ICE changes should be ignored during reconnection
-	p.handleIceStateChange("connected")
-	if p.State() != proto.ParticipantInfo_JOINING {
-		t.Fatal("state should not change during reconnection")
 	}
 }
 

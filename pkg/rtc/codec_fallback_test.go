@@ -849,7 +849,7 @@ func TestDispatchRPC_TrackPublishBackup_NoPermission(t *testing.T) {
 		Identity: "bkp-noperm-alice",
 		Grants:   &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}, Media: m},
 	})
-	p.SetState(proto.ParticipantInfo_CONNECTED)
+	p.SetState(proto.ParticipantInfo_JOINED)
 	room.AddParticipant(p)
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 

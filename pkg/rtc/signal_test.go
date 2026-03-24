@@ -29,7 +29,7 @@ func newSignalTestParticipant(t *testing.T) *Participant {
 		PingInterval:  5 * time.Second,
 		PingTimeout:   15 * time.Second,
 	})
-	p.SetState(proto.ParticipantInfo_CONNECTED)
+	p.SetState(proto.ParticipantInfo_JOINED)
 	room.AddParticipant(p)
 	return p
 }
@@ -387,7 +387,7 @@ func TestProcessReconnectSync(t *testing.T) {
 		Sid: "sync-p1", Identity: "sync-alice",
 		Grants: &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
 	})
-	p.SetState(proto.ParticipantInfo_CONNECTED)
+	p.SetState(proto.ParticipantInfo_JOINED)
 	room.AddParticipant(p)
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
 

@@ -169,7 +169,8 @@ func (r *Room) SetupStore(kv store.Store, nodeID string) {
 
 // processStoreEvents reacts to changes made by other nodes (participant
 // join/leave, group changes, new chat messages). Events originating from the
-// local node are ignored because the local Room already processes them.
+// local node are ignored because the local Room already drives client updates
+// (e.g. ICE / ready paths broadcast); remote nodes rely on this watch.
 func (r *Room) processStoreEvents(ch <-chan RoomStoreEvent, localNodeID string) {
 	for evt := range ch {
 		switch evt.Type {
@@ -213,10 +214,10 @@ func (r *Room) handleRemoteParticipantEvent(evt RoomStoreEvent) {
 
 		if known {
 			r.BroadcastNotification(proto.MethodParticipantUpdated,
-				&proto.ParticipantUpdatedNotification{Participant: info}, "")
+				&proto.ParticipantUpdatedNotification{Participant: info}, info.Sid)
 		} else {
 			r.BroadcastNotification(proto.MethodParticipantJoined,
-				&proto.ParticipantJoinedNotification{Participant: info}, "")
+				&proto.ParticipantJoinedNotification{Participant: info}, info.Sid)
 		}
 	case store.OpDelete:
 		r.mu.Lock()
