@@ -226,10 +226,10 @@ func (r *Room) handleRemoteParticipantEvent(evt RoomStoreEvent) {
 
 		if known {
 			r.BroadcastNotification(proto.MethodParticipantUpdated,
-				&proto.ParticipantUpdatedNotification{Participant: info}, info.Sid)
+				&proto.ParticipantUpdatedNotification{Participant: info}, "")
 		} else {
 			r.BroadcastNotification(proto.MethodParticipantJoined,
-				&proto.ParticipantJoinedNotification{Participant: info}, info.Sid)
+				&proto.ParticipantJoinedNotification{Participant: info}, "")
 		}
 	case store.OpDelete:
 		r.mu.Lock()

@@ -3,6 +3,7 @@ package rtc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/axonkit/axonkit/pkg/config"
 	"github.com/axonkit/axonkit/pkg/proto"
 	"github.com/axonkit/axonkit/pkg/store"
+	"github.com/nats-io/nats.go"
 )
 
 // RoomStateBucketTTL is the JetStream KV max age for the ROOM_STATE bucket.
@@ -175,17 +177,28 @@ func (s *RoomStore) StartHeartbeat(ctx context.Context) {
 	defer ticker.Stop()
 
 	leaseKey := fmt.Sprintf("%s.lease", s.prefix())
-
-	// Create the lease key once with a TTL.
-	ctxCreate, cancelCreate := context.WithTimeout(ctx, 2*time.Second)
-	_ = s.kv.Create(ctxCreate, leaseKey, []byte(s.nodeID), store.WithCreateTTL(5*time.Second))
-	cancelCreate()
+	created := false
 
 	updateLease := func() {
-		ctxPut, cancel := context.WithTimeout(ctx, 2*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		_ = s.kv.Put(ctxPut, leaseKey, []byte(s.nodeID))
+		if !created {
+			// Create the lease key once with a TTL.
+			err := s.kv.Create(ctx, leaseKey, []byte(s.nodeID), store.WithCreateTTL(5*time.Second))
+			if err != nil && !errors.Is(err, nats.ErrKeyExists) {
+				s.logger.Error("Failed to create lease key", "error", err)
+			} else {
+				created = true
+				s.logger.Info("Lease key created")
+			}
+		} else {
+			if err := s.kv.Put(ctx, leaseKey, []byte(s.nodeID)); err != nil {
+				s.logger.Error("Failed to update lease key", "error", err)
+			}
+		}
 	}
+
+	s.logger.Info("Starting heartbeat")
 
 	updateLease()
 
