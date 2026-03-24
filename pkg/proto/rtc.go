@@ -566,3 +566,10 @@ type NodeRPCResponse struct {
 	Status  int             `json:"status"`
 	Payload json.RawMessage `json:"payload"`
 }
+
+// RequestBackupCodecRPCRequest is sent to the node that hosts the publisher
+// so it can run SubscribedQualityChanged (backup codec) on the real client.
+type RequestBackupCodecRPCRequest struct {
+	PublisherSid string `json:"publisherSid"`
+	TrackSid     string `json:"trackSid"`
+}

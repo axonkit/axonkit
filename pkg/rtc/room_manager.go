@@ -37,6 +37,9 @@ type RoomManager struct {
 	kv     store.Store // shared KV for cross-node room state sync
 	nodeID string
 
+	backupCodecFwdMu sync.RWMutex
+	backupCodecFwd   func(publisherSid, trackSid, publisherNodeId string) error
+
 	logger *slog.Logger
 }
 
@@ -63,6 +66,24 @@ func NewRoomManager(params RoomManagerParams) *RoomManager {
 		nodeID:     params.NodeID,
 		logger:     slog.Default().With("component", "RoomManager"),
 	}
+}
+
+// SetRequestBackupCodec sets the NATS (or in-process) forwarder used when a
+// remote subscriber needs the publisher's node to send SubscribedQualityChanged.
+// Call before any room is created; safe for use from Server wiring only.
+func (rm *RoomManager) SetRequestBackupCodec(fn func(publisherSid, trackSid, publisherNodeId string) error) {
+	rm.backupCodecFwdMu.Lock()
+	rm.backupCodecFwd = fn
+	rm.backupCodecFwdMu.Unlock()
+}
+
+// RequestBackupCodecOnPublisher runs backup codec signaling for a track on this node.
+func (rm *RoomManager) RequestBackupCodecOnPublisher(publisherSid, trackSid string) error {
+	p := rm.GetParticipantBySid(publisherSid)
+	if p == nil {
+		return fmt.Errorf("publisher not found: %s", publisherSid)
+	}
+	return p.RequestBackupCodecForTrack(trackSid)
 }
 
 // Start starts the RoomManager background tasks.
@@ -333,12 +354,16 @@ func (rm *RoomManager) setupCascadeCallbacks(room *Room) {
 			if rm.mediaMgr == nil {
 				return nil
 			}
-			for _, r := range rm.mediaMgr.Routers() {
-				if r.Id() == routerId {
-					return r
-				}
+			return rm.mediaMgr.RouterForId(routerId)
+		},
+		RequestBackupCodec: func(publisherSid, trackSid, publisherNodeId string) error {
+			rm.backupCodecFwdMu.RLock()
+			fn := rm.backupCodecFwd
+			rm.backupCodecFwdMu.RUnlock()
+			if fn == nil {
+				return fmt.Errorf("request backup codec forwarder not configured")
 			}
-			return nil
+			return fn(publisherSid, trackSid, publisherNodeId)
 		},
 	}
 }

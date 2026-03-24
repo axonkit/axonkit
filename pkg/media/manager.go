@@ -160,7 +160,7 @@ func (m *Manager) Routers() []*mediasoup.Router {
 	return m.routers
 }
 
-func (m *Manager) routerForId(routerId string) *mediasoup.Router {
+func (m *Manager) RouterForId(routerId string) *mediasoup.Router {
 	for _, r := range m.routers {
 		if r.Id() == routerId {
 			return r
@@ -183,7 +183,7 @@ func (m *Manager) RegisterProducer(streamID types.StreamID, producer *mediasoup.
 	m.producers[streamID] = &LocalProducer{
 		StreamID: streamID,
 		Producer: producer,
-		Router:   m.routerForId(streamID.RouterID()),
+		Router:   m.RouterForId(streamID.RouterID()),
 	}
 	m.producersMu.Unlock()
 	m.logger.Info("Producer registered", "streamId", streamID)
@@ -196,7 +196,7 @@ func (m *Manager) RegisterDataProducer(streamID types.StreamID, dataProducer *me
 	m.producers[streamID] = &LocalProducer{
 		StreamID:     streamID,
 		DataProducer: dataProducer,
-		Router:       m.routerForId(streamID.RouterID()),
+		Router:       m.RouterForId(streamID.RouterID()),
 	}
 	m.producersMu.Unlock()
 	m.logger.Info("Data producer registered", "streamId", streamID)

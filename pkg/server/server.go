@@ -38,6 +38,7 @@ type Server struct {
 	mediaMgr    *media.Manager
 	registry    *discovery.Registry
 	roomManager *rtc.RoomManager
+	nodeRPC     *NodeRPCService
 	httpAPI     *HTTPServer
 	httpServer  *http.Server
 
@@ -159,19 +160,24 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	})
 	n.roomManager = roomManager
 
+	nodeRPC := NewNodeRPCService(nc, myNode.ID)
+	n.nodeRPC = nodeRPC
+
 	verifier := auth.NewTokenVerifier(cfg.Auth.APIKey, cfg.Auth.APISecret)
 	httpAPI := NewHTTPServer(HTTPServerParams{
 		Config:        cfg,
 		RoomManager:   roomManager,
 		Verifier:      verifier,
 		Node:          myNode,
-		NC:            nc,
+		NodeRPC:       nodeRPC,
 		Routers:       mediaMgr.Routers(),
 		WebRtcServers: mediaMgr.WebRtcServers(),
 	})
 	n.httpAPI = httpAPI
+	registerDefaultNodeRPCHandlers(nodeRPC, httpAPI, roomManager)
+	roomManager.SetRequestBackupCodec(n.ForwardRequestBackupCodec)
 
-	rpcSub, err := nc.Subscribe(fmt.Sprintf("rtc.rpc.%s", myNode.ID), httpAPI.HandleNodeRPC)
+	rpcSub, err := nc.Subscribe(nodeRPCSubjectPrefix+string(myNode.ID), nodeRPC.Handle)
 	if err != nil {
 		n.closeDeps()
 		return nil, fmt.Errorf("nats rpc subscribe: %w", err)
@@ -186,6 +192,12 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	}
 
 	return n, nil
+}
+
+// ForwardRequestBackupCodec asks the publisher's node to send backup-codec
+// signaling to the real client. Used by rtc when the subscriber is remote.
+func (n *Server) ForwardRequestBackupCodec(publisherSid, trackSid, publisherNodeId string) error {
+	return ForwardRequestBackupCodecRPC(n.nodeRPC, publisherSid, trackSid, publisherNodeId)
 }
 
 func (n *Server) closeDeps() {

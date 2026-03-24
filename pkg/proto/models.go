@@ -97,6 +97,9 @@ type TrackInfo struct {
 	Source            TrackSource         `json:"source,omitempty"`
 	Version           *TimedVersion       `json:"version,omitempty"`
 	AudioFeatures     []AudioTrackFeature `json:"audioFeatures,omitempty"`
+	VideoCodec        string              `json:"videoCodec,omitempty"`
+	BackupCodec       string              `json:"backupCodec,omitempty"`
+	BackupStreamSid   string              `json:"backupStreamSid,omitempty"` // routerId.producerId of backup producer when published
 	BackupCodecPolicy BackupCodecPolicy   `json:"backupCodecPolicy,omitempty"`
 	AppData           map[string]any      `json:"appData,omitempty"`
 }

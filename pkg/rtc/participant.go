@@ -32,15 +32,16 @@ type PublishedTrack struct {
 	appData  map[string]any
 
 	// Backup codec support
-	videoCodec        string
-	backupCodec       string
-	backupCodecPolicy proto.BackupCodecPolicy
-	backupProducer    *mediasoup.Producer
-	backupSid         string
-	regressed         bool                // true after REGRESSION has fired
-	pendingBackupSubs []*pendingBackupSub // subscribers waiting for backup producer
-	backupConsumers   map[string]string   // consumerID → codec used ("primary"/"backup")
-	backupRequested   bool                // true once we've asked the publisher for backup
+	videoCodec         string
+	backupCodec        string
+	backupCodecPolicy  proto.BackupCodecPolicy
+	backupProducer     *mediasoup.Producer
+	backupSid          string
+	regressed          bool // true after REGRESSION has fired
+	pendingBackupSubs  []*pendingBackupSub
+	backupDrainRunning bool              // cross-node: one goroutine polls for piped backup
+	backupConsumers    map[string]string // consumerID → codec used ("primary"/"backup")
+	backupRequested    bool              // true once we've asked the publisher for backup
 
 	// Dynacast: track which consumers are active and their max spatial layer.
 	// Protected by mu.
@@ -74,6 +75,9 @@ func (t *PublishedTrack) ToProto() *proto.TrackInfo {
 		Width:             t.width,
 		Height:            t.height,
 		Source:            t.source,
+		VideoCodec:        t.videoCodec,
+		BackupCodec:       t.backupCodec,
+		BackupStreamSid:   t.backupSid,
 		BackupCodecPolicy: t.backupCodecPolicy,
 	}
 }
@@ -359,37 +363,70 @@ func (t *PublishedTrack) syncLocalSubToStore() {
 
 // requestBackupCodec sends a SubscribedQualityChangedNotification with
 // subscribedCodecs to ask the publisher to start sending the backup codec.
+// For remote publishers (stub participant, no signal channel), it forwards
+// via room.cascade.RequestBackupCodec using the publisher NodeId from KV.
 func (t *PublishedTrack) requestBackupCodec() {
 	if t.publisher == nil || t.backupCodec == "" {
 		return
 	}
 
-	notification := &proto.SubscribedQualityChangedNotification{
-		TrackSid:            t.sid,
-		SubscribedQualities: t.currentSubscribedQualities(),
-		SubscribedCodecs: []proto.SubscribedCodec{
-			{
-				Codec: t.videoCodec,
-				Qualities: []proto.SubscribedQuality{
-					{Quality: proto.VideoQuality_LOW, Enabled: true},
-					{Quality: proto.VideoQuality_MEDIUM, Enabled: true},
-					{Quality: proto.VideoQuality_HIGH, Enabled: true},
+	t.publisher.mu.RLock()
+	hasSignal := t.publisher.signalOutProducer != nil
+	t.publisher.mu.RUnlock()
+
+	if hasSignal {
+		notification := &proto.SubscribedQualityChangedNotification{
+			TrackSid:            t.sid,
+			SubscribedQualities: t.currentSubscribedQualities(),
+			SubscribedCodecs: []proto.SubscribedCodec{
+				{
+					Codec: t.videoCodec,
+					Qualities: []proto.SubscribedQuality{
+						{Quality: proto.VideoQuality_LOW, Enabled: true},
+						{Quality: proto.VideoQuality_MEDIUM, Enabled: true},
+						{Quality: proto.VideoQuality_HIGH, Enabled: true},
+					},
+				},
+				{
+					Codec: t.backupCodec,
+					Qualities: []proto.SubscribedQuality{
+						{Quality: proto.VideoQuality_LOW, Enabled: true},
+						{Quality: proto.VideoQuality_MEDIUM, Enabled: true},
+						{Quality: proto.VideoQuality_HIGH, Enabled: true},
+					},
 				},
 			},
-			{
-				Codec: t.backupCodec,
-				Qualities: []proto.SubscribedQuality{
-					{Quality: proto.VideoQuality_LOW, Enabled: true},
-					{Quality: proto.VideoQuality_MEDIUM, Enabled: true},
-					{Quality: proto.VideoQuality_HIGH, Enabled: true},
-				},
-			},
-		},
+		}
+		t.publisher.logger.Info("Requesting backup codec from publisher",
+			"trackSid", t.sid, "backupCodec", t.backupCodec)
+		_ = t.publisher.SendNotification(proto.MethodTrackSubscribedQualityChanged, notification)
+		return
 	}
 
-	t.publisher.logger.Info("Requesting backup codec from publisher",
-		"trackSid", t.sid, "backupCodec", t.backupCodec)
-	_ = t.publisher.SendNotification(proto.MethodTrackSubscribedQualityChanged, notification)
+	if t.publisher.room == nil {
+		t.publisher.logger.Warn("Backup codec request skipped: publisher has no room")
+		return
+	}
+	if t.publisher.room.cascade.RequestBackupCodec == nil {
+		t.publisher.logger.Warn("Backup codec request skipped: RequestBackupCodec not configured")
+		return
+	}
+	rs := t.publisher.room.Store()
+	if rs == nil {
+		t.publisher.logger.Warn("Backup codec request skipped: no room store")
+		return
+	}
+	info := rs.GetParticipant(t.publisher.sid)
+	if info == nil || info.NodeId == "" {
+		t.publisher.logger.Warn("Backup codec request skipped: publisher not in KV or missing nodeId",
+			"publisherSid", t.publisher.sid)
+		return
+	}
+	t.publisher.logger.Info("Forwarding backup codec request to publisher node",
+		"trackSid", t.sid, "publisherSid", t.publisher.sid, "nodeId", info.NodeId)
+	if err := t.publisher.room.cascade.RequestBackupCodec(t.publisher.sid, t.sid, info.NodeId); err != nil {
+		t.publisher.logger.Warn("Forward request backup codec failed", "error", err)
+	}
 }
 
 // currentSubscribedQualities returns the current quality state for backward compat.
@@ -763,6 +800,19 @@ func NewParticipant(params ParticipantParams) *Participant {
 	p.permission = p.permissionFromGrants()
 	go p.messageLoop()
 	return p
+}
+
+// RequestBackupCodecForTrack sends backup-codec signaling for one published track
+// (publisher must be on this worker).
+func (p *Participant) RequestBackupCodecForTrack(trackSid string) error {
+	p.mu.RLock()
+	track, ok := p.publishedTracks[trackSid]
+	p.mu.RUnlock()
+	if !ok || track == nil {
+		return fmt.Errorf("track not found: %s", trackSid)
+	}
+	track.requestBackupCodec()
+	return nil
 }
 
 func (p *Participant) Sid() string      { return p.sid }
@@ -1164,6 +1214,10 @@ func (p *Participant) PublishBackupTrack(req *proto.PublishBackupTrackRequest) (
 		p.room.cascade.OnTrackPublished(backupSid, track.backupProducer)
 	}
 
+	if p.room != nil && p.room.Store() != nil {
+		p.room.runAsync(func() { p.room.roomStore.PutTrack(p.sid, track.ToProto()) })
+	}
+
 	// Process pending subscribers and apply regression policy
 	track.onBackupProducerReady()
 
@@ -1402,30 +1456,124 @@ func (p *Participant) subscribeWithBackupFallback(
 	caps *mediasoup.RtpCapabilities,
 ) error {
 	track.mu.Lock()
-
-	// If backup producer already exists, consume from it directly
 	if track.backupProducer != nil {
 		track.mu.Unlock()
 		return p.consumeFromBackup(track, publisher, transport, caps)
 	}
+	track.mu.Unlock()
 
-	// Queue subscriber and request backup from publisher if not yet requested
+	// Backup may already be piped on this worker (cross-node) before backupProducer is cached.
+	if err := p.consumeFromBackup(track, publisher, transport, caps); err == nil {
+		return nil
+	}
+
+	track.mu.Lock()
 	track.pendingBackupSubs = append(track.pendingBackupSubs, &pendingBackupSub{
 		subscriber: p,
 		publisher:  publisher,
 	})
-
 	needRequest := !track.backupRequested
 	track.backupRequested = true
+	startDrain := !track.backupDrainRunning
+	if startDrain {
+		track.backupDrainRunning = true
+	}
 	track.mu.Unlock()
 
 	if needRequest {
 		track.requestBackupCodec()
 	}
+	if startDrain {
+		go track.runRemoteBackupDrain()
+	}
 
 	p.logger.Info("Subscriber queued for backup codec",
 		"trackSid", track.sid, "backupCodec", track.backupCodec)
 	return nil
+}
+
+func (t *PublishedTrack) resolveBackupStreamSid() string {
+	t.mu.Lock()
+	sid := t.backupSid
+	t.mu.Unlock()
+	if sid != "" {
+		return sid
+	}
+	if t.publisher == nil || t.publisher.room == nil {
+		return ""
+	}
+	t.publisher.room.mu.RLock()
+	defer t.publisher.room.mu.RUnlock()
+	if mt := t.publisher.room.remoteMediaTracks[t.sid]; mt != nil && mt.info != nil {
+		return mt.info.BackupStreamSid
+	}
+	return ""
+}
+
+// runRemoteBackupDrain waits for backupStreamSid to be piped locally, then
+// runs consumeFromBackup for pending subscribers (cross-node backup path).
+func (t *PublishedTrack) runRemoteBackupDrain() {
+	defer func() {
+		t.mu.Lock()
+		t.backupDrainRunning = false
+		t.mu.Unlock()
+	}()
+
+	deadline := time.After(60 * time.Second)
+	tick := time.NewTicker(400 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-deadline:
+			return
+		case <-tick.C:
+			t.mu.Lock()
+			n := len(t.pendingBackupSubs)
+			t.mu.Unlock()
+			if n == 0 {
+				return
+			}
+			backupSid := t.resolveBackupStreamSid()
+			if backupSid == "" {
+				continue
+			}
+			pub := t.publisher
+			if pub == nil || pub.room == nil {
+				return
+			}
+			if pub.room.cascade.EnsureStream != nil {
+				_ = pub.room.cascade.EnsureStream(backupSid)
+			}
+			if pub.room.cascade.GetLocalProducer == nil {
+				continue
+			}
+			lp := pub.room.cascade.GetLocalProducer(backupSid)
+			if lp == nil || lp.Producer == nil {
+				continue
+			}
+			t.mu.Lock()
+			queue := t.pendingBackupSubs
+			t.pendingBackupSubs = nil
+			t.backupProducer = lp.Producer
+			t.backupSid = backupSid
+			t.mu.Unlock()
+			for _, ps := range queue {
+				go func() {
+					ps.subscriber.mu.RLock()
+					tr := ps.subscriber.recvTransport
+					ca := ps.subscriber.rtpCapabilities
+					ps.subscriber.mu.RUnlock()
+					if tr == nil || ca == nil {
+						return
+					}
+					if err := ps.subscriber.consumeFromBackup(t, ps.publisher, tr, ca); err != nil {
+						ps.subscriber.logger.Warn("Pending backup consume failed",
+							"error", err, "trackSid", t.sid)
+					}
+				}()
+			}
+		}
+	}
 }
 
 // consumeFromBackup creates a consumer from the backup producer.
@@ -1435,7 +1583,20 @@ func (p *Participant) consumeFromBackup(
 	transport *mediasoup.Transport,
 	caps *mediasoup.RtpCapabilities,
 ) error {
-	backupProducerId := track.backupProducer.Id()
+	track.mu.Lock()
+	prod := track.backupProducer
+	sid := track.backupSid
+	track.mu.Unlock()
+
+	if prod == nil && sid != "" && publisher.room != nil && publisher.room.cascade.GetLocalProducer != nil {
+		if lp := publisher.room.cascade.GetLocalProducer(sid); lp != nil && lp.Producer != nil {
+			prod = lp.Producer
+		}
+	}
+	if prod == nil {
+		return fmt.Errorf("no backup producer for track %s", track.sid)
+	}
+	backupProducerId := prod.Id()
 
 	if publisher.router.Id() != p.router.Id() {
 		res, err := publisher.router.PipeToRouter(&mediasoup.PipeToRouterOptions{

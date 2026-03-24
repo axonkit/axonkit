@@ -84,7 +84,7 @@ type HTTPServer struct {
 	roomManager   *rtc.RoomManager
 	verifier      *auth.TokenVerifier
 	node          types.NodeInfo
-	nc            *nats.Conn
+	nodeRPC       *NodeRPCService
 	routers       []*mediasoup.Router
 	webRtcServers []*mediasoup.WebRtcServer
 }
@@ -94,7 +94,7 @@ type HTTPServerParams struct {
 	RoomManager   *rtc.RoomManager
 	Verifier      *auth.TokenVerifier
 	Node          types.NodeInfo
-	NC            *nats.Conn
+	NodeRPC       *NodeRPCService
 	Routers       []*mediasoup.Router
 	WebRtcServers []*mediasoup.WebRtcServer
 }
@@ -105,7 +105,7 @@ func NewHTTPServer(params HTTPServerParams) *HTTPServer {
 		roomManager:   params.RoomManager,
 		verifier:      params.Verifier,
 		node:          params.Node,
-		nc:            params.NC,
+		nodeRPC:       params.NodeRPC,
 		routers:       params.Routers,
 		webRtcServers: params.WebRtcServers,
 	}
@@ -141,11 +141,11 @@ func (s *HTTPServer) handleJoin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ---- Node forwarding: if the client specifies a target node, proxy to it ----
-	if req.NodeId != "" && types.NodeID(req.NodeId) != s.node.ID && s.nc != nil {
+	if req.NodeId != "" && types.NodeID(req.NodeId) != s.node.ID && s.nodeRPC != nil {
 		payload, _ := json.Marshal(req)
-		action := "join"
+		action := NodeRPCActionJoin
 		if req.Reconnect {
-			action = "reconnect"
+			action = NodeRPCActionReconnect
 		}
 		if err := s.forwardViaNATS(w, types.NodeID(req.NodeId), action, payload); err != nil {
 			if req.Reconnect && errors.Is(err, nats.ErrNoResponders) {
@@ -534,9 +534,9 @@ func (s *HTTPServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.NodeId != "" && types.NodeID(req.NodeId) != s.node.ID && s.nc != nil {
+	if req.NodeId != "" && types.NodeID(req.NodeId) != s.node.ID && s.nodeRPC != nil {
 		payload, _ := json.Marshal(req)
-		if err := s.forwardViaNATS(w, types.NodeID(req.NodeId), "connect", payload); err != nil {
+		if err := s.forwardViaNATS(w, types.NodeID(req.NodeId), NodeRPCActionConnect, payload); err != nil {
 			writeJSON(w, http.StatusBadGateway, proto.ErrorResponse{
 				Code: proto.ErrCodeInternal, Error: "failed to reach target node"})
 		}
@@ -650,120 +650,17 @@ func (s *HTTPServer) handleFullReconnect(w http.ResponseWriter, req *proto.JoinR
 // ============================================================
 
 func (s *HTTPServer) forwardViaNATS(w http.ResponseWriter, targetNode types.NodeID, action string, payload json.RawMessage) error {
-	rpcReq := proto.NodeRPCRequest{Action: action, Payload: payload}
-	data, _ := json.Marshal(rpcReq)
-
-	subject := fmt.Sprintf("rtc.rpc.%s", targetNode)
-	msg, err := s.nc.Request(subject, data, 5*time.Second)
+	if s.nodeRPC == nil {
+		return fmt.Errorf("node rpc not configured")
+	}
+	resp, err := s.nodeRPC.Request(string(targetNode), action, payload)
 	if err != nil {
-		slog.Error("NATS forward failed", "target", targetNode, "action", action, "error", err)
+		slog.Error("Node RPC forward failed", "target", targetNode, "action", action, "error", err)
 		return err
 	}
-
-	var rpcResp proto.NodeRPCResponse
-	if err := json.Unmarshal(msg.Data, &rpcResp); err != nil {
-		writeJSON(w, http.StatusBadGateway, proto.ErrorResponse{
-			Code: proto.ErrCodeInternal, Error: "invalid response from target node"})
-		return nil
-	}
-
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Node-Id", string(targetNode))
-	w.WriteHeader(rpcResp.Status)
-	_, _ = w.Write(rpcResp.Payload)
+	w.WriteHeader(resp.Status)
+	_, _ = w.Write(resp.Payload)
 	return nil
-}
-
-// HandleNodeRPC processes forwarded requests from other nodes via NATS.
-// Each node subscribes to "rtc.rpc.<nodeID>".
-func (s *HTTPServer) HandleNodeRPC(msg *nats.Msg) {
-	var req proto.NodeRPCRequest
-	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		resp := proto.NodeRPCResponse{Status: http.StatusBadRequest}
-		resp.Payload, _ = json.Marshal(proto.ErrorResponse{
-			Code: proto.ErrCodeInvalidRequest, Error: err.Error()})
-		data, _ := json.Marshal(resp)
-		_ = msg.Respond(data)
-		return
-	}
-
-	rec := &responseRecorder{}
-
-	switch req.Action {
-	case "join":
-		var joinReq proto.JoinRequest
-		if err := json.Unmarshal(req.Payload, &joinReq); err != nil {
-			rec.status = http.StatusBadRequest
-			rec.body, _ = json.Marshal(proto.ErrorResponse{
-				Code: proto.ErrCodeInvalidRequest, Error: err.Error()})
-		} else {
-			s.handleJoinLocal(rec, &joinReq, "")
-		}
-
-	case "reconnect":
-		var joinReq proto.JoinRequest
-		if err := json.Unmarshal(req.Payload, &joinReq); err != nil {
-			rec.status = http.StatusBadRequest
-			rec.body, _ = json.Marshal(proto.ErrorResponse{
-				Code: proto.ErrCodeInvalidRequest, Error: err.Error()})
-		} else {
-			s.handleReconnectLocal(rec, &joinReq, "")
-		}
-
-	case "connect":
-		var connReq proto.ConnectRequest
-		if err := json.Unmarshal(req.Payload, &connReq); err != nil {
-			rec.status = http.StatusBadRequest
-			rec.body, _ = json.Marshal(proto.ErrorResponse{
-				Code: proto.ErrCodeInvalidRequest, Error: err.Error()})
-		} else {
-			participant := s.roomManager.GetParticipantBySid(connReq.ParticipantSid)
-			if participant == nil {
-				rec.status = http.StatusNotFound
-				rec.body, _ = json.Marshal(proto.ErrorResponse{
-					Code: proto.ErrCodeNotFound, Error: "participant not found"})
-			} else {
-				s.handleConnectLocal(rec, &connReq, participant, "")
-			}
-		}
-
-	default:
-		rec.status = http.StatusBadRequest
-		rec.body, _ = json.Marshal(proto.ErrorResponse{
-			Code: proto.ErrCodeInvalidRequest, Error: "unknown action: " + req.Action})
-	}
-
-	if rec.status == 0 {
-		rec.status = http.StatusOK
-	}
-	rpcResp := proto.NodeRPCResponse{Status: rec.status, Payload: rec.body}
-	data, _ := json.Marshal(rpcResp)
-	_ = msg.Respond(data)
-}
-
-// responseRecorder captures the status and body from handler methods so they
-// can be relayed over NATS instead of HTTP.
-type responseRecorder struct {
-	headers http.Header
-	status  int
-	body    json.RawMessage
-}
-
-func (r *responseRecorder) Header() http.Header {
-	if r.headers == nil {
-		r.headers = make(http.Header)
-	}
-	return r.headers
-}
-
-func (r *responseRecorder) WriteHeader(status int) {
-	r.status = status
-}
-
-func (r *responseRecorder) Write(data []byte) (int, error) {
-	if r.status == 0 {
-		r.status = http.StatusOK
-	}
-	r.body = data
-	return len(data), nil
 }

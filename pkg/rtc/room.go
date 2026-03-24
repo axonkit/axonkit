@@ -46,6 +46,9 @@ type CascadeCallbacks struct {
 	GetLocalProducer func(streamID string) *media.LocalProducer
 	// GetRouter returns a local router by ID.
 	GetRouter func(routerId string) *mediasoup.Router
+	// RequestBackupCodec forwards a backup-codec request to the node that
+	// hosts the publisher (publisherSid). publisherNodeId comes from room KV.
+	RequestBackupCodec func(publisherSid, trackSid, publisherNodeId string) error
 }
 
 type Room struct {
@@ -56,13 +59,14 @@ type Room struct {
 	creationTime time.Time
 
 	participants       map[string]*Participant
-	remoteParticipants map[string]bool             // SIDs of participants on other nodes
-	remoteTracks       map[string]*proto.TrackInfo // trackSid -> TrackInfo (for remote tracks)
-	groups             map[string]*Group           // groupSid -> Group
-	messages           []*proto.MessageNotification
-	remoteMsgIds       map[string]bool   // dedup remote messages
-	sharedState        map[string]string // room-level KV for collaboration features
-	mu                 sync.RWMutex
+	remoteParticipants map[string]bool // SIDs of participants on other nodes
+	groups             map[string]*Group
+	// remoteMediaTracks: trackSid -> KV TrackInfo plus optional piped PublishedTrack.
+	remoteMediaTracks map[string]*remoteMediaTrack
+	messages          []*proto.MessageNotification
+	remoteMsgIds      map[string]bool   // dedup remote messages
+	sharedState       map[string]string // room-level KV for collaboration features
+	mu                sync.RWMutex
 
 	cascade    CascadeCallbacks
 	roomStore  *RoomStore
@@ -75,6 +79,19 @@ type Room struct {
 	emptyTimer *time.Timer
 	closed     bool
 	asyncWG    sync.WaitGroup
+}
+
+// remoteMediaTrack joins the room-store TrackInfo with optional materialized
+// PublishedTrack after this node has piped the stream.
+type remoteMediaTrack struct {
+	info      *proto.TrackInfo
+	published *remotePublishedEntry
+}
+
+// remotePublishedEntry holds the long-lived objects for one piped remote track.
+type remotePublishedEntry struct {
+	track     *PublishedTrack
+	publisher *Participant
 }
 
 type RoomParams struct {
@@ -93,7 +110,7 @@ func NewRoom(params RoomParams) *Room {
 		metadata:           params.Metadata,
 		participants:       make(map[string]*Participant),
 		remoteParticipants: make(map[string]bool),
-		remoteTracks:       make(map[string]*proto.TrackInfo),
+		remoteMediaTracks:  make(map[string]*remoteMediaTrack),
 		groups:             make(map[string]*Group),
 		remoteMsgIds:       make(map[string]bool),
 		sharedState:        make(map[string]string),
@@ -311,18 +328,26 @@ func (r *Room) handleRemoteTrackSubEvent(evt RoomStoreEvent) {
 }
 
 func (r *Room) handleRemoteTrackEvent(evt RoomStoreEvent) {
-	r.mu.Lock()
 	trackSid := evt.SubKey
 	participantSid := evt.Key
 
 	switch evt.Operation {
 	case store.OpPut:
 		if evt.Track == nil {
-			r.mu.Unlock()
 			return
 		}
-		existing := r.remoteTracks[trackSid]
-		r.remoteTracks[trackSid] = evt.Track
+		r.mu.Lock()
+		mt := r.remoteMediaTracks[trackSid]
+		if mt == nil {
+			mt = &remoteMediaTrack{}
+			r.remoteMediaTracks[trackSid] = mt
+		}
+		existing := mt.info
+		mt.info = evt.Track
+		if mt.published != nil {
+			mt.published.publisher.sid = participantSid
+			applyRemoteTrackProto(mt.published.track, evt.Track, nil, r.Dynacast())
+		}
 		r.mu.Unlock()
 
 		if participantSid != "" {
@@ -371,15 +396,14 @@ func (r *Room) handleRemoteTrackEvent(evt RoomStoreEvent) {
 			}
 		}
 	case store.OpDelete:
-		delete(r.remoteTracks, trackSid)
+		r.mu.Unlock()
+		delete(r.remoteMediaTracks, trackSid)
 		r.mu.Unlock()
 
 		r.BroadcastNotification(proto.MethodTrackUnpublished, &proto.TrackUnpublishedNotification{
 			ParticipantSid: participantSid,
 			TrackSid:       trackSid,
 		}, "")
-	default:
-		r.mu.Unlock()
 	}
 }
 
@@ -433,6 +457,37 @@ func (r *Room) handleRemoteDataTrackEvent(evt RoomStoreEvent) {
 	}
 }
 
+// applyRemoteTrackProto updates PublishedTrack fields from TrackInfo. If producer
+// is non-nil it replaces the mediasoup producer (e.g. after re-pipe). Dynacast maps
+// are allocated once when missing and conditions require them.
+func applyRemoteTrackProto(t *PublishedTrack, info *proto.TrackInfo, producer *mediasoup.Producer, dynacast bool) {
+	if info == nil {
+		return
+	}
+	t.sid = info.Sid
+	if producer != nil {
+		t.producer = producer
+	}
+	t.name = info.Name
+	t.source = info.Source
+	t.kind = info.Kind
+	t.muted = info.Muted
+	t.width = info.Width
+	t.height = info.Height
+	t.appData = info.AppData
+	t.videoCodec = info.VideoCodec
+	t.backupCodec = info.BackupCodec
+	t.backupSid = info.BackupStreamSid
+	t.backupCodecPolicy = info.BackupCodecPolicy
+	if info.BackupCodec != "" && t.backupConsumers == nil {
+		t.backupConsumers = make(map[string]string)
+	}
+	if dynacast && info.Kind == mediasoup.MediaKindVideo && t.activeConsumers == nil {
+		t.activeConsumers = make(map[string]*consumerLayerState)
+		t.lastQualities = [3]bool{true, true, true}
+	}
+}
+
 // resolveRemoteTrack pipes a remote track to the local node and, if the pipe
 // router differs from targetRouter, does a cross-router PipeToRouter so the
 // returned producer is directly consumable on targetRouter.
@@ -448,19 +503,44 @@ func (r *Room) resolveRemoteTrack(trackInfo *proto.TrackInfo, publisherSid strin
 		return nil, nil, fmt.Errorf("local producer not found for %s", trackInfo.Sid)
 	}
 
-	track := &PublishedTrack{
-		sid:      trackInfo.Sid,
-		name:     trackInfo.Name,
-		source:   trackInfo.Source,
-		kind:     trackInfo.Kind,
-		producer: lp.Producer,
-		muted:    trackInfo.Muted,
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.remoteMediaTracks == nil {
+		r.remoteMediaTracks = make(map[string]*remoteMediaTrack)
 	}
-	publisher := &Participant{
+
+	sid := trackInfo.Sid
+	mt := r.remoteMediaTracks[sid]
+	if mt == nil {
+		mt = &remoteMediaTrack{info: trackInfo}
+		r.remoteMediaTracks[sid] = mt
+	} else {
+		mt.info = trackInfo
+	}
+
+	if mt.published != nil {
+		ent := mt.published
+		ent.publisher.sid = publisherSid
+		ent.publisher.router = lp.Router
+		ent.publisher.room = r
+		applyRemoteTrackProto(ent.track, trackInfo, lp.Producer, r.Dynacast())
+		return ent.track, ent.publisher, nil
+	}
+
+	// Stub publisher carries room + router so dynacast (activeConsumers) and
+	// backup consumer bookkeeping (backupConsumers) can sync TrackSub to KV.
+	// No signal channel here; requestBackupCodec uses cascade.RequestBackupCodec
+	// (NATS to the publisher's node) when configured.
+	stubPub := &Participant{
 		sid:    publisherSid,
 		router: lp.Router,
+		room:   r,
+		logger: slog.Default().With("component", "RemotePublisherStub", "participantSid", publisherSid),
 	}
-	return track, publisher, nil
+	track := &PublishedTrack{publisher: stubPub}
+	applyRemoteTrackProto(track, trackInfo, lp.Producer, r.Dynacast())
+	mt.published = &remotePublishedEntry{track: track, publisher: stubPub}
+	return track, stubPub, nil
 }
 
 // resolveRemoteDataTrack is the data-track counterpart of resolveRemoteTrack.
@@ -1420,6 +1500,7 @@ func (r *Room) Close(reason proto.DisconnectReason) {
 		participants = append(participants, p)
 	}
 	r.participants = make(map[string]*Participant)
+	r.remoteMediaTracks = make(map[string]*remoteMediaTrack)
 	r.mu.Unlock()
 
 	for _, p := range participants {
