@@ -19,10 +19,10 @@ const nodeRPCSubjectPrefix = "rtc.rpc."
 
 // Well-known NodeRPCRequest.Action values. Register handlers with the same names.
 const (
-	NodeRPCActionJoin                = "join"
-	NodeRPCActionReconnect           = "reconnect"
-	NodeRPCActionConnect             = "connect"
-	NodeRPCActionRequestBackupCodec  = "request_backup_codec"
+	NodeRPCActionJoin               = "join"
+	NodeRPCActionReconnect          = "reconnect"
+	NodeRPCActionConnect            = "connect"
+	NodeRPCActionRequestBackupCodec = "request_backup_codec"
 )
 
 // NodeRPCHandler handles one action for the local node. Returns HTTP-style status and JSON body.

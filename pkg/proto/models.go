@@ -54,21 +54,21 @@ type Room struct {
 }
 
 type ParticipantInfo struct {
-	Sid         string                 `json:"sid,omitempty"`
-	Identity    string                 `json:"identity,omitempty"`
-	State       ParticipantInfo_State  `json:"state,omitempty"`
-	Tracks      []*TrackInfo           `json:"tracks,omitempty"`
-	Metadata    string                 `json:"metadata,omitempty"`
-	JoinedAt    int64                  `json:"joinedAt,omitempty"`
-	Name        string                 `json:"name,omitempty"`
-	Version     uint32                 `json:"version,omitempty"`
-	Permission  *ParticipantPermission `json:"permission,omitempty"`
-	IsPublisher bool                   `json:"isPublisher,omitempty"`
-	Attributes  map[string]string      `json:"attributes,omitempty"`
-	DataTracks  []*DataTrackInfo       `json:"dataTracks,omitempty"`
-	GroupId          string           `json:"groupId,omitempty"`
-	NodeId           string           `json:"nodeId,omitempty"`
-	DisconnectReason DisconnectReason `json:"disconnectReason,omitempty"`
+	Sid              string                 `json:"sid,omitempty"`
+	Identity         string                 `json:"identity,omitempty"`
+	State            ParticipantInfo_State  `json:"state,omitempty"`
+	Tracks           []*TrackInfo           `json:"tracks,omitempty"`
+	Metadata         string                 `json:"metadata,omitempty"`
+	JoinedAt         int64                  `json:"joinedAt,omitempty"`
+	Name             string                 `json:"name,omitempty"`
+	Version          uint32                 `json:"version,omitempty"`
+	Permission       *ParticipantPermission `json:"permission,omitempty"`
+	IsPublisher      bool                   `json:"isPublisher,omitempty"`
+	Attributes       map[string]string      `json:"attributes,omitempty"`
+	DataTracks       []*DataTrackInfo       `json:"dataTracks,omitempty"`
+	GroupId          string                 `json:"groupId,omitempty"`
+	NodeId           string                 `json:"nodeId,omitempty"`
+	DisconnectReason DisconnectReason       `json:"disconnectReason,omitempty"`
 }
 
 type ParticipantInfo_State int32

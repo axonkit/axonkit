@@ -412,7 +412,7 @@ func (r *Room) handleRemoteTrackEvent(evt RoomStoreEvent) {
 			}
 		}
 	case store.OpDelete:
-		r.mu.Unlock()
+		r.mu.Lock()
 		delete(r.remoteMediaTracks, trackSid)
 		r.mu.Unlock()
 
