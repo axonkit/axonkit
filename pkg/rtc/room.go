@@ -207,6 +207,18 @@ func (r *Room) handleRemoteParticipantEvent(evt RoomStoreEvent) {
 		}
 		info := evt.Participant
 
+		if info.State == proto.ParticipantInfo_DISCONNECTED {
+			r.mu.Lock()
+			delete(r.remoteParticipants, info.Sid)
+			r.mu.Unlock()
+			r.BroadcastNotification(proto.MethodParticipantLeft,
+				&proto.ParticipantLeftNotification{
+					ParticipantSid: info.Sid,
+					Reason:         info.DisconnectReason,
+				}, "")
+			return
+		}
+
 		r.mu.Lock()
 		_, known := r.remoteParticipants[info.Sid]
 		r.remoteParticipants[info.Sid] = true
@@ -221,14 +233,17 @@ func (r *Room) handleRemoteParticipantEvent(evt RoomStoreEvent) {
 		}
 	case store.OpDelete:
 		r.mu.Lock()
+		_, had := r.remoteParticipants[evt.Key]
 		delete(r.remoteParticipants, evt.Key)
 		r.mu.Unlock()
 
-		r.BroadcastNotification(proto.MethodParticipantLeft,
-			&proto.ParticipantLeftNotification{
-				ParticipantSid: evt.Key,
-				Reason:         proto.DisconnectReason_UNKNOWN_REASON,
-			}, "")
+		if had {
+			r.BroadcastNotification(proto.MethodParticipantLeft,
+				&proto.ParticipantLeftNotification{
+					ParticipantSid: evt.Key,
+					Reason:         proto.DisconnectReason_UNKNOWN_REASON,
+				}, "")
+		}
 	}
 }
 
@@ -641,7 +656,10 @@ func (r *Room) RemoveParticipant(sid string, reason proto.DisconnectReason) {
 	r.logger.Info("Participant removed", "participant", p.identity, "sid", sid, "remaining", count)
 
 	if r.roomStore != nil {
-		r.runAsync(func() { r.roomStore.DeleteParticipant(sid) })
+		r.runAsync(func() {
+			r.roomStore.PutParticipant(p.ToProto())
+			r.roomStore.DeleteParticipant(sid)
+		})
 	}
 
 	r.BroadcastNotification(proto.MethodParticipantLeft, &proto.ParticipantLeftNotification{
