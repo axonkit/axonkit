@@ -271,11 +271,7 @@ func (rm *RoomManager) setupCascadeCallbacks(room *Room) {
 		OnTrackPublished: func(sid string, producer *mediasoup.Producer) {
 			streamID := types.StreamID(sid)
 			if rm.mediaMgr != nil {
-				rm.mediaMgr.RegisterProducer(streamID, &media.LocalProducer{
-					StreamID: streamID,
-					Router:   rm.mediaMgr.GetRouter(streamID.RouterID()),
-					Producer: producer,
-				})
+				rm.mediaMgr.RegisterProducer(streamID, producer)
 			}
 			if rm.rib != nil {
 				if err := rm.rib.StartAdvertise(routing.AdvertiseOptions{
@@ -290,11 +286,7 @@ func (rm *RoomManager) setupCascadeCallbacks(room *Room) {
 		OnDataTrackPublished: func(sid string, dataProducer *mediasoup.DataProducer) {
 			streamID := types.StreamID(sid)
 			if rm.mediaMgr != nil {
-				rm.mediaMgr.RegisterProducer(streamID, &media.LocalProducer{
-					StreamID:     streamID,
-					Router:       rm.mediaMgr.GetRouter(streamID.RouterID()),
-					DataProducer: dataProducer,
-				})
+				rm.mediaMgr.RegisterDataProducer(streamID, dataProducer)
 			}
 			if rm.rib != nil {
 				if err := rm.rib.StartAdvertise(routing.AdvertiseOptions{

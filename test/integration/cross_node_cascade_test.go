@@ -166,13 +166,7 @@ func publishTrackOnNode(t *testing.T, node *axonkitNode) types.StreamID {
 	}
 
 	streamID := types.NewStreamID(router.Id(), producer.Id())
-	node.MediaMgr.RegisterProducer(streamID, &media.LocalProducer{
-		StreamID:     streamID,
-		RouterIdx:    0,
-		Producer:     producer,
-		RouterId:     router.Id(),
-		UpstreamNode: node.ID,
-	})
+	node.MediaMgr.RegisterProducer(streamID, producer)
 
 	if err := node.RIB.StartAdvertise(routing.AdvertiseOptions{
 		StreamID: streamID,
@@ -326,13 +320,7 @@ func TestCrossNodeDataStream(t *testing.T) {
 	}
 
 	streamID := types.NewStreamID(router.Id(), dp.Id())
-	nodeA.MediaMgr.RegisterProducer(streamID, &media.LocalProducer{
-		StreamID:     streamID,
-		RouterIdx:    0,
-		RouterId:     router.Id(),
-		DataProducer: dp,
-		UpstreamNode: nodeA.ID,
-	})
+	nodeA.MediaMgr.RegisterDataProducer(streamID, dp)
 
 	if err := nodeA.RIB.StartAdvertise(routing.AdvertiseOptions{
 		StreamID: streamID,

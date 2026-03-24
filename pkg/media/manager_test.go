@@ -113,13 +113,7 @@ func testPublish(t *testing.T, m *Manager) types.StreamID {
 	}
 
 	streamID := types.NewStreamID(router.Id(), producer.Id())
-	m.RegisterProducer(streamID, &LocalProducer{
-		StreamID:     streamID,
-		RouterIdx:    idx,
-		Producer:     producer,
-		RouterId:     router.Id(),
-		UpstreamNode: m.nodeID,
-	})
+	m.RegisterProducer(streamID, producer)
 	return streamID
 }
 
@@ -148,13 +142,7 @@ func testPublishData(t *testing.T, m *Manager) types.StreamID {
 	}
 
 	streamID := types.NewStreamID(router.Id(), dataProducer.Id())
-	m.RegisterProducer(streamID, &LocalProducer{
-		StreamID:     streamID,
-		RouterIdx:    idx,
-		DataProducer: dataProducer,
-		RouterId:     router.Id(),
-		UpstreamNode: m.nodeID,
-	})
+	m.RegisterDataProducer(streamID, dataProducer)
 	return streamID
 }
 

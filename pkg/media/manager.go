@@ -160,7 +160,7 @@ func (m *Manager) Routers() []*mediasoup.Router {
 	return m.routers
 }
 
-func (m *Manager) GetRouter(routerId string) *mediasoup.Router {
+func (m *Manager) routerForId(routerId string) *mediasoup.Router {
 	for _, r := range m.routers {
 		if r.Id() == routerId {
 			return r
@@ -178,11 +178,28 @@ func (m *Manager) WebRtcServers() []*mediasoup.WebRtcServer {
 
 // RegisterProducer registers a local producer (from a participant) so the
 // pipe system can find it when a remote node requests the stream.
-func (m *Manager) RegisterProducer(streamID types.StreamID, lp *LocalProducer) {
+func (m *Manager) RegisterProducer(streamID types.StreamID, producer *mediasoup.Producer) {
 	m.producersMu.Lock()
-	m.producers[streamID] = lp
+	m.producers[streamID] = &LocalProducer{
+		StreamID: streamID,
+		Producer: producer,
+		Router:   m.routerForId(streamID.RouterID()),
+	}
 	m.producersMu.Unlock()
 	m.logger.Info("Producer registered", "streamId", streamID)
+}
+
+// RegisterDataProducer registers a local data producer (from a participant) so the
+// pipe system can find it when a remote node requests the stream.
+func (m *Manager) RegisterDataProducer(streamID types.StreamID, dataProducer *mediasoup.DataProducer) {
+	m.producersMu.Lock()
+	m.producers[streamID] = &LocalProducer{
+		StreamID:     streamID,
+		DataProducer: dataProducer,
+		Router:       m.routerForId(streamID.RouterID()),
+	}
+	m.producersMu.Unlock()
+	m.logger.Info("Data producer registered", "streamId", streamID)
 }
 
 // UnregisterProducer removes a producer and cleans up any downstream pipe

@@ -253,7 +253,7 @@ func TestRoomManager_CascadeEnsureStream_WithLocalProducer(t *testing.T) {
 
 	// Register a local producer first
 	streamID := types.StreamID("rt-xxx.pr-yyy")
-	mediaMgr.RegisterProducer(streamID, &media.LocalProducer{StreamID: streamID})
+	mediaMgr.RegisterProducer(streamID, nil)
 
 	// EnsureStream should skip FIB because producer is local
 	if err := room.cascade.EnsureStream(string(streamID)); err != nil {
@@ -286,7 +286,7 @@ func TestRoomManager_CascadeReleaseStream_WithLocalProducer(t *testing.T) {
 
 	// Register a local producer
 	streamID := types.StreamID("rt-xxx.pr-yyy")
-	mediaMgr.RegisterProducer(streamID, &media.LocalProducer{StreamID: streamID})
+	mediaMgr.RegisterProducer(streamID, nil)
 
 	// ReleaseStream should skip FIB because producer is local
 	room.cascade.ReleaseStream(string(streamID))
