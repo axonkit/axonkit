@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"time"
 )
 
 type Operation int
@@ -44,20 +43,7 @@ func GetWatchOptions(opts ...WatchOption) WatchOptions {
 	return o
 }
 
-type CreateOptions struct {
-	TTL time.Duration
-}
-
-type CreateOption func(*CreateOptions)
-
-func WithCreateTTL(ttl time.Duration) CreateOption {
-	return func(o *CreateOptions) {
-		o.TTL = ttl
-	}
-}
-
 type Store interface {
-	Create(ctx context.Context, key string, value []byte, opts ...CreateOption) error
 	Put(ctx context.Context, key string, value []byte) error
 	Get(ctx context.Context, key string) (Entry, error)
 	Delete(ctx context.Context, key string) error

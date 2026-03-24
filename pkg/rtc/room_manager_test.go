@@ -25,8 +25,16 @@ func defaultRMConfig() config.RoomConfig {
 	}
 }
 
+func testRMParams(kv store.Store) RoomManagerParams {
+	return RoomManagerParams{
+		Config:  defaultRMConfig(),
+		KV:      kv,
+		LeaseKV: store.NewMemoryStore(0),
+	}
+}
+
 func TestRoomManager_GetOrCreateRoom(t *testing.T) {
-	rm := NewRoomManager(RoomManagerParams{Config: defaultRMConfig(), KV: store.NewMemoryStore(0)})
+	rm := NewRoomManager(testRMParams(store.NewMemoryStore(0)))
 	defer rm.Close()
 
 	room := rm.GetOrCreateRoom("test-room", 0, "")
@@ -41,7 +49,7 @@ func TestRoomManager_GetOrCreateRoom(t *testing.T) {
 }
 
 func TestRoomManager_GetRoom(t *testing.T) {
-	rm := NewRoomManager(RoomManagerParams{Config: defaultRMConfig(), KV: store.NewMemoryStore(0)})
+	rm := NewRoomManager(testRMParams(store.NewMemoryStore(0)))
 	defer rm.Close()
 
 	if rm.GetRoom("nonexistent") != nil {
@@ -55,7 +63,7 @@ func TestRoomManager_GetRoom(t *testing.T) {
 }
 
 func TestRoomManager_GetRoomBySid(t *testing.T) {
-	rm := NewRoomManager(RoomManagerParams{Config: defaultRMConfig(), KV: store.NewMemoryStore(0)})
+	rm := NewRoomManager(testRMParams(store.NewMemoryStore(0)))
 	defer rm.Close()
 
 	if rm.GetRoomBySid("nonexistent") != nil {
@@ -69,7 +77,7 @@ func TestRoomManager_GetRoomBySid(t *testing.T) {
 }
 
 func TestRoomManager_GetParticipantBySid(t *testing.T) {
-	rm := NewRoomManager(RoomManagerParams{Config: defaultRMConfig(), KV: store.NewMemoryStore(0)})
+	rm := NewRoomManager(testRMParams(store.NewMemoryStore(0)))
 	defer rm.Close()
 
 	if rm.GetParticipantBySid("nonexistent") != nil {
@@ -88,7 +96,7 @@ func TestRoomManager_GetParticipantBySid(t *testing.T) {
 }
 
 func TestRoomManager_RoomRemoveOnClose(t *testing.T) {
-	rm := NewRoomManager(RoomManagerParams{Config: defaultRMConfig(), KV: store.NewMemoryStore(0)})
+	rm := NewRoomManager(testRMParams(store.NewMemoryStore(0)))
 	defer rm.Close()
 
 	room := rm.GetOrCreateRoom("test-room", 0, "")
@@ -103,7 +111,7 @@ func TestRoomManager_RoomRemoveOnClose(t *testing.T) {
 }
 
 func TestRoomManager_Close(t *testing.T) {
-	rm := NewRoomManager(RoomManagerParams{Config: defaultRMConfig(), KV: store.NewMemoryStore(0)})
+	rm := NewRoomManager(testRMParams(store.NewMemoryStore(0)))
 	rm.GetOrCreateRoom("room-1", 0, "")
 	rm.GetOrCreateRoom("room-2", 0, "")
 
@@ -117,7 +125,8 @@ func TestRoomManager_Close(t *testing.T) {
 func TestRoomManager_MaxParticipantsOverride(t *testing.T) {
 	cfg := defaultRMConfig()
 	cfg.MaxParticipants = 50
-	rm := NewRoomManager(RoomManagerParams{Config: cfg, KV: store.NewMemoryStore(0)})
+	kv := store.NewMemoryStore(0)
+	rm := NewRoomManager(RoomManagerParams{Config: cfg, KV: kv, LeaseKV: store.NewMemoryStore(0)})
 	defer rm.Close()
 
 	room := rm.GetOrCreateRoom("test-room", 10, "")
@@ -132,7 +141,7 @@ func TestRoomManager_MaxParticipantsOverride(t *testing.T) {
 }
 
 func TestRoomManager_CascadeCallbacks(t *testing.T) {
-	rm := NewRoomManager(RoomManagerParams{Config: defaultRMConfig(), KV: store.NewMemoryStore(0)})
+	rm := NewRoomManager(testRMParams(store.NewMemoryStore(0)))
 	defer rm.Close()
 
 	room := rm.GetOrCreateRoom("test-room", 0, "")
@@ -159,7 +168,7 @@ func TestRoomManager_CascadeCallbacks(t *testing.T) {
 }
 
 func TestRoomManager_CascadeEnsureStream_LocalSkip(t *testing.T) {
-	rm := NewRoomManager(RoomManagerParams{Config: defaultRMConfig(), KV: store.NewMemoryStore(0)})
+	rm := NewRoomManager(testRMParams(store.NewMemoryStore(0)))
 	defer rm.Close()
 
 	room := rm.GetOrCreateRoom("test-room", 0, "")
@@ -170,7 +179,7 @@ func TestRoomManager_CascadeEnsureStream_LocalSkip(t *testing.T) {
 }
 
 func TestRoomManager_CascadeReleaseStream_NilFIB(t *testing.T) {
-	rm := NewRoomManager(RoomManagerParams{Config: defaultRMConfig(), KV: store.NewMemoryStore(0)})
+	rm := NewRoomManager(testRMParams(store.NewMemoryStore(0)))
 	defer rm.Close()
 
 	room := rm.GetOrCreateRoom("test-room", 0, "")
@@ -193,6 +202,7 @@ func TestRoomManager_CascadeCallbacks_WithRIBAndMedia(t *testing.T) {
 		RIB:          rib,
 		MediaManager: mediaMgr,
 		KV:           store.NewMemoryStore(0),
+		LeaseKV:      store.NewMemoryStore(0),
 	})
 	defer rm.Close()
 
@@ -246,6 +256,7 @@ func TestRoomManager_CascadeEnsureStream_WithLocalProducer(t *testing.T) {
 		FIB:          fib,
 		MediaManager: mediaMgr,
 		KV:           store.NewMemoryStore(0),
+		LeaseKV:      store.NewMemoryStore(0),
 	})
 	defer rm.Close()
 
@@ -279,6 +290,7 @@ func TestRoomManager_CascadeReleaseStream_WithLocalProducer(t *testing.T) {
 		FIB:          fib,
 		MediaManager: mediaMgr,
 		KV:           store.NewMemoryStore(0),
+		LeaseKV:      store.NewMemoryStore(0),
 	})
 	defer rm.Close()
 
@@ -293,7 +305,7 @@ func TestRoomManager_CascadeReleaseStream_WithLocalProducer(t *testing.T) {
 }
 
 func TestRoomManager_ConcurrentGetOrCreate(t *testing.T) {
-	rm := NewRoomManager(RoomManagerParams{Config: defaultRMConfig(), KV: store.NewMemoryStore(0)})
+	rm := NewRoomManager(testRMParams(store.NewMemoryStore(0)))
 	defer rm.Close()
 
 	var wg sync.WaitGroup
@@ -365,7 +377,8 @@ func TestMetaKeyRoomName(t *testing.T) {
 
 func TestRoomManager_SweeperPurgesMetaWithoutLease(t *testing.T) {
 	kv := store.NewMemoryStore(0)
-	rm := NewRoomManager(RoomManagerParams{Config: defaultRMConfig(), KV: kv})
+	leaseKV := store.NewMemoryStore(0)
+	rm := NewRoomManager(RoomManagerParams{Config: defaultRMConfig(), KV: kv, LeaseKV: leaseKV})
 	defer rm.Close()
 
 	old := time.Now().Add(-time.Hour).UnixMilli()
@@ -396,7 +409,7 @@ func TestRoomManager_SweeperPurgesMetaWithoutLease(t *testing.T) {
 
 func TestRoomManager_SweeperSkipsFreshMetaWithoutLease(t *testing.T) {
 	kv := store.NewMemoryStore(0)
-	rm := NewRoomManager(RoomManagerParams{Config: defaultRMConfig(), KV: kv})
+	rm := NewRoomManager(RoomManagerParams{Config: defaultRMConfig(), KV: kv, LeaseKV: store.NewMemoryStore(0)})
 	defer rm.Close()
 
 	PutRoomMeta(kv, &RoomMeta{

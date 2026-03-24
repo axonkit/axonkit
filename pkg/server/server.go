@@ -149,6 +149,12 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		return nil, fmt.Errorf("room state store: %w", err)
 	}
 
+	roomLeaseKV, err := store.NewNatsStore(context.Background(), js, rtc.RoomLeaseBucketName, rtc.RoomLeaseBucketTTL)
+	if err != nil {
+		n.closeDeps()
+		return nil, fmt.Errorf("room lease store: %w", err)
+	}
+
 	roomManager := rtc.NewRoomManager(rtc.RoomManagerParams{
 		Config:       cfg.Room,
 		RIB:          rib,
@@ -156,6 +162,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		Finder:       finder,
 		MediaManager: mediaMgr,
 		KV:           roomKV,
+		LeaseKV:      roomLeaseKV,
 		NodeID:       string(myNode.ID),
 	})
 	n.roomManager = roomManager

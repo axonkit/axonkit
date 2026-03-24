@@ -81,38 +81,6 @@ func (w *memoryWatcher) Stop() {
 	close(w.ch)
 }
 
-func (s *MemoryStore) Create(ctx context.Context, key string, value []byte, opts ...CreateOption) error {
-	var o CreateOptions
-	for _, opt := range opts {
-		opt(&o)
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if _, exists := s.data[key]; exists {
-		return fmt.Errorf("key exists: %s", key)
-	}
-
-	// Clone value to prevent external modification
-	valCopy := make([]byte, len(value))
-	copy(valCopy, value)
-	s.data[key] = valCopy
-
-	ttl := s.ttl
-
-	if o.TTL > 0 {
-		ttl = o.TTL
-	}
-
-	if ttl > 0 && s.ttlMgr != nil {
-		s.ttlMgr.Add(key, struct{}{}, ttl)
-	}
-
-	s.notify(key, valCopy, OpPut)
-	return nil
-}
-
 func (s *MemoryStore) Put(ctx context.Context, key string, value []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

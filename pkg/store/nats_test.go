@@ -131,9 +131,9 @@ func TestNatsStore_Keys(t *testing.T) {
 	}
 
 	// Put keys
-	store.Put(ctx, "a.1", []byte("v1"))
-	store.Put(ctx, "a.2", []byte("v2"))
-	store.Put(ctx, "b.1", []byte("v3"))
+	_ = store.Put(ctx, "a.1", []byte("v1"))
+	_ = store.Put(ctx, "a.2", []byte("v2"))
+	_ = store.Put(ctx, "b.1", []byte("v3"))
 
 	// List keys
 	keys, err := store.Keys(ctx, "a.>")

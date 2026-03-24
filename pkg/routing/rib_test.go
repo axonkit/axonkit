@@ -38,7 +38,7 @@ func TestWatchDownstream_SelfExclusion(t *testing.T) {
 		}
 		bytes, _ := json.Marshal(val)
 		key := fmt.Sprintf("route.%s.R1.C1.%s", streamID, node)
-		ms.Put(context.Background(), key, bytes)
+		_ = ms.Put(context.Background(), key, bytes)
 	}
 
 	// 1. Self Advertise (Loopback) -> Should be IGNORED
@@ -186,7 +186,7 @@ func TestRIB_SubscribeUpdates(t *testing.T) {
 	}
 	data, _ := json.Marshal(val)
 	key := fmt.Sprintf("route.%s.us-east.c1.nodeB", streamID)
-	ms.Put(context.Background(), key, data)
+	_ = ms.Put(context.Background(), key, data)
 
 	select {
 	case isDelete := <-updates:

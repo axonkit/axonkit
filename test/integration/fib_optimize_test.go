@@ -75,7 +75,7 @@ func TestFIBOptimization(t *testing.T) {
 			ExpireAt:   time.Now().Add(10 * time.Second),
 		}
 		data, _ := json.Marshal(val)
-		kv.Put(context.Background(), key, data)
+		_, _ = kv.Put(context.Background(), key, data)
 	}
 
 	// Dynamic FindPath (always picks best from RIB)
@@ -245,7 +245,7 @@ func TestConcurrentOptimization(t *testing.T) {
 			ExpireAt:   time.Now().Add(10 * time.Second),
 		}
 		data, _ := json.Marshal(val)
-		kv.Put(context.Background(), key, data)
+		_, _ = kv.Put(context.Background(), key, data)
 	}
 
 	findPath := func(sid types.StreamID) (*types.RouteKVValue, error) {

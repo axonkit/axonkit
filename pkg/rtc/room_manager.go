@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
-	"strings"
 	"sync"
 	"time"
 
@@ -34,8 +33,9 @@ type RoomManager struct {
 	finder   *discovery.Finder
 	mediaMgr *media.Manager
 
-	kv     store.Store // shared KV for cross-node room state sync
-	nodeID string
+	kv      store.Store // ROOM_STATE: meta, participants, tracks, …
+	leaseKV store.Store // ROOM_LEASE: one key per room name (liveness)
+	nodeID  string
 
 	backupCodecFwdMu sync.RWMutex
 	backupCodecFwd   func(publisherSid, trackSid, publisherNodeId string) error
@@ -50,6 +50,7 @@ type RoomManagerParams struct {
 	Finder       *discovery.Finder
 	MediaManager *media.Manager
 	KV           store.Store
+	LeaseKV      store.Store
 	NodeID       string
 }
 
@@ -63,6 +64,7 @@ func NewRoomManager(params RoomManagerParams) *RoomManager {
 		finder:     params.Finder,
 		mediaMgr:   params.MediaManager,
 		kv:         params.KV,
+		leaseKV:    params.LeaseKV,
 		nodeID:     params.NodeID,
 		logger:     slog.Default().With("component", "RoomManager"),
 	}
@@ -88,12 +90,13 @@ func (rm *RoomManager) RequestBackupCodecOnPublisher(publisherSid, trackSid stri
 
 // Start starts the RoomManager background tasks.
 func (rm *RoomManager) Start(ctx context.Context) {
+	go rm.runLeaseRefreshLoop(ctx)
 	go rm.watchLeases(ctx)
 	go rm.runRoomStateSweeper(ctx)
 }
 
 func (rm *RoomManager) watchLeases(ctx context.Context) {
-	watcher, err := rm.kv.Watch(ctx, "room.*.lease")
+	watcher, err := rm.leaseKV.Watch(ctx, ">")
 	if err != nil {
 		rm.logger.Error("Failed to watch room leases", "error", err)
 		return
@@ -108,24 +111,19 @@ func (rm *RoomManager) watchLeases(ctx context.Context) {
 			if !ok {
 				return
 			}
-			if entry == nil {
-				continue
-			}
 			if entry.Operation() == store.OpDelete {
-				// Key format: room.<roomName>.lease
-				keyParts := strings.Split(entry.Key(), ".")
-				if len(keyParts) != 3 {
+				roomName := entry.Key()
+				if roomName == "" {
 					continue
 				}
-				roomName := keyParts[1]
-
-				time.Sleep(time.Duration(rand.Intn(1000)) * time.Millisecond)
-				purgeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				if _, err := GetRoomMeta(rm.kv, roomName); err == nil {
-					PurgeRoomKV(purgeCtx, rm.kv, roomName)
-					rm.logger.Info("Purged room KV after lease delete", "room", roomName)
-				}
-				cancel()
+				time.AfterFunc(time.Duration(rand.Intn(1000))*time.Millisecond, func() {
+					if _, err := GetRoomMeta(rm.kv, roomName); err == nil {
+						purgeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+						PurgeRoomKV(purgeCtx, rm.kv, roomName)
+						cancel()
+						rm.logger.Info("Purged room KV after lease delete", "room", roomName)
+					}
+				})
 			}
 		}
 	}
@@ -177,7 +175,7 @@ func (rm *RoomManager) tryPurgeMetaWithoutLease(ctx context.Context, roomName st
 		if err != nil || meta == nil {
 			return
 		}
-		if _, leaseErr := rm.kv.Get(ctx, RoomLeaseKey(roomName)); leaseErr == nil {
+		if _, leaseErr := rm.leaseKV.Get(ctx, RoomLeaseStoreKey(roomName)); leaseErr == nil {
 			return
 		}
 		if time.Since(time.UnixMilli(meta.CreationTime)) < OrphanRoomMetaGrace {
@@ -185,7 +183,7 @@ func (rm *RoomManager) tryPurgeMetaWithoutLease(ctx context.Context, roomName st
 		}
 	}
 	PurgeRoomKV(ctx, rm.kv, roomName)
-	rm.logger.Info("Purged orphan room KV (meta without lease)", "room", roomName)
+	rm.logger.Info("Purged orphan room KV", "room", roomName)
 }
 
 // GetOrCreateRoom returns an existing room by name, or creates one using
@@ -237,7 +235,10 @@ func (rm *RoomManager) GetOrCreateRoom(name string, maxParticipants int, metadat
 
 	rm.rooms[name] = room
 	rm.roomsBySid[meta.Sid] = room
+
 	rm.logger.Info("Room created", "name", name, "sid", meta.Sid)
+
+	go rm.refreshRoomLease(context.Background(), name)
 
 	return room
 }
@@ -256,11 +257,45 @@ func (rm *RoomManager) GetRoomBySid(sid string) *Room {
 
 func (rm *RoomManager) removeRoom(room *Room) {
 	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
 	delete(rm.rooms, room.name)
 	delete(rm.roomsBySid, room.sid)
+	rm.mu.Unlock()
+
 	rm.logger.Info("Room removed", "name", room.name, "sid", room.sid)
+}
+
+func (rm *RoomManager) runLeaseRefreshLoop(ctx context.Context) {
+	ticker := time.NewTicker(RoomLeaseHeartbeatInterval)
+	defer ticker.Stop()
+	rm.refreshAllRoomLeases(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			rm.refreshAllRoomLeases(ctx)
+		}
+	}
+}
+
+func (rm *RoomManager) refreshRoomLease(ctx context.Context, roomName string) {
+	c, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := rm.leaseKV.Put(c, RoomLeaseStoreKey(roomName), []byte(rm.nodeID)); err != nil {
+		rm.logger.Error("Room lease refresh failed", "room", roomName, "error", err)
+	}
+}
+
+func (rm *RoomManager) refreshAllRoomLeases(ctx context.Context) {
+	rm.mu.RLock()
+	names := make([]string, 0, len(rm.rooms))
+	for n := range rm.rooms {
+		names = append(names, n)
+	}
+	rm.mu.RUnlock()
+	for _, name := range names {
+		rm.refreshRoomLease(ctx, name)
+	}
 }
 
 // GetParticipantBySid searches across all rooms for a participant by SID.

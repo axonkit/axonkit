@@ -156,7 +156,7 @@ func TestMemoryStore_Keys(t *testing.T) {
 	}
 
 	for k, v := range data {
-		ms.Put(ctx, k, []byte(v))
+		_ = ms.Put(ctx, k, []byte(v))
 	}
 
 	tests := []struct {

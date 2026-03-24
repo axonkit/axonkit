@@ -3,7 +3,6 @@ package rtc
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -14,18 +13,23 @@ import (
 	"github.com/axonkit/axonkit/pkg/config"
 	"github.com/axonkit/axonkit/pkg/proto"
 	"github.com/axonkit/axonkit/pkg/store"
-	"github.com/nats-io/nats.go"
 )
 
 // RoomStateBucketTTL is the JetStream KV max age for the ROOM_STATE bucket.
-// Each key's timer resets on Put; use a long horizon so idle participants are
-// not dropped while still connected. This TTL mainly retires orphans after
-// crashes (alongside explicit deletes and node-offline cleanup).
 const RoomStateBucketTTL = 7 * 24 * time.Hour
+
+// RoomLeaseBucketName is the JetStream KV bucket dedicated to room liveness rows.
+const RoomLeaseBucketName = "ROOM_LEASE"
+
+// RoomLeaseBucketTTL is the lease bucket MaxAge; heartbeats must refresh more often than this.
+const RoomLeaseBucketTTL = 10 * time.Second
+
+// RoomLeaseHeartbeatInterval is how often RoomManager renews each active room lease.
+const RoomLeaseHeartbeatInterval = 2 * time.Second
 
 // OrphanRoomMetaGrace is how long room meta may exist without a lease before
 // the sweeper purges the room prefix. This avoids racing GetOrCreateRoom,
-// which writes meta before the heartbeat goroutine creates the lease key.
+// which writes meta before the first lease Put.
 const OrphanRoomMetaGrace = 15 * time.Second
 
 // RoomStateSweeperInterval is how often nodes scan for meta-without-lease orphans.
@@ -106,14 +110,13 @@ func DeleteRoomMeta(kv store.Store, roomName string) {
 	_ = kv.Delete(ctx, key)
 }
 
-// RoomLeaseKey returns the JetStream KV key for a room's liveness lease.
-func RoomLeaseKey(roomName string) string {
-	return fmt.Sprintf("room.%s.lease", roomName)
+// RoomLeaseStoreKey is the key in the ROOM_LEASE bucket (room name; no dots).
+func RoomLeaseStoreKey(roomName string) string {
+	return roomName
 }
 
 // PurgeRoomKV removes room.<roomName>.meta (best-effort) and every key under
-// room.<roomName>.>. Used after lease loss or when the sweeper finds meta
-// without a lease (orphan).
+// room.<roomName>.> in the ROOM_STATE bucket.
 func PurgeRoomKV(ctx context.Context, kv store.Store, roomName string) {
 	DeleteRoomMeta(kv, roomName)
 	pattern := fmt.Sprintf("room.%s.>", roomName)
@@ -147,7 +150,6 @@ func MetaKeyRoomName(metaKey string) (roomName string, ok bool) {
 // Key layout:
 //
 //	room.<roomName>.meta              → JSON RoomMeta
-//	room.<roomName>.lease             → (empty, with TTL)
 //	room.<roomName>.participant.<sid>  → JSON ParticipantInfo
 //	room.<roomName>.track.<participantSid>.<trackSid>       → JSON TrackInfo
 //	room.<roomName>.dataTrack.<participantSid>.<dataTrackSid> → JSON DataTrackInfo
@@ -167,48 +169,6 @@ func NewRoomStore(kv store.Store, roomName, nodeID string) *RoomStore {
 		roomName: roomName,
 		nodeID:   nodeID,
 		logger:   slog.Default().With("component", "RoomStore", "room", roomName),
-	}
-}
-
-// StartHeartbeat maintains a lease for the room and cleans up if the lease expires.
-// It should be called by the room creator/manager.
-func (s *RoomStore) StartHeartbeat(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	leaseKey := fmt.Sprintf("%s.lease", s.prefix())
-	created := false
-
-	updateLease := func() {
-		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		if !created {
-			// Create the lease key once with a TTL.
-			err := s.kv.Create(ctx, leaseKey, []byte(s.nodeID), store.WithCreateTTL(5*time.Second))
-			if err != nil && !errors.Is(err, nats.ErrKeyExists) {
-				s.logger.Error("Failed to create lease key", "error", err)
-			} else {
-				created = true
-				s.logger.Info("Lease key created")
-			}
-		} else {
-			if err := s.kv.Put(ctx, leaseKey, []byte(s.nodeID)); err != nil {
-				s.logger.Error("Failed to update lease key", "error", err)
-			}
-		}
-	}
-
-	s.logger.Info("Starting heartbeat")
-
-	updateLease()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			updateLease()
-		}
 	}
 }
 

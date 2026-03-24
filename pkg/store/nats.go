@@ -27,7 +27,6 @@ func WithLimitMarkerTTL(ttl time.Duration) NatsStoreOption {
 type NatsStore struct {
 	kv       jetstream.KeyValue
 	ttl      time.Duration
-	bucket   string
 	logger   *slog.Logger
 	watchers []*natsWatcher
 	mu       sync.RWMutex
@@ -57,26 +56,10 @@ func NewNatsStore(ctx context.Context, js jetstream.JetStream, bucket string, tt
 	s := &NatsStore{
 		kv:     kv,
 		ttl:    ttlDuration,
-		bucket: bucket,
 		logger: slog.Default().With("component", "NatsStore", "bucket", bucket),
 	}
 
 	return s, nil
-}
-
-func (s *NatsStore) Create(ctx context.Context, key string, value []byte, opts ...CreateOption) error {
-	var o CreateOptions
-	for _, opt := range opts {
-		opt(&o)
-	}
-
-	if o.TTL > 0 {
-		_, err := s.kv.Create(ctx, key, value, jetstream.KeyTTL(o.TTL))
-		return err
-	}
-
-	_, err := s.kv.Create(ctx, key, value)
-	return err
 }
 
 func (s *NatsStore) Put(ctx context.Context, key string, value []byte) error {
@@ -202,14 +185,3 @@ func (nw *natsWatcher) Updates() <-chan Entry {
 func (nw *natsWatcher) Stop() {
 	nw.w.Stop()
 }
-
-// localEntry implements Entry for locally generated events (like TTL expiration)
-type localEntry struct {
-	key   string
-	value []byte
-	op    Operation
-}
-
-func (e *localEntry) Key() string          { return e.key }
-func (e *localEntry) Value() []byte        { return e.value }
-func (e *localEntry) Operation() Operation { return e.op }

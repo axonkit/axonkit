@@ -151,7 +151,7 @@ func (r *Room) ShouldRegressCodec() bool {
 func (r *Room) SetOnClose(fn func(*Room)) { r.onClose = fn }
 
 // SetupStore initializes the cross-node RoomStore and starts watching for
-// remote changes. Must be called after NewRoom and before participants join.
+// remote changes. Room lease heartbeats are driven by RoomManager.
 func (r *Room) SetupStore(kv store.Store, nodeID string) {
 	r.roomStore = NewRoomStore(kv, r.name, nodeID)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -163,7 +163,6 @@ func (r *Room) SetupStore(kv store.Store, nodeID string) {
 		r.logger.Warn("Failed to start room store watch", "error", err)
 		return
 	}
-	go r.roomStore.StartHeartbeat(ctx)
 	go r.processStoreEvents(ch, nodeID)
 }
 

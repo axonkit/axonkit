@@ -107,6 +107,10 @@ func createAxonkitNode(t *testing.T, srv interface{ ClientURL() string }, nodeID
 	if err != nil {
 		t.Fatalf("room state store failed for %s: %v", nodeID, err)
 	}
+	roomLeaseKV, err := store.NewNatsStore(context.Background(), js, rtc.RoomLeaseBucketName, rtc.RoomLeaseBucketTTL)
+	if err != nil {
+		t.Fatalf("room lease store failed for %s: %v", nodeID, err)
+	}
 
 	roomMgr := rtc.NewRoomManager(rtc.RoomManagerParams{
 		Config: config.RoomConfig{
@@ -121,6 +125,7 @@ func createAxonkitNode(t *testing.T, srv interface{ ClientURL() string }, nodeID
 		Finder:       finder,
 		MediaManager: mgr,
 		KV:           roomKV,
+		LeaseKV:      roomLeaseKV,
 		NodeID:       string(nodeInfo.ID),
 	})
 
