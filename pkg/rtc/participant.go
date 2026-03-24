@@ -945,6 +945,17 @@ func (p *Participant) SetState(state proto.ParticipantInfo_State) {
 	p.mu.Lock()
 	p.state = state
 	p.mu.Unlock()
+	p.syncStateToStore()
+}
+
+// syncStateToStore writes the current participant snapshot to the shared room
+// store when the room is configured with KV replication.
+func (p *Participant) syncStateToStore() {
+	room := p.room
+	if room == nil || room.roomStore == nil {
+		return
+	}
+	room.runAsync(func() { room.roomStore.PutParticipant(p.ToProto()) })
 }
 
 func (p *Participant) SendTransportSid() string {
@@ -1048,15 +1059,19 @@ func (p *Participant) handleIceStateChange(state mediasoup.IceState) {
 		}
 		p.mu.Unlock()
 
+		p.syncStateToStore()
+
 		if wasSuspended && p.room != nil {
 			p.room.BroadcastNotification(proto.MethodParticipantUpdated,
-				&proto.ParticipantUpdatedNotification{Participant: p.ToProto()}, "")
+				&proto.ParticipantUpdatedNotification{Participant: p.ToProto()}, p.sid)
 		}
 
 	case mediasoup.IceStateDisconnected:
 		p.mu.Lock()
 		p.state = proto.ParticipantInfo_SUSPENDED
 		p.mu.Unlock()
+
+		p.syncStateToStore()
 
 		p.logger.Warn("ICE disconnected, suspending participant")
 		if p.room != nil {
@@ -1966,17 +1981,25 @@ func (p *Participant) Request(method string, body any) (*proto.Message, error) {
 func (p *Participant) sendMessage(msg *proto.Message) error {
 	p.mu.RLock()
 	producer := p.signalOutProducer
-	suspended := p.state == proto.ParticipantInfo_SUSPENDED
+	state := p.state
 	p.mu.RUnlock()
-
-	if suspended {
-		p.logger.Warn("Participant is suspended, dropping message", "method", msg.Method)
-		return nil
-	}
 
 	if producer == nil {
 		p.logger.Error("Signal channel not established", "method", msg.Method, "logId", msg.LogId)
 		return fmt.Errorf("signal channel not established")
+	}
+
+	// RPC responses must be delivered during join (CONNECTED) and other edge cases.
+	// One-way traffic is only sent after ready (JOINED), except server-initiated disconnect.
+	if !msg.IsResponse() {
+		if state != proto.ParticipantInfo_JOINED {
+			allow := msg.IsNotification() && msg.Method == proto.MethodDisconnect
+			if !allow {
+				p.logger.Warn("Participant not joined, dropping outbound signal message",
+					"method", msg.Method, "state", state)
+				return nil
+			}
+		}
 	}
 
 	log := p.logger.Info
