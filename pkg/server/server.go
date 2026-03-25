@@ -66,7 +66,10 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		opts := natsserver.DefaultTestOptions
 		opts.Port = -1
 		opts.JetStream = true
-		opts.StoreDir = "./.data"
+		opts.StoreDir = cfg.Nats.StoreDir
+		if opts.StoreDir == "" {
+			opts.StoreDir = "./.data"
+		}
 		n.embeddedNats = natsserver.RunServer(&opts)
 		natsOpts = append(natsOpts, nats.InProcessServer(n.embeddedNats))
 	}

@@ -67,7 +67,8 @@ type AuthConfig struct {
 }
 
 type NatsConfig struct {
-	URL string `json:"url"`
+	URL      string `json:"url"`
+	StoreDir string `json:"storeDir,omitempty"`
 }
 
 func DefaultConfig() *Config {
