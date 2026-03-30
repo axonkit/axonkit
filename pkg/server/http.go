@@ -409,6 +409,7 @@ func (s *HTTPServer) createTransports(router *mediasoup.Router, webRtcServer *me
 		send.Close()
 		return nil, nil, nil, fmt.Errorf("recv transport: %w", err)
 	}
+	recv.SetMaxIncomingBitrate(8000000)
 
 	direct, err = router.CreateDirectTransport(&mediasoup.DirectTransportOptions{})
 	if err != nil {
