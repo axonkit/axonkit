@@ -17,7 +17,10 @@ import (
 	"github.com/rs/xid"
 )
 
-const dynacastDowngradeDelay = 5 * time.Second
+const (
+	dynacastDowngradeDelay = 5 * time.Second
+	preReadySignalQueueCap = 1024
+)
 
 // PublishedTrack holds a published media track and its signaling metadata.
 type PublishedTrack struct {
@@ -715,6 +718,10 @@ type Participant struct {
 	pendingRPC map[string]chan *proto.Message
 	msgCh      chan *proto.Message // bounded inbound message queue
 	done       chan struct{}       // closed on Close() to stop messageLoop
+
+	// Notifications sent while the participant is still JOINING are queued and
+	// flushed right after the ready response, matching snapshot-then-delta flow.
+	queuedSignalNotifications []*proto.Message
 
 	// Heartbeat
 	lastPing     time.Time
@@ -1970,13 +1977,37 @@ func (p *Participant) Request(method string, body any) (*proto.Message, error) {
 	}
 }
 
+func (p *Participant) queueSignalNotificationLocked(msg *proto.Message) bool {
+	if len(p.queuedSignalNotifications) >= preReadySignalQueueCap {
+		p.logger.Warn("Pre-ready signal queue full, dropping notification",
+			"method", msg.Method, "logId", msg.LogId, "limit", preReadySignalQueueCap)
+		return false
+	}
+	p.queuedSignalNotifications = append(p.queuedSignalNotifications, msg)
+	return true
+}
+
+func (p *Participant) flushQueuedSignalNotifications() {
+	p.mu.Lock()
+	queued := p.queuedSignalNotifications
+	p.queuedSignalNotifications = nil
+	p.mu.Unlock()
+
+	for _, msg := range queued {
+		if err := p.sendMessage(msg); err != nil {
+			p.logger.Warn("Failed to flush queued signal notification",
+				"method", msg.Method, "logId", msg.LogId, "error", err)
+			return
+		}
+	}
+}
+
 func (p *Participant) sendMessage(msg *proto.Message) error {
-	p.mu.RLock()
+	p.mu.Lock()
 	producer := p.signalOutProducer
 	state := p.state
-	p.mu.RUnlock()
-
 	if producer == nil {
+		p.mu.Unlock()
 		p.logger.Error("Signal channel not established", "method", msg.Method, "logId", msg.LogId)
 		return fmt.Errorf("signal channel not established")
 	}
@@ -1984,15 +2015,26 @@ func (p *Participant) sendMessage(msg *proto.Message) error {
 	// RPC responses must be delivered during join (JOINING / pre-ready) and other edge cases.
 	// One-way traffic is only sent after ready (JOINED), except server-initiated disconnect.
 	if !msg.IsResponse() {
+		if state == proto.ParticipantInfo_JOINING && msg.IsNotification() && msg.Method != proto.MethodDisconnect {
+			queued := p.queueSignalNotificationLocked(msg)
+			p.mu.Unlock()
+			if queued {
+				p.logger.Debug("Queued outbound notification until ready",
+					"method", msg.Method, "logId", msg.LogId)
+			}
+			return nil
+		}
 		if state != proto.ParticipantInfo_JOINED {
 			allow := msg.IsNotification() && msg.Method == proto.MethodDisconnect
 			if !allow {
+				p.mu.Unlock()
 				p.logger.Warn("Participant not joined, dropping outbound signal message",
 					"method", msg.Method, "state", state)
 				return nil
 			}
 		}
 	}
+	p.mu.Unlock()
 
 	log := p.logger.Info
 	if msg.Error() != "" {

@@ -431,6 +431,95 @@ func TestIntegration_SetSignalAndMessage(t *testing.T) {
 	}
 }
 
+func TestIntegration_ReadyFlushesQueuedNotifications(t *testing.T) {
+	_, router := createWorkerAndRouter(t)
+	direct := createDirectTransport(t, router)
+
+	room := NewRoom(RoomParams{
+		Sid:          "room-ready-flush",
+		Name:         "ready-flush",
+		Config:       defaultRoomConfig(),
+		CreationTime: time.Now(),
+	})
+
+	p := NewParticipant(ParticipantParams{
+		Sid:          "ready-flush-p1",
+		Identity:     "ready-flush-user",
+		Grants:       &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
+		Router:       router,
+		PingTimeout:  10 * time.Second,
+		PingInterval: 5 * time.Second,
+	})
+	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
+	room.AddParticipant(p)
+
+	outProducer, err := direct.ProduceData(&mediasoup.DataProducerOptions{Label: "signal-out"})
+	if err != nil {
+		t.Fatalf("ProduceData out: %v", err)
+	}
+	outConsumer, err := direct.ConsumeData(&mediasoup.DataConsumerOptions{
+		DataProducerId: outProducer.Id(),
+	})
+	if err != nil {
+		t.Fatalf("ConsumeData out: %v", err)
+	}
+	inProducer, err := direct.ProduceData(&mediasoup.DataProducerOptions{Label: "signal-in"})
+	if err != nil {
+		t.Fatalf("ProduceData in: %v", err)
+	}
+	inConsumer, err := direct.ConsumeData(&mediasoup.DataConsumerOptions{
+		DataProducerId: inProducer.Id(),
+	})
+	if err != nil {
+		t.Fatalf("ConsumeData in: %v", err)
+	}
+
+	received := make(chan *proto.Message, 4)
+	outConsumer.OnMessage(func(payload []byte, ppid mediasoup.SctpPayloadType) {
+		msg, err := proto.DecodeMessage(payload)
+		if err != nil {
+			t.Errorf("DecodeMessage: %v", err)
+			return
+		}
+		received <- msg
+	})
+
+	p.SetTransports(nil, nil, direct)
+	p.SetSignal(outProducer, outConsumer, inProducer, inConsumer)
+
+	if err := p.SendNotification("queued.event", map[string]string{"value": "before-ready"}); err != nil {
+		t.Fatalf("SendNotification before ready: %v", err)
+	}
+
+	select {
+	case msg := <-received:
+		t.Fatalf("unexpected message before ready: %s", msg.Method)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	p.dispatchRPC(makeRequest(proto.MethodReady, "log-ready-flush", &proto.ReadyRequest{}))
+
+	var methods []string
+	for range 2 {
+		select {
+		case msg := <-received:
+			methods = append(methods, msg.Method)
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for ready flush messages, got %v", methods)
+		}
+	}
+
+	if len(methods) != 2 {
+		t.Fatalf("expected 2 messages, got %v", methods)
+	}
+	if methods[0] != proto.MethodReady {
+		t.Fatalf("expected ready response first, got %s", methods[0])
+	}
+	if methods[1] != "queued.event" {
+		t.Fatalf("expected queued notification second, got %s", methods[1])
+	}
+}
+
 func TestIntegration_RestartIce(t *testing.T) {
 	_, router := createWorkerAndRouter(t)
 	send := createWebRtcTransport(t, router)

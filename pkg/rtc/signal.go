@@ -12,9 +12,10 @@ import (
 // dispatchRPC routes incoming datachannel RPC messages to the appropriate handler.
 func (p *Participant) dispatchRPC(msg *proto.Message) {
 	var (
-		body   any
-		status int
-		errMsg string
+		body          any
+		status        int
+		errMsg        string
+		afterSendResp func()
 	)
 
 	switch msg.Method {
@@ -26,7 +27,7 @@ func (p *Participant) dispatchRPC(msg *proto.Message) {
 
 	switch msg.Method {
 	case proto.MethodReady:
-		body, status, errMsg = p.handleReady(msg)
+		body, status, errMsg, afterSendResp = p.handleReady(msg)
 
 	case proto.MethodPing:
 		body, status, errMsg = p.handlePingRPC(msg)
@@ -147,19 +148,19 @@ func (p *Participant) dispatchRPC(msg *proto.Message) {
 			}
 		}
 		resp.Method = msg.Method
-		_ = p.sendMessage(resp)
+		if err := p.sendMessage(resp); err == nil && afterSendResp != nil && errMsg == "" {
+			afterSendResp()
+		}
 	}
 }
 
-func (p *Participant) handleReady(msg *proto.Message) (any, int, string) {
+func (p *Participant) handleReady(msg *proto.Message) (any, int, string, func()) {
 	var req proto.ReadyRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		return nil, proto.StatusBadRequest, "invalid request body"
+		return nil, proto.StatusBadRequest, "invalid request body", nil
 	}
 
 	p.SetRtpCapabilities(req.RtpCapabilities)
-	p.SetState(proto.ParticipantInfo_JOINED)
-	p.StartHeartbeat()
 
 	// Fetch participants, groups, messages and shared state from both
 	// local node and shared store so the response covers all nodes.
@@ -167,19 +168,13 @@ func (p *Participant) handleReady(msg *proto.Message) (any, int, string) {
 	groupInfos := p.room.GetAllGroupInfos()
 	sharedState := p.room.GetAllSharedState()
 
-	// For reconnect, deliver messages the client missed.
 	var missedMessages []*proto.MessageNotification
 	if req.SyncState != nil {
 		missedMessages = p.room.GetAllMessagesSince(req.SyncState.LastMessageTimestamp)
-		time.AfterFunc(time.Millisecond*10, func() {
-			p.processReconnectSync(req.SyncState, otherInfos)
-		})
-	} else {
-		p.room.BroadcastNotification(proto.MethodParticipantJoined,
-			&proto.ParticipantJoinedNotification{Participant: p.ToProto()}, p.sid)
-		time.AfterFunc(time.Millisecond*10, func() {
-			p.room.SubscribeExistingTracks(p, otherInfos)
-		})
+	}
+
+	afterSendResp := func() {
+		p.completeReady(req.SyncState, otherInfos)
 	}
 
 	return &proto.ReadyResponse{
@@ -188,7 +183,22 @@ func (p *Participant) handleReady(msg *proto.Message) (any, int, string) {
 		Groups:            groupInfos,
 		Messages:          missedMessages,
 		SharedState:       sharedState,
-	}, proto.StatusOK, ""
+	}, proto.StatusOK, "", afterSendResp
+}
+
+func (p *Participant) completeReady(syncState *proto.SyncState, otherInfos []*proto.ParticipantInfo) {
+	p.SetState(proto.ParticipantInfo_JOINED)
+	p.StartHeartbeat()
+	p.flushQueuedSignalNotifications()
+
+	if syncState != nil {
+		p.processReconnectSync(syncState, otherInfos)
+		return
+	}
+
+	p.room.BroadcastNotification(proto.MethodParticipantJoined,
+		&proto.ParticipantJoinedNotification{Participant: p.ToProto()}, p.sid)
+	p.room.SubscribeExistingTracks(p, otherInfos)
 }
 
 // processReconnectSync compares the client's last-known state with the current

@@ -312,8 +312,8 @@ func TestDispatchRPC_Ready(t *testing.T) {
 	msg := makeRequest(proto.MethodReady, "log-ready", &proto.ReadyRequest{})
 	p.dispatchRPC(msg)
 
-	if p.State() != proto.ParticipantInfo_JOINED {
-		t.Fatalf("expected JOINED state after ready, got %d", p.State())
+	if p.State() != proto.ParticipantInfo_JOINING {
+		t.Fatalf("expected JOINING state without ready response delivery, got %d", p.State())
 	}
 }
 
