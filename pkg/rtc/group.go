@@ -13,6 +13,7 @@ import (
 type Group struct {
 	sid         string
 	name        string
+	ownerSid    string
 	permissions *proto.ParticipantPermission
 
 	participants map[string]bool // participantSid -> present
@@ -28,6 +29,20 @@ func NewGroup(name string, permissions *proto.ParticipantPermission) *Group {
 	}
 }
 
+// GroupFromProto reconstructs a Group from a stored GroupInfo. Used when a
+// remote node created the group and the local node discovers it via the store
+// watch. The local participant set starts empty and is populated as local
+// participants join.
+func GroupFromProto(info *proto.GroupInfo) *Group {
+	return &Group{
+		sid:          info.GroupId,
+		name:         info.Name,
+		ownerSid:     info.OwnerSid,
+		permissions:  info.Permissions,
+		participants: make(map[string]bool),
+	}
+}
+
 func (g *Group) SID() string { return g.sid }
 
 func (g *Group) ToProto() *proto.GroupInfo {
@@ -36,6 +51,7 @@ func (g *Group) ToProto() *proto.GroupInfo {
 	return &proto.GroupInfo{
 		GroupId:          g.sid,
 		Name:             g.name,
+		OwnerSid:         g.ownerSid,
 		Permissions:      g.permissions,
 		ParticipantCount: len(g.participants),
 	}

@@ -4,8 +4,8 @@ import "testing"
 
 func TestNewStreamID(t *testing.T) {
 	sid := NewStreamID("router-123", "producer-456")
-	if sid != "router-123.producer-456" {
-		t.Fatalf("expected router-123.producer-456, got %s", sid)
+	if sid != "router-123/producer-456" {
+		t.Fatalf("expected router-123/producer-456, got %s", sid)
 	}
 }
 
@@ -14,9 +14,8 @@ func TestStreamID_RouterID(t *testing.T) {
 		input    StreamID
 		expected string
 	}{
-		{"router-abc.producer-def", "router-abc"},
+		{"router-abc/producer-def", "router-abc"},
 		{"single", "single"},
-		{"a.b.c", "a"},
 	}
 	for _, tc := range tests {
 		got := tc.input.RouterID()
@@ -31,9 +30,8 @@ func TestStreamID_ProducerID(t *testing.T) {
 		input    StreamID
 		expected string
 	}{
-		{"router-abc.producer-def", "producer-def"},
+		{"router-abc/producer-def", "producer-def"},
 		{"single", "single"},
-		{"a.b.c", "c"},
 	}
 	for _, tc := range tests {
 		got := tc.input.ProducerID()

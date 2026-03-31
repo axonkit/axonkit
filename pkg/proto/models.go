@@ -88,6 +88,7 @@ const (
 // TrackInfo represents a published media track.
 type TrackInfo struct {
 	Sid               string              `json:"sid,omitempty"`
+	ParticipantSid    string              `json:"participantSid,omitempty"`
 	Kind              mediasoup.MediaKind `json:"kind,omitempty"`
 	Name              string              `json:"name,omitempty"`
 	Muted             bool                `json:"muted,omitempty"`
@@ -180,9 +181,10 @@ const (
 
 // DataTrackInfo represents a published data track.
 type DataTrackInfo struct {
-	Sid     string         `json:"sid,omitempty"`
-	Name    string         `json:"name,omitempty"`
-	AppData map[string]any `json:"appData,omitempty"`
+	Sid            string         `json:"sid,omitempty"`
+	ParticipantSid string         `json:"participantSid,omitempty"`
+	Name           string         `json:"name,omitempty"`
+	AppData        map[string]any `json:"appData,omitempty"`
 }
 
 // SubscriptionInfo represents a media subscription delivered to a client.

@@ -52,21 +52,13 @@ type memoryWatcher struct {
 	pattern string
 	opts    WatchOptions
 	ch      chan Entry
-	stopCh  chan struct{}
+	queue   queue[Entry]
+	cancel  context.CancelFunc
 }
 
-func (w *memoryWatcher) Updates() <-chan Entry {
-	return w.ch
-}
+func (w *memoryWatcher) Updates() <-chan Entry { return w.ch }
 
 func (w *memoryWatcher) Stop() {
-	select {
-	case <-w.stopCh:
-		return // already stopped
-	default:
-		close(w.stopCh)
-	}
-
 	w.store.mu.Lock()
 	defer w.store.mu.Unlock()
 	// Remove self from store.watchers
@@ -75,10 +67,10 @@ func (w *memoryWatcher) Stop() {
 			// Fast delete
 			w.store.watchers[i] = w.store.watchers[len(w.store.watchers)-1]
 			w.store.watchers = w.store.watchers[:len(w.store.watchers)-1]
+			watcher.cancel()
 			break
 		}
 	}
-	close(w.ch)
 }
 
 func (s *MemoryStore) Put(ctx context.Context, key string, value []byte) error {
@@ -147,33 +139,46 @@ func (s *MemoryStore) Keys(ctx context.Context, pattern string) ([]string, error
 }
 
 func (s *MemoryStore) Watch(ctx context.Context, pattern string, opts ...WatchOption) (Watcher, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	options := GetWatchOptions(opts...)
+	ctx, cancel := context.WithCancel(ctx)
 
 	w := &memoryWatcher{
 		store:   s,
 		pattern: pattern,
 		opts:    options,
-		ch:      make(chan Entry, 100), // Buffer to avoid blocking notify
-		stopCh:  make(chan struct{}),
+		ch:      make(chan Entry),
+		queue:   newQueue[Entry](),
+		cancel:  cancel,
 	}
 
-	s.watchers = append(s.watchers, w)
+	s.mu.Lock()
 
-	// Deliver initial state synchronously under the lock so that it is
-	// guaranteed to arrive before any subsequent Put/Delete notifications.
 	for k, v := range s.data {
 		if matchSubject(pattern, k) {
 			valCopy := make([]byte, len(v))
 			copy(valCopy, v)
-			select {
-			case w.ch <- &memoryEntry{key: k, value: valCopy, op: OpPut}:
-			default:
-			}
+			w.queue.put(&memoryEntry{key: k, value: valCopy, op: OpPut})
 		}
 	}
+	w.queue.put(nil) // sentinel: initial snapshot complete
+
+	s.watchers = append(s.watchers, w)
+
+	s.mu.Unlock()
+
+	go func() {
+		defer func() {
+			close(w.ch)
+			cancel()
+		}()
+		for {
+			entry, err := w.queue.get(ctx)
+			if err != nil {
+				return
+			}
+			w.ch <- entry
+		}
+	}()
 
 	return w, nil
 }
@@ -187,12 +192,7 @@ func (s *MemoryStore) Close() error {
 
 	// Stop all watchers
 	for _, w := range s.watchers {
-		select {
-		case <-w.stopCh:
-		default:
-			close(w.stopCh)
-			close(w.ch)
-		}
+		w.cancel()
 	}
 	s.watchers = nil
 	s.data = nil
@@ -207,15 +207,11 @@ func (s *MemoryStore) notify(key string, value []byte, op Operation) {
 		}
 
 		if matchSubject(w.pattern, key) {
-			e := &memoryEntry{
+			w.queue.put(&memoryEntry{
 				key:   key,
 				value: value,
 				op:    op,
-			}
-			select {
-			case w.ch <- e:
-			case <-w.stopCh:
-			}
+			})
 		}
 	}
 }

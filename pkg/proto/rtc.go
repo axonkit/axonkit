@@ -356,6 +356,16 @@ type TrackUnpublishedNotification struct {
 	TrackSid       string `json:"trackSid"`
 }
 
+type DataTrackPublishedNotification struct {
+	ParticipantSid string         `json:"participantSid"`
+	DataTrack      *DataTrackInfo `json:"dataTrack"`
+}
+
+type DataTrackUnpublishedNotification struct {
+	ParticipantSid string `json:"participantSid"`
+	DataTrackSid   string `json:"dataTrackSid"`
+}
+
 type TrackMutedNotification struct {
 	ParticipantSid string `json:"participantSid"`
 	TrackSid       string `json:"trackSid"`
@@ -438,6 +448,7 @@ type MessageNotification struct {
 	Transient           bool   `json:"transient,omitempty"`
 	ParticipantSid      string `json:"participantSid,omitempty"`
 	ParticipantIdentity string `json:"participantIdentity,omitempty"`
+	Deleted             bool   `json:"deleted,omitempty"`
 }
 
 type MessageDeleteRequest struct {
@@ -504,6 +515,7 @@ type RpcError struct {
 type GroupInfo struct {
 	GroupId          string                 `json:"groupId"`
 	Name             string                 `json:"name"`
+	OwnerSid         string                 `json:"ownerSid,omitempty"`
 	Permissions      *ParticipantPermission `json:"permissions,omitempty"`
 	ParticipantCount int                    `json:"participantCount"`
 }
@@ -536,6 +548,10 @@ type JoinGroupResponse struct {
 type LeaveGroupRequest struct{}
 
 type GroupCreatedNotification struct {
+	Group *GroupInfo `json:"group"`
+}
+
+type GroupUpdatedNotification struct {
 	Group *GroupInfo `json:"group"`
 }
 

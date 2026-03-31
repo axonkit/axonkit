@@ -9,6 +9,33 @@ import (
 	"github.com/axonkit/axonkit/pkg/proto"
 )
 
+func boolPtr(v bool) *bool { return &v }
+
+func newSignalTestParticipantWithGrants(t *testing.T, grants *proto.ClaimGrants) *Participant {
+	t.Helper()
+	cfg := defaultRoomConfig()
+	cfg.AutoSubscribe = false
+	room := NewRoom(RoomParams{
+		Sid:          "room-sig",
+		Name:         "signal-room",
+		Config:       cfg,
+		CreationTime: time.Now(),
+	})
+
+	p := NewParticipant(ParticipantParams{
+		Sid:           "sig-p1",
+		Identity:      "sig-alice",
+		Name:          "Alice",
+		Grants:        grants,
+		AutoSubscribe: true,
+		PingInterval:  5 * time.Second,
+		PingTimeout:   15 * time.Second,
+	})
+	p.SetState(proto.ParticipantInfo_JOINED)
+	room.AddParticipant(p)
+	return p
+}
+
 func newSignalTestParticipant(t *testing.T) *Participant {
 	t.Helper()
 	cfg := defaultRoomConfig()
@@ -245,9 +272,11 @@ func TestDispatchRPC_TransportGetStats_BadJSON(t *testing.T) {
 }
 
 func TestDispatchRPC_ParticipantUpdate(t *testing.T) {
-	p := newSignalTestParticipant(t)
+	p := newSignalTestParticipantWithGrants(t, &proto.ClaimGrants{
+		Room:  &proto.RoomGrant{Join: true},
+		Media: &proto.MediaGrant{CanUpdateOwnMetadata: boolPtr(true)},
+	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
-	p.permission.CanUpdateMetadata = true
 
 	meta := "updated"
 	msg := makeRequest(proto.MethodParticipantUpdate, "log-pu", &proto.UpdateParticipantRequest{
@@ -261,9 +290,10 @@ func TestDispatchRPC_ParticipantUpdate(t *testing.T) {
 }
 
 func TestDispatchRPC_ParticipantUpdate_NoPermission(t *testing.T) {
-	p := newSignalTestParticipant(t)
+	p := newSignalTestParticipantWithGrants(t, &proto.ClaimGrants{
+		Room: &proto.RoomGrant{Join: true},
+	})
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
-	p.permission.CanUpdateMetadata = false
 
 	meta := "try-update"
 	msg := makeRequest(proto.MethodParticipantUpdate, "log-pu-noperm", &proto.UpdateParticipantRequest{

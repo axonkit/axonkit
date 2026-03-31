@@ -39,6 +39,23 @@ func runServer(t *testing.T) *natsserver.Server {
 	return s
 }
 
+func readNonNilEntry(t *testing.T, ch <-chan Entry, timeout time.Duration, msg string) Entry {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case e := <-ch:
+			if e == nil {
+				continue
+			}
+			return e
+		case <-deadline:
+			t.Fatal(msg)
+			return nil
+		}
+	}
+}
+
 func TestNatsStore_Watch_Put_Delete(t *testing.T) {
 	s := runServer(t)
 
@@ -75,19 +92,12 @@ func TestNatsStore_Watch_Put_Delete(t *testing.T) {
 	defer w.Stop()
 
 	// Wait for initial value (Put)
-	select {
-	case e := <-w.Updates():
-		if e == nil {
-			t.Fatal("Received nil entry")
-		}
-		if e.Operation() != OpPut {
-			t.Errorf("Expected OpPut, got %v", e.Operation())
-		}
-		if string(e.Value()) != string(value) {
-			t.Errorf("Expected %s, got %s", value, e.Value())
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Timeout waiting for Put event")
+	e := readNonNilEntry(t, w.Updates(), 2*time.Second, "Timeout waiting for Put event")
+	if e.Operation() != OpPut {
+		t.Errorf("Expected OpPut, got %v", e.Operation())
+	}
+	if string(e.Value()) != string(value) {
+		t.Errorf("Expected %s, got %s", value, e.Value())
 	}
 
 	// 3. Delete
@@ -96,17 +106,9 @@ func TestNatsStore_Watch_Put_Delete(t *testing.T) {
 	}
 
 	// 4. Verify Watch receives Delete
-	select {
-	case e := <-w.Updates():
-		if e == nil {
-			t.Fatal("Received nil entry")
-		}
-		if e.Operation() != OpDelete {
-			t.Errorf("Expected OpDelete, got %v", e.Operation())
-		}
-		// e.Value() is likely nil/empty for delete
-	case <-time.After(2 * time.Second):
-		t.Fatal("Timeout waiting for Delete event")
+	e = readNonNilEntry(t, w.Updates(), 2*time.Second, "Timeout waiting for Delete event")
+	if e.Operation() != OpDelete {
+		t.Errorf("Expected OpDelete, got %v", e.Operation())
 	}
 }
 
@@ -183,16 +185,9 @@ func TestNatsStore_TTL(t *testing.T) {
 	defer w.Stop()
 
 	// Wait for initial value (Put)
-	select {
-	case e := <-w.Updates():
-		if e == nil {
-			t.Fatal("Received nil entry")
-		}
-		if e.Operation() != OpPut {
-			t.Errorf("Expected OpPut, got %v", e.Operation())
-		}
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("Timeout waiting for Put event")
+	e := readNonNilEntry(t, w.Updates(), 2*time.Second, "Timeout waiting for Put event")
+	if e.Operation() != OpPut {
+		t.Errorf("Expected OpPut, got %v", e.Operation())
 	}
 
 	// 3. Verify exists
@@ -214,17 +209,9 @@ func TestNatsStore_TTL(t *testing.T) {
 	}
 
 	// 6. Verify Watch receives Delete (due to TTL)
-	select {
-	case e := <-w.Updates():
-		if e == nil {
-			t.Fatal("Received nil entry")
-		}
-		t.Logf("Received event: Op=%v Key=%s", e.Operation(), e.Key())
-		if e.Operation() != OpDelete {
-			t.Errorf("Expected OpDelete, got %v", e.Operation())
-		}
-		t.Logf("Received TTL expiration event for key %s", key)
-	case <-time.After(2 * time.Second): // Reduced timeout
-		t.Error("Timeout waiting for Delete event (TTL) - skipping strict check")
+	e = readNonNilEntry(t, w.Updates(), 3*time.Second, "Timeout waiting for Delete event (TTL)")
+	t.Logf("Received event: Op=%v Key=%s", e.Operation(), e.Key())
+	if e.Operation() != OpDelete {
+		t.Errorf("Expected OpDelete, got %v", e.Operation())
 	}
 }

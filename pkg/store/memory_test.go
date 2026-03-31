@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"sort"
 	"testing"
@@ -97,14 +98,37 @@ func TestMemoryStore_Watch(t *testing.T) {
 
 	updates := w.Updates()
 
-	// Verify initial state
-	select {
-	case e := <-updates:
-		if e.Key() != preKey {
-			t.Errorf("Initial state key mismatch: got %s, want %s", e.Key(), preKey)
+	// Verify initial state (skip nil sentinel)
+	gotInitial := false
+	for !gotInitial {
+		select {
+		case e := <-updates:
+			if e == nil {
+				continue
+			}
+			if e.Key() != preKey {
+				t.Errorf("Initial state key mismatch: got %s, want %s", e.Key(), preKey)
+			}
+			gotInitial = true
+		case <-time.After(1 * time.Second):
+			t.Fatal("Timeout waiting for initial state")
 		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("Timeout waiting for initial state")
+	}
+
+	readEntry := func(msg string) Entry {
+		t.Helper()
+		for {
+			select {
+			case e := <-updates:
+				if e == nil {
+					continue
+				}
+				return e
+			case <-time.After(1 * time.Second):
+				t.Fatal(msg)
+				return nil
+			}
+		}
 	}
 
 	// Test Update
@@ -113,16 +137,12 @@ func TestMemoryStore_Watch(t *testing.T) {
 		t.Fatalf("Put new failed: %v", err)
 	}
 
-	select {
-	case e := <-updates:
-		if e.Key() != newKey {
-			t.Errorf("Update key mismatch: got %s, want %s", e.Key(), newKey)
-		}
-		if e.Operation() != OpPut {
-			t.Errorf("Operation mismatch: got %v, want %v", e.Operation(), OpPut)
-		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("Timeout waiting for update")
+	e := readEntry("Timeout waiting for update")
+	if e.Key() != newKey {
+		t.Errorf("Update key mismatch: got %s, want %s", e.Key(), newKey)
+	}
+	if e.Operation() != OpPut {
+		t.Errorf("Operation mismatch: got %v, want %v", e.Operation(), OpPut)
 	}
 
 	// Test Delete
@@ -130,16 +150,49 @@ func TestMemoryStore_Watch(t *testing.T) {
 		t.Fatalf("Delete failed: %v", err)
 	}
 
-	select {
-	case e := <-updates:
-		if e.Key() != newKey {
-			t.Errorf("Delete key mismatch: got %s, want %s", e.Key(), newKey)
+	e = readEntry("Timeout waiting for delete")
+	if e.Key() != newKey {
+		t.Errorf("Delete key mismatch: got %s, want %s", e.Key(), newKey)
+	}
+	if e.Operation() != OpDelete {
+		t.Errorf("Operation mismatch: got %v, want %v", e.Operation(), OpDelete)
+	}
+}
+
+func TestMemoryStore_Watch_InitialSnapshotDoesNotDrop(t *testing.T) {
+	ms := NewMemoryStore(0)
+	defer ms.Close()
+
+	ctx := context.Background()
+	const count = 150
+
+	for i := range count {
+		key := fmt.Sprintf("bulk.%03d", i)
+		if err := ms.Put(ctx, key, []byte(key)); err != nil {
+			t.Fatalf("Put %s failed: %v", key, err)
 		}
-		if e.Operation() != OpDelete {
-			t.Errorf("Operation mismatch: got %v, want %v", e.Operation(), OpDelete)
+	}
+
+	w, err := ms.Watch(ctx, "bulk.>")
+	if err != nil {
+		t.Fatalf("Watch failed: %v", err)
+	}
+	defer w.Stop()
+
+	seen := make(map[string]bool, count)
+	gotSentinel := false
+	timeout := time.After(2 * time.Second)
+	for len(seen) < count || !gotSentinel {
+		select {
+		case e := <-w.Updates():
+			if e == nil {
+				gotSentinel = true
+				continue
+			}
+			seen[e.Key()] = true
+		case <-timeout:
+			t.Fatalf("timeout waiting initial snapshot, got %d/%d, sentinel=%v", len(seen), count, gotSentinel)
 		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("Timeout waiting for delete")
 	}
 }
 

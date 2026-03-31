@@ -38,6 +38,18 @@ func newTestParticipant(identity string) *Participant {
 	return p
 }
 
+func waitForRoomCondition(t *testing.T, timeout time.Duration, fn func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition not met before timeout")
+}
+
 func TestRoom_NewRoom(t *testing.T) {
 	r := NewRoom(RoomParams{
 		Sid:          "sid-1",
@@ -143,6 +155,47 @@ func TestRoom_AddParticipant_DuplicateIdentity(t *testing.T) {
 	if r.GetParticipant("sid-2") == nil {
 		t.Fatal("expected new participant to exist")
 	}
+}
+
+func TestRoom_AddParticipant_DuplicateIdentity_RemoteKicked(t *testing.T) {
+	r := NewRoom(RoomParams{
+		Sid:          "sid-1",
+		Name:         "test-room",
+		Config:       defaultRoomConfig(),
+		CreationTime: time.Now(),
+		NodeID:       "node-local",
+	})
+
+	r.Store().PutParticipant(&proto.ParticipantInfo{
+		Sid:      "sid-remote",
+		Identity: "alice",
+		Name:     "alice",
+		NodeId:   "node-remote",
+		State:    proto.ParticipantInfo_JOINED,
+	})
+
+	waitForRoomCondition(t, time.Second, func() bool {
+		r.mu.RLock()
+		info := r.storeParticipants["sid-remote"]
+		r.mu.RUnlock()
+		return info != nil && info.Identity == "alice"
+	})
+
+	p := newTestParticipant("alice")
+	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
+
+	if err := r.AddParticipant(p); err != nil {
+		t.Fatalf("expected nil (remote kicked), got %v", err)
+	}
+	if r.GetParticipant(p.Sid()) == nil {
+		t.Fatal("expected new participant to be admitted")
+	}
+
+	// Verify the remote participant was marked DISCONNECTED in the store.
+	waitForRoomCondition(t, time.Second, func() bool {
+		info := r.Store().GetParticipant("sid-remote")
+		return info != nil && info.State == proto.ParticipantInfo_DISCONNECTED
+	})
 }
 
 func TestRoom_AddParticipant_Closed(t *testing.T) {
@@ -664,4 +717,121 @@ func TestRoom_TestHelpers(t *testing.T) {
 	if len(released) != 1 || released[0] != "stream-2" {
 		t.Fatal("expected release callback")
 	}
+}
+
+func TestRoom_GetAllParticipantInfos_UsesLocalRuntimeTracks(t *testing.T) {
+	r := NewRoom(RoomParams{
+		Sid:          "sid-1",
+		Name:         "test-room",
+		Config:       defaultRoomConfig(),
+		CreationTime: time.Now(),
+	})
+
+	p := newTestParticipant("alice")
+	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
+	if err := r.AddParticipant(p); err != nil {
+		t.Fatalf("AddParticipant failed: %v", err)
+	}
+
+	p.mu.Lock()
+	p.publishedTracks["track-1"] = &PublishedTrack{sid: "track-1", kind: "audio", name: "mic"}
+	p.dataPublishedTracks["data-1"] = &DataPublishedTrack{sid: "data-1", name: "chat"}
+	p.mu.Unlock()
+
+	infos := r.GetAllParticipantInfos("")
+	if len(infos) != 1 {
+		t.Fatalf("expected 1 participant info, got %d", len(infos))
+	}
+	if len(infos[0].Tracks) != 1 || infos[0].Tracks[0].Sid != "track-1" {
+		t.Fatalf("expected runtime media track to be preserved, got %+v", infos[0].Tracks)
+	}
+	if len(infos[0].DataTracks) != 1 || infos[0].DataTracks[0].Sid != "data-1" {
+		t.Fatalf("expected runtime data track to be preserved, got %+v", infos[0].DataTracks)
+	}
+}
+
+func TestRoom_GetAllParticipantInfos_UsesStoreParticipants(t *testing.T) {
+	r := NewRoom(RoomParams{
+		Sid:          "sid-1",
+		Name:         "test-room",
+		Config:       defaultRoomConfig(),
+		CreationTime: time.Now(),
+	})
+
+	remoteInfo := &proto.ParticipantInfo{
+		Sid:      "sid-remote",
+		Identity: "remote",
+		Name:     "remote",
+		NodeId:   "node-remote",
+		GroupId:  "group-1",
+		State:    proto.ParticipantInfo_JOINED,
+	}
+	r.Store().PutParticipant(remoteInfo)
+	r.Store().PutTrack(&proto.TrackInfo{Sid: "track-remote", ParticipantSid: remoteInfo.Sid, Name: "camera"})
+	r.Store().PutDataTrack(&proto.DataTrackInfo{Sid: "data-remote", ParticipantSid: remoteInfo.Sid, Name: "chat"})
+
+	waitForRoomCondition(t, time.Second, func() bool {
+		infos := r.GetAllParticipantInfos("")
+		if len(infos) != 1 {
+			return false
+		}
+		info := infos[0]
+		return info.Sid == remoteInfo.Sid &&
+			info.GroupId == "group-1" &&
+			len(info.Tracks) == 1 && info.Tracks[0].Sid == "track-remote" &&
+			len(info.DataTracks) == 1 && info.DataTracks[0].Sid == "data-remote"
+	})
+}
+
+func TestRoom_GetAllGroupInfos_UsesStoreGroups(t *testing.T) {
+	r := NewRoom(RoomParams{
+		Sid:          "sid-1",
+		Name:         "test-room",
+		Config:       defaultRoomConfig(),
+		CreationTime: time.Now(),
+	})
+
+	r.Store().PutGroup(&proto.GroupInfo{
+		GroupId: "group-1",
+		Name:    "breakout",
+	})
+	r.Store().PutParticipant(&proto.ParticipantInfo{
+		Sid: "p1", Identity: "alice", GroupId: "group-1", State: proto.ParticipantInfo_JOINED,
+	})
+	r.Store().PutParticipant(&proto.ParticipantInfo{
+		Sid: "p2", Identity: "bob", GroupId: "group-1", State: proto.ParticipantInfo_JOINED,
+	})
+
+	waitForRoomCondition(t, time.Second, func() bool {
+		groups := r.GetAllGroupInfos()
+		return len(groups) == 1 &&
+			groups[0].GroupId == "group-1" &&
+			groups[0].ParticipantCount == 2
+	})
+}
+
+func TestRoom_StoreCacheReadsForMessagesAndState(t *testing.T) {
+	r := NewRoom(RoomParams{
+		Sid:          "sid-1",
+		Name:         "test-room",
+		Config:       defaultRoomConfig(),
+		CreationTime: time.Now(),
+	})
+
+	msg := &proto.MessageNotification{
+		ID:        "msg-1",
+		Type:      "chat",
+		Message:   "hello",
+		Timestamp: time.Now().UnixMilli(),
+	}
+	r.StoreMessage(msg)
+	r.UpdateState("cursor", "42", "", "")
+
+	waitForRoomCondition(t, time.Second, func() bool {
+		messages := r.GetAllMessagesSince(0)
+		state := r.GetAllSharedState()
+		return len(messages) == 1 &&
+			messages[0].ID == "msg-1" &&
+			state["cursor"] == "42"
+	})
 }

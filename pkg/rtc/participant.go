@@ -70,7 +70,7 @@ type consumerLayerState struct {
 }
 
 func (t *PublishedTrack) ToProto() *proto.TrackInfo {
-	return &proto.TrackInfo{
+	info := &proto.TrackInfo{
 		Sid:               t.sid,
 		Kind:              t.kind,
 		Name:              t.name,
@@ -83,6 +83,10 @@ func (t *PublishedTrack) ToProto() *proto.TrackInfo {
 		BackupStreamSid:   t.backupSid,
 		BackupCodecPolicy: t.backupCodecPolicy,
 	}
+	if t.publisher != nil {
+		info.ParticipantSid = t.publisher.sid
+	}
+	return info
 }
 
 // stopDebounce cancels any pending debounce timer. Safe to call from outside
@@ -311,7 +315,14 @@ func (t *PublishedTrack) sendQualityNotification(q [3]bool) {
 		notification.SubscribedCodecs = codecs
 	}
 
-	_ = t.publisher.SendNotification(proto.MethodTrackSubscribedQualityChanged, notification)
+	// Remote publisher stubs have no signal channel; quality is propagated
+	// to the publisher's node via syncLocalSubToStore below.
+	t.publisher.mu.RLock()
+	hasSignal := t.publisher.signalOutProducer != nil
+	t.publisher.mu.RUnlock()
+	if hasSignal {
+		_ = t.publisher.SendNotification(proto.MethodTrackSubscribedQualityChanged, notification)
+	}
 
 	// Sync local consumer state to the shared store so that the publisher's
 	// node (if different) can include it in its dynacast calculation.
@@ -576,6 +587,13 @@ func (t *PublishedTrack) sendCodecQualityNotification(primaryEnabled, backupEnab
 		return
 	}
 
+	t.publisher.mu.RLock()
+	hasSignal := t.publisher.signalOutProducer != nil
+	t.publisher.mu.RUnlock()
+	if !hasSignal {
+		return
+	}
+
 	buildQualities := func(enabled bool) []proto.SubscribedQuality {
 		return []proto.SubscribedQuality{
 			{Quality: proto.VideoQuality_LOW, Enabled: enabled},
@@ -655,11 +673,15 @@ type DataPublishedTrack struct {
 }
 
 func (t *DataPublishedTrack) ToProto() *proto.DataTrackInfo {
-	return &proto.DataTrackInfo{
+	info := &proto.DataTrackInfo{
 		Sid:     t.sid,
 		Name:    t.name,
 		AppData: t.appData,
 	}
+	if t.publisher != nil {
+		info.ParticipantSid = t.publisher.sid
+	}
+	return info
 }
 
 // Subscription holds a media subscription and its signaling metadata.
@@ -953,17 +975,9 @@ func (p *Participant) SetState(state proto.ParticipantInfo_State) {
 	p.mu.Lock()
 	p.state = state
 	p.mu.Unlock()
-	p.syncStateToStore()
-}
-
-// syncStateToStore writes the current participant snapshot to the shared room
-// store when the room is configured with KV replication.
-func (p *Participant) syncStateToStore() {
-	room := p.room
-	if room == nil || room.roomStore == nil {
-		return
+	if p.room != nil {
+		p.room.OnParticipantUpdated(p)
 	}
-	room.runAsync(func() { room.roomStore.PutParticipant(p.ToProto()) })
 }
 
 func (p *Participant) SendTransportSid() string {
@@ -1056,26 +1070,20 @@ func (p *Participant) handleIceStateChange(state mediasoup.IceState) {
 		case proto.ParticipantInfo_SUSPENDED:
 			p.state = proto.ParticipantInfo_JOINED
 			p.mu.Unlock()
-			p.syncStateToStore()
 			if p.room != nil {
-				p.room.BroadcastNotification(proto.MethodParticipantUpdated,
-					&proto.ParticipantUpdatedNotification{Participant: p.ToProto()}, p.sid)
+				p.room.OnParticipantUpdated(p)
 			}
 		default:
 			p.mu.Unlock()
 		}
 
 	case mediasoup.IceStateDisconnected:
+		p.logger.Warn("ICE disconnected, suspending participant")
 		p.mu.Lock()
 		p.state = proto.ParticipantInfo_SUSPENDED
 		p.mu.Unlock()
-
-		p.syncStateToStore()
-
-		p.logger.Warn("ICE disconnected, suspending participant")
 		if p.room != nil {
-			p.room.BroadcastNotification(proto.MethodParticipantUpdated,
-				&proto.ParticipantUpdatedNotification{Participant: p.ToProto()}, p.sid)
+			p.room.OnParticipantUpdated(p)
 		}
 
 	case mediasoup.IceStateClosed:
@@ -1229,7 +1237,7 @@ func (p *Participant) PublishBackupTrack(req *proto.PublishBackupTrackRequest) (
 	}
 
 	if p.room != nil && p.room.Store() != nil {
-		p.room.runAsync(func() { p.room.roomStore.PutTrack(p.sid, track.ToProto()) })
+		p.room.runAsync(func() { p.room.roomStore.PutTrack(track.ToProto()) })
 	}
 
 	// Process pending subscribers and apply regression policy
@@ -1400,6 +1408,12 @@ func (p *Participant) GetDataPublishedTracks() []*DataPublishedTrack {
 	return tracks
 }
 
+func (p *Participant) GetDataPublishedTrack(sid string) *DataPublishedTrack {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.dataPublishedTracks[sid]
+}
+
 // ============================================================
 // Subscription Operations
 // ============================================================
@@ -1518,7 +1532,7 @@ func (t *PublishedTrack) resolveBackupStreamSid() string {
 	}
 	t.publisher.room.mu.RLock()
 	defer t.publisher.room.mu.RUnlock()
-	if mt := t.publisher.room.remoteMediaTracks[t.sid]; mt != nil && mt.info != nil {
+	if mt := t.publisher.room.storeTracks[t.sid]; mt != nil && mt.info != nil {
 		return mt.info.BackupStreamSid
 	}
 	return ""
@@ -2218,11 +2232,7 @@ func (p *Participant) UpdateMetadata(metadata, name *string, attributes map[stri
 	p.mu.Unlock()
 
 	if p.room != nil {
-		p.room.BroadcastNotification(proto.MethodParticipantUpdated,
-			&proto.ParticipantUpdatedNotification{Participant: p.ToProto()}, p.sid)
-		if p.room.Store() != nil {
-			go p.room.Store().PutParticipant(p.ToProto())
-		}
+		p.room.OnParticipantUpdated(p)
 	}
 }
 

@@ -241,8 +241,8 @@ func (s *RoomStore) GetAllParticipants() []*proto.ParticipantInfo {
 
 // --- Track & DataTrack ---
 
-func (s *RoomStore) PutTrack(participantSid string, info *proto.TrackInfo) {
-	key := fmt.Sprintf("%s.track.%s.%s", s.prefix(), participantSid, info.Sid)
+func (s *RoomStore) PutTrack(info *proto.TrackInfo) {
+	key := fmt.Sprintf("%s.track.%s", s.prefix(), info.Sid)
 	data, err := json.Marshal(info)
 	if err != nil {
 		s.logger.Warn("Failed to marshal track", "error", err)
@@ -255,8 +255,8 @@ func (s *RoomStore) PutTrack(participantSid string, info *proto.TrackInfo) {
 	}
 }
 
-func (s *RoomStore) DeleteTrack(participantSid, trackSid string) {
-	key := fmt.Sprintf("%s.track.%s.%s", s.prefix(), participantSid, trackSid)
+func (s *RoomStore) DeleteTrack(trackSid string) {
+	key := fmt.Sprintf("%s.track.%s", s.prefix(), trackSid)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := s.kv.Delete(ctx, key); err != nil {
@@ -280,18 +280,14 @@ func (s *RoomStore) GetAllTracks() map[string][]*proto.TrackInfo {
 		}
 		var info proto.TrackInfo
 		if err := json.Unmarshal(entry.Value(), &info); err == nil {
-			parts := strings.Split(k, ".")
-			if len(parts) >= 4 {
-				participantSid := parts[3]
-				result[participantSid] = append(result[participantSid], &info)
-			}
+			result[info.ParticipantSid] = append(result[info.ParticipantSid], &info)
 		}
 	}
 	return result
 }
 
-func (s *RoomStore) PutDataTrack(participantSid string, info *proto.DataTrackInfo) {
-	key := fmt.Sprintf("%s.dataTrack.%s.%s", s.prefix(), participantSid, info.Sid)
+func (s *RoomStore) PutDataTrack(info *proto.DataTrackInfo) {
+	key := fmt.Sprintf("%s.dataTrack.%s", s.prefix(), info.Sid)
 	data, err := json.Marshal(info)
 	if err != nil {
 		s.logger.Warn("Failed to marshal dataTrack", "error", err)
@@ -304,8 +300,8 @@ func (s *RoomStore) PutDataTrack(participantSid string, info *proto.DataTrackInf
 	}
 }
 
-func (s *RoomStore) DeleteDataTrack(participantSid, trackSid string) {
-	key := fmt.Sprintf("%s.dataTrack.%s.%s", s.prefix(), participantSid, trackSid)
+func (s *RoomStore) DeleteDataTrack(trackSid string) {
+	key := fmt.Sprintf("%s.dataTrack.%s", s.prefix(), trackSid)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := s.kv.Delete(ctx, key); err != nil {
@@ -329,11 +325,7 @@ func (s *RoomStore) GetAllDataTracks() map[string][]*proto.DataTrackInfo {
 		}
 		var info proto.DataTrackInfo
 		if err := json.Unmarshal(entry.Value(), &info); err == nil {
-			parts := strings.Split(k, ".")
-			if len(parts) >= 4 {
-				participantSid := parts[3]
-				result[participantSid] = append(result[participantSid], &info)
-			}
+			result[info.ParticipantSid] = append(result[info.ParticipantSid], &info)
 		}
 	}
 	return result
@@ -528,8 +520,8 @@ func (s *RoomStore) DeleteTrackSub(trackSid string) {
 type RoomStoreEvent struct {
 	Type      string // "participant", "group", "msg", "tracksub", "state", "lease", "track", "dataTrack"
 	Operation store.Operation
-	Key       string // the sub-key (sid, groupId, msgId, participantSid, stateKey)
-	SubKey    string // the second sub-key (e.g. trackSid for track/dataTrack)
+	Key       string // primary key (sid, groupId, trackSid, …)
+	SubKey    string // secondary key segment when present (e.g. nodeId for tracksub)
 
 	Participant *proto.ParticipantInfo
 	Group       *proto.GroupInfo
@@ -540,22 +532,41 @@ type RoomStoreEvent struct {
 	DataTrack   *proto.DataTrackInfo
 }
 
+// RoomStoreWatchResult holds the event channel. A nil *RoomStoreEvent signals
+// that the initial snapshot has been fully delivered.
+type RoomStoreWatchResult struct {
+	Events <-chan *RoomStoreEvent
+}
+
 // Watch starts watching all keys under this room prefix. Events from the
 // local node are included — the caller is expected to filter by comparing
 // ParticipantInfo.NodeId or similar if needed.
-func (s *RoomStore) Watch(ctx context.Context) (<-chan RoomStoreEvent, error) {
+//
+// A nil *RoomStoreEvent on the Events channel signals that the initial
+// snapshot from the underlying store has been fully delivered.
+func (s *RoomStore) Watch(ctx context.Context) (*RoomStoreWatchResult, error) {
 	pattern := fmt.Sprintf("%s.>", s.prefix())
 	watcher, err := s.kv.Watch(ctx, pattern)
 	if err != nil {
 		return nil, err
 	}
 
-	ch := make(chan RoomStoreEvent, 64)
+	ch := make(chan *RoomStoreEvent, 64)
 	go func() {
 		defer close(ch)
 		for entry := range watcher.Updates() {
-			evt, ok := s.parseEvent(entry)
-			if !ok {
+			if entry == nil {
+				// nil sentinel from store → pass through
+				select {
+				case ch <- nil:
+				case <-ctx.Done():
+					watcher.Stop()
+					return
+				}
+				continue
+			}
+			evt := s.parseEvent(entry)
+			if evt == nil {
 				continue
 			}
 			select {
@@ -566,20 +577,20 @@ func (s *RoomStore) Watch(ctx context.Context) (<-chan RoomStoreEvent, error) {
 			}
 		}
 	}()
-	return ch, nil
+	return &RoomStoreWatchResult{Events: ch}, nil
 }
 
-func (s *RoomStore) parseEvent(entry store.Entry) (RoomStoreEvent, bool) {
+func (s *RoomStore) parseEvent(entry store.Entry) *RoomStoreEvent {
 	// Key format: room.<roomName>.<type>.<id> or room.<roomName>.<type>.<participantSid>.<trackSid>
 	key := entry.Key()
 	prefix := s.prefix() + "."
 	if !strings.HasPrefix(key, prefix) {
-		return RoomStoreEvent{}, false
+		return nil
 	}
 	rest := key[len(prefix):]
 	parts := strings.SplitN(rest, ".", 3)
 
-	evt := RoomStoreEvent{
+	evt := &RoomStoreEvent{
 		Type:      parts[0],
 		Operation: entry.Operation(),
 	}
@@ -589,6 +600,8 @@ func (s *RoomStore) parseEvent(entry store.Entry) (RoomStoreEvent, bool) {
 	if len(parts) > 2 {
 		evt.SubKey = parts[2]
 	}
+
+	s.logger.Debug("Received store event", "key", key, "operation", entry.Operation(), "type", evt.Type)
 
 	if entry.Operation() == store.OpPut {
 		switch evt.Type {
@@ -627,5 +640,5 @@ func (s *RoomStore) parseEvent(entry store.Entry) (RoomStoreEvent, bool) {
 		}
 	}
 
-	return evt, true
+	return evt
 }

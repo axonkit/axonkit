@@ -111,6 +111,9 @@ func (rm *RoomManager) watchLeases(ctx context.Context) {
 			if !ok {
 				return
 			}
+			if entry == nil {
+				continue
+			}
 			if entry.Operation() == store.OpDelete {
 				roomName := entry.Key()
 				if roomName == "" {
@@ -226,12 +229,13 @@ func (rm *RoomManager) GetOrCreateRoom(name string, maxParticipants int, metadat
 		Config:       meta.Config,
 		CreationTime: time.UnixMilli(meta.CreationTime),
 		Metadata:     meta.Metadata,
+		NodeID:       rm.nodeID,
+		RoomStore:    NewRoomStore(rm.kv, name, rm.nodeID),
 	})
 	room.SetOnClose(func(r *Room) {
 		rm.removeRoom(r)
 	})
 	rm.setupCascadeCallbacks(room)
-	room.SetupStore(rm.kv, rm.nodeID)
 
 	rm.rooms[name] = room
 	rm.roomsBySid[meta.Sid] = room

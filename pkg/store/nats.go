@@ -116,9 +116,9 @@ func (s *NatsStore) Watch(ctx context.Context, pattern string, opts ...WatchOpti
 		}()
 		for e := range w.Updates() {
 			if e == nil {
+				nw.ch <- nil // pass through sentinel
 				continue
 			}
-
 			nw.ch <- &natsEntry{e}
 		}
 	}()
@@ -178,10 +178,5 @@ type natsWatcher struct {
 	pattern string
 }
 
-func (nw *natsWatcher) Updates() <-chan Entry {
-	return nw.ch
-}
-
-func (nw *natsWatcher) Stop() {
-	nw.w.Stop()
-}
+func (nw *natsWatcher) Updates() <-chan Entry { return nw.ch }
+func (nw *natsWatcher) Stop()                 { nw.w.Stop() }

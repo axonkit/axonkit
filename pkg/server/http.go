@@ -313,8 +313,15 @@ func (s *HTTPServer) handleJoinLocal(w http.ResponseWriter, req *proto.JoinReque
 		sendTransport.Close()
 		recvTransport.Close()
 		directTransport.Close()
+		code := proto.ErrCodeInternal
+		switch err {
+		case rtc.ErrRoomFull:
+			code = proto.ErrCodeRoomFull
+		case rtc.ErrDuplicateIdentity:
+			code = proto.ErrCodeDuplicateIdentity
+		}
 		writeJSON(w, http.StatusConflict, proto.ErrorResponse{
-			Code: proto.ErrCodeRoomFull, Error: err.Error()})
+			Code: code, Error: err.Error()})
 		return
 	}
 

@@ -196,8 +196,6 @@ func (p *Participant) completeReady(syncState *proto.SyncState, otherInfos []*pr
 		return
 	}
 
-	p.room.BroadcastNotification(proto.MethodParticipantJoined,
-		&proto.ParticipantJoinedNotification{Participant: p.ToProto()}, p.sid)
 	p.room.SubscribeExistingTracks(p, otherInfos)
 }
 
@@ -615,7 +613,6 @@ func (p *Participant) handleMessageRelay(msg *proto.Message) {
 	m.ParticipantIdentity = p.identity
 
 	p.room.StoreMessage(&m)
-	p.room.BroadcastNotification(proto.MethodMessageReceived, &m, p.sid)
 }
 
 func (p *Participant) handleMessageDelete(msg *proto.Message) (any, int, string) {
@@ -628,13 +625,9 @@ func (p *Participant) handleMessageDelete(msg *proto.Message) (any, int, string)
 		return nil, proto.StatusBadRequest, "invalid request body"
 	}
 
-	if !p.room.DeleteMessage(req.ID) {
+	if !p.room.DeleteMessage(req.ID, p.sid) {
 		return nil, proto.StatusNotFound, "message not found"
 	}
-
-	p.room.BroadcastNotification(proto.MethodMessageDeleted, &proto.MessageDeletedNotification{
-		IDs: []string{req.ID},
-	}, "")
 
 	return nil, proto.StatusOK, ""
 }
@@ -649,12 +642,7 @@ func (p *Participant) handleMessageDeleteByType(msg *proto.Message) (any, int, s
 		return nil, proto.StatusBadRequest, "invalid request body"
 	}
 
-	ids := p.room.DeleteMessagesByType(req.Type)
-
-	p.room.BroadcastNotification(proto.MethodMessageDeleted, &proto.MessageDeletedNotification{
-		IDs:  ids,
-		Type: req.Type,
-	}, "")
+	p.room.DeleteMessagesByType(req.Type)
 
 	return nil, proto.StatusOK, ""
 }
@@ -761,7 +749,7 @@ func (p *Participant) handleGroupCreate(msg *proto.Message) (any, int, string) {
 		return nil, proto.StatusBadRequest, "invalid request"
 	}
 
-	g := p.room.CreateGroup(req.Name, req.Permissions)
+	g := p.room.CreateGroup(req.Name, p.sid, req.Permissions)
 	return &proto.CreateGroupResponse{Group: g.ToProto()}, proto.StatusOK, ""
 }
 
@@ -778,7 +766,7 @@ func (p *Participant) handleGroupDelete(msg *proto.Message) (any, int, string) {
 		return nil, proto.StatusBadRequest, "invalid request"
 	}
 
-	if err := p.room.DeleteGroup(req.GroupId); err != nil {
+	if err := p.room.DeleteGroup(req.GroupId, p.sid); err != nil {
 		return nil, proto.StatusNotFound, err.Error()
 	}
 	return nil, proto.StatusOK, ""
@@ -789,12 +777,7 @@ func (p *Participant) handleGroupList(msg *proto.Message) (any, int, string) {
 		return nil, proto.StatusBadRequest, "not in a room"
 	}
 
-	groups := p.room.ListGroups()
-	infos := make([]*proto.GroupInfo, 0, len(groups))
-	for _, g := range groups {
-		infos = append(infos, g.ToProto())
-	}
-	return &proto.ListGroupsResponse{Groups: infos}, proto.StatusOK, ""
+	return &proto.ListGroupsResponse{Groups: p.room.GetAllGroupInfos()}, proto.StatusOK, ""
 }
 
 func (p *Participant) handleGroupJoin(msg *proto.Message) (any, int, string) {
@@ -811,12 +794,7 @@ func (p *Participant) handleGroupJoin(msg *proto.Message) (any, int, string) {
 	if err != nil {
 		return nil, proto.StatusNotFound, err.Error()
 	}
-
-	infos := make([]*proto.ParticipantInfo, 0, len(others))
-	for _, o := range others {
-		infos = append(infos, o.ToProto())
-	}
-	return &proto.JoinGroupResponse{OtherParticipants: infos}, proto.StatusOK, ""
+	return &proto.JoinGroupResponse{OtherParticipants: others}, proto.StatusOK, ""
 }
 
 func (p *Participant) handleGroupLeave(msg *proto.Message) (any, int, string) {

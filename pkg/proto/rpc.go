@@ -83,6 +83,8 @@ const (
 	MethodParticipantUpdated             = "participant.updated"
 	MethodTrackPublished                 = "track.published"
 	MethodTrackUnpublished               = "track.unpublished"
+	MethodDataTrackPublished             = "dataTrack.published"
+	MethodDataTrackUnpublished           = "dataTrack.unpublished"
 	MethodTrackMuted                     = "track.muted"
 	MethodTrackSubscribedQualityChanged  = "track.subscribedQualityChanged"
 	MethodTrackSubscriptionStatusChanged = "track.subscriptionStatusChanged"
@@ -103,6 +105,7 @@ const (
 
 	// Server -> Client: Group notifications
 	MethodGroupCreated           = "group.created"
+	MethodGroupUpdated           = "group.updated"
 	MethodGroupDeleted           = "group.deleted"
 	MethodGroupParticipantJoined = "group.participantJoined"
 	MethodGroupParticipantLeft   = "group.participantLeft"

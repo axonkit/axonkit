@@ -5,7 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -58,15 +59,17 @@ type Room struct {
 	metadata     string
 	creationTime time.Time
 
-	participants       map[string]*Participant
-	remoteParticipants map[string]bool // SIDs of participants on other nodes
-	groups             map[string]*Group
-	// remoteMediaTracks: trackSid -> KV TrackInfo plus optional piped PublishedTrack.
-	remoteMediaTracks map[string]*remoteMediaTrack
-	messages          []*proto.MessageNotification
-	remoteMsgIds      map[string]bool   // dedup remote messages
-	sharedState       map[string]string // room-level KV for collaboration features
-	mu                sync.RWMutex
+	participants      map[string]*Participant
+	storeParticipants map[string]*proto.ParticipantInfo
+	groups            map[string]*Group
+	storeGroups       map[string]*proto.GroupInfo
+	// storeTracks: trackSid -> store TrackInfo plus optional materialized
+	// PublishedTrack after this node has piped the stream.
+	storeTracks     map[string]*storeTrackEntry
+	storeDataTracks map[string]*proto.DataTrackInfo
+	messages        []*proto.MessageNotification // store-driven message cache
+	sharedState     map[string]string            // room-level KV cache
+	mu              sync.RWMutex
 
 	cascade    CascadeCallbacks
 	roomStore  *RoomStore
@@ -79,19 +82,14 @@ type Room struct {
 	emptyTimer *time.Timer
 	closed     bool
 	asyncWG    sync.WaitGroup
+	watchWG    sync.WaitGroup
 }
 
-// remoteMediaTrack joins the room-store TrackInfo with optional materialized
-// PublishedTrack after this node has piped the stream.
-type remoteMediaTrack struct {
-	info      *proto.TrackInfo
-	published *remotePublishedEntry
-}
-
-// remotePublishedEntry holds the long-lived objects for one piped remote track.
-type remotePublishedEntry struct {
-	track     *PublishedTrack
-	publisher *Participant
+// storeTrackEntry joins the room-store TrackInfo with optional materialized
+// PublishedTrack after this node has piped the stream locally.
+type storeTrackEntry struct {
+	info  *proto.TrackInfo
+	track *PublishedTrack // non-nil after local pipe; track.publisher carries the router stub
 }
 
 type RoomParams struct {
@@ -100,23 +98,120 @@ type RoomParams struct {
 	Config       config.RoomConfig
 	CreationTime time.Time
 	Metadata     string
+	NodeID       string
+	RoomStore    *RoomStore
 }
 
 func NewRoom(params RoomParams) *Room {
-	return &Room{
-		sid:                params.Sid,
-		name:               params.Name,
-		config:             params.Config,
-		metadata:           params.Metadata,
-		participants:       make(map[string]*Participant),
-		remoteParticipants: make(map[string]bool),
-		remoteMediaTracks:  make(map[string]*remoteMediaTrack),
-		groups:             make(map[string]*Group),
-		remoteMsgIds:       make(map[string]bool),
-		sharedState:        make(map[string]string),
-		creationTime:       params.CreationTime,
-		logger:             slog.Default().With("component", "Room", "room", params.Name, "roomSid", params.Sid),
+	if params.RoomStore == nil {
+		// Keep roomStore always available so direct Room construction paths
+		// (especially tests) behave the same as RoomManager-created rooms.
+		params.RoomStore = NewRoomStore(store.NewMemoryStore(0), params.Name, params.NodeID)
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	room := &Room{
+		sid:               params.Sid,
+		name:              params.Name,
+		config:            params.Config,
+		metadata:          params.Metadata,
+		participants:      make(map[string]*Participant),
+		storeParticipants: make(map[string]*proto.ParticipantInfo),
+		groups:            make(map[string]*Group),
+		storeGroups:       make(map[string]*proto.GroupInfo),
+		storeTracks:       make(map[string]*storeTrackEntry),
+		storeDataTracks:   make(map[string]*proto.DataTrackInfo),
+		sharedState:       make(map[string]string),
+		creationTime:      params.CreationTime,
+		roomStore:         params.RoomStore,
+		watchCtx:          ctx,
+		watchClose:        cancel,
+		logger:            slog.Default().With("component", "Room", "room", params.Name, "roomSid", params.Sid),
+	}
+	room.startStoreWatch(ctx)
+	return room
+}
+
+func cloneParticipantPermission(permission *proto.ParticipantPermission) *proto.ParticipantPermission {
+	if permission == nil {
+		return nil
+	}
+	cloned := *permission
+	cloned.CanPublishSources = slices.Clone(permission.CanPublishSources)
+	return &cloned
+}
+
+func cloneTrackInfo(info *proto.TrackInfo) *proto.TrackInfo {
+	if info == nil {
+		return nil
+	}
+	cloned := *info
+	cloned.AudioFeatures = slices.Clone(info.AudioFeatures)
+	cloned.AppData = maps.Clone(info.AppData)
+	return &cloned
+}
+
+func cloneTrackInfos(infos []*proto.TrackInfo) []*proto.TrackInfo {
+	if len(infos) == 0 {
+		return nil
+	}
+	cloned := make([]*proto.TrackInfo, 0, len(infos))
+	for _, info := range infos {
+		cloned = append(cloned, cloneTrackInfo(info))
+	}
+	return cloned
+}
+
+func cloneDataTrackInfo(info *proto.DataTrackInfo) *proto.DataTrackInfo {
+	if info == nil {
+		return nil
+	}
+	cloned := *info
+	cloned.AppData = maps.Clone(info.AppData)
+	return &cloned
+}
+
+func cloneDataTrackInfos(infos []*proto.DataTrackInfo) []*proto.DataTrackInfo {
+	if len(infos) == 0 {
+		return nil
+	}
+	cloned := make([]*proto.DataTrackInfo, 0, len(infos))
+	for _, info := range infos {
+		cloned = append(cloned, cloneDataTrackInfo(info))
+	}
+	return cloned
+}
+
+func cloneParticipantInfo(info *proto.ParticipantInfo) *proto.ParticipantInfo {
+	if info == nil {
+		return nil
+	}
+	cloned := *info
+	cloned.Tracks = cloneTrackInfos(info.Tracks)
+	cloned.DataTracks = cloneDataTrackInfos(info.DataTracks)
+	cloned.Permission = cloneParticipantPermission(info.Permission)
+	cloned.Attributes = maps.Clone(info.Attributes)
+	return &cloned
+}
+
+func cloneGroupInfo(info *proto.GroupInfo) *proto.GroupInfo {
+	if info == nil {
+		return nil
+	}
+	cloned := *info
+	cloned.Permissions = cloneParticipantPermission(info.Permissions)
+	return &cloned
+}
+
+func cloneMessage(msg *proto.MessageNotification) *proto.MessageNotification {
+	if msg == nil {
+		return nil
+	}
+	cloned := *msg
+	if msg.EditTimestamp != nil {
+		editTimestamp := *msg.EditTimestamp
+		cloned.EditTimestamp = &editTimestamp
+	}
+	return &cloned
 }
 
 func (r *Room) maxMessages() int {
@@ -142,63 +237,68 @@ func (r *Room) ShouldRegressCodec() bool {
 	if threshold == 0 {
 		return true
 	}
-	r.mu.RLock()
-	count := len(r.participants)
-	r.mu.RUnlock()
-	return count < threshold
+	return r.ParticipantCount() < threshold
 }
 
 func (r *Room) SetOnClose(fn func(*Room)) { r.onClose = fn }
 
-// SetupStore initializes the cross-node RoomStore and starts watching for
-// remote changes. Room lease heartbeats are driven by RoomManager.
-func (r *Room) SetupStore(kv store.Store, nodeID string) {
-	r.roomStore = NewRoomStore(kv, r.name, nodeID)
-	ctx, cancel := context.WithCancel(context.Background())
-	r.watchCtx = ctx
-	r.watchClose = cancel
-
-	ch, err := r.roomStore.Watch(ctx)
+func (r *Room) startStoreWatch(ctx context.Context) {
+	result, err := r.roomStore.Watch(ctx)
 	if err != nil {
 		r.logger.Warn("Failed to start room store watch", "error", err)
 		return
 	}
-	go r.processStoreEvents(ch, nodeID)
-}
-
-// processStoreEvents reacts to changes made by other nodes (participant
-// join/leave, group changes, new chat messages). Events originating from the
-// local node are ignored because the local Room already drives client updates
-// (e.g. ICE / ready paths broadcast); remote nodes rely on this watch.
-func (r *Room) processStoreEvents(ch <-chan RoomStoreEvent, localNodeID string) {
-	for evt := range ch {
-		switch evt.Type {
-		case "participant":
-			if evt.Participant != nil && evt.Participant.NodeId == localNodeID {
-				continue
-			}
-			r.handleRemoteParticipantEvent(evt)
-		case "group":
-			r.handleRemoteGroupEvent(evt)
-		case "msg":
-			r.handleRemoteMessageEvent(evt)
-		case "state":
-			r.handleRemoteStateEvent(evt)
-		case "tracksub":
-			if evt.TrackSub != nil && evt.TrackSub.NodeId != localNodeID {
-				r.handleRemoteTrackSubEvent(evt)
-			} else if evt.Operation == store.OpDelete {
-				r.handleRemoteTrackSubEvent(evt)
-			}
-		case "track":
-			r.handleRemoteTrackEvent(evt)
-		case "dataTrack":
-			r.handleRemoteDataTrackEvent(evt)
-		}
+	ready := make(chan struct{})
+	r.watchWG.Go(func() {
+		r.processStoreEvents(result.Events, ready)
+	})
+	select {
+	case <-ready:
+	case <-time.After(3 * time.Second):
+		r.logger.Warn("Timeout waiting for initial store snapshot")
 	}
 }
 
-func (r *Room) handleRemoteParticipantEvent(evt RoomStoreEvent) {
+// processStoreEvents reacts to room-store changes and fans them back out to
+// local participants. ready is closed after the nil sentinel (initial snapshot
+// complete) is received from the channel.
+func (r *Room) processStoreEvents(ch <-chan *RoomStoreEvent, ready chan struct{}) {
+	readyClosed := false
+	for evt := range ch {
+		if evt == nil {
+			if !readyClosed {
+				close(ready)
+				readyClosed = true
+			}
+			continue
+		}
+		r.dispatchStoreEvent(evt)
+	}
+	if !readyClosed {
+		close(ready)
+	}
+}
+
+func (r *Room) dispatchStoreEvent(evt *RoomStoreEvent) {
+	switch evt.Type {
+	case "participant":
+		r.handleStoreParticipantEvent(evt)
+	case "group":
+		r.handleStoreGroupEvent(evt)
+	case "msg":
+		r.handleStoreMessageEvent(evt)
+	case "state":
+		r.handleStoreStateEvent(evt)
+	case "tracksub":
+		r.handleStoreTrackSubEvent(evt)
+	case "track":
+		r.handleStoreTrackEvent(evt)
+	case "dataTrack":
+		r.handleStoreDataTrackEvent(evt)
+	}
+}
+
+func (r *Room) handleStoreParticipantEvent(evt *RoomStoreEvent) {
 	switch evt.Operation {
 	case store.OpPut:
 		if evt.Participant == nil {
@@ -206,101 +306,156 @@ func (r *Room) handleRemoteParticipantEvent(evt RoomStoreEvent) {
 		}
 		info := evt.Participant
 
-		if info.State == proto.ParticipantInfo_DISCONNECTED {
-			r.mu.Lock()
-			delete(r.remoteParticipants, info.Sid)
-			r.mu.Unlock()
-			r.BroadcastNotification(proto.MethodParticipantLeft,
-				&proto.ParticipantLeftNotification{
-					ParticipantSid: info.Sid,
-					Reason:         info.DisconnectReason,
-				}, "")
+		r.mu.Lock()
+		prev := r.storeParticipants[info.Sid]
+		prevGroupID := ""
+		if prev != nil {
+			prevGroupID = prev.GroupId
+		}
+		r.storeParticipants[info.Sid] = info
+		localP := r.participants[info.Sid]
+		r.mu.Unlock()
+
+		// Remote kick: another node wrote DISCONNECTED for a local participant.
+		if info.State == proto.ParticipantInfo_DISCONNECTED && localP != nil {
+			go localP.Close(info.DisconnectReason)
 			return
 		}
 
-		r.mu.Lock()
-		_, known := r.remoteParticipants[info.Sid]
-		r.remoteParticipants[info.Sid] = true
-		r.mu.Unlock()
+		r.broadcastGroupMembershipChange(info.Sid, prevGroupID, info.GroupId)
 
-		if known {
-			r.BroadcastNotification(proto.MethodParticipantUpdated,
-				&proto.ParticipantUpdatedNotification{Participant: info}, info.Sid)
+		if prev != nil {
+			// ParticipantInfo_DISCONNECTED is used to set DisconnectReason,
+			// so we don't need to broadcast an update.
+			if info.State != proto.ParticipantInfo_DISCONNECTED {
+				r.BroadcastNotification(proto.MethodParticipantUpdated,
+					&proto.ParticipantUpdatedNotification{Participant: info}, info.Sid)
+			}
+			if prev.GroupId != info.GroupId {
+				r.rewireRemoteParticipantSubscriptions(info.Sid, info.GroupId)
+			}
 		} else {
 			r.BroadcastNotification(proto.MethodParticipantJoined,
 				&proto.ParticipantJoinedNotification{Participant: info}, info.Sid)
 		}
 	case store.OpDelete:
 		r.mu.Lock()
-		_, had := r.remoteParticipants[evt.Key]
-		delete(r.remoteParticipants, evt.Key)
+		prev := r.storeParticipants[evt.Key]
+		delete(r.storeParticipants, evt.Key)
 		r.mu.Unlock()
 
-		if had {
-			r.BroadcastNotification(proto.MethodParticipantLeft,
-				&proto.ParticipantLeftNotification{
-					ParticipantSid: evt.Key,
-					Reason:         proto.DisconnectReason_UNKNOWN_REASON,
-				}, "")
+		if prev == nil {
+			return
 		}
+		if prev.GroupId != "" {
+			r.broadcastGroupMembershipChange(evt.Key, prev.GroupId, "")
+		}
+
+		r.BroadcastNotification(proto.MethodParticipantLeft,
+			&proto.ParticipantLeftNotification{
+				ParticipantSid: evt.Key,
+				Reason:         prev.DisconnectReason,
+			}, prev.Sid)
 	}
 }
 
-func (r *Room) handleRemoteGroupEvent(evt RoomStoreEvent) {
-	r.mu.Lock()
+func (r *Room) broadcastGroupMembershipChange(participantSid, previousGroupID, currentGroupID string) {
+	if previousGroupID == currentGroupID {
+		return
+	}
+	if previousGroupID != "" {
+		r.BroadcastNotification(proto.MethodGroupParticipantLeft, &proto.GroupParticipantLeftNotification{
+			GroupId:        previousGroupID,
+			ParticipantSid: participantSid,
+		}, participantSid)
+	}
+	if currentGroupID != "" {
+		r.BroadcastNotification(proto.MethodGroupParticipantJoined, &proto.GroupParticipantJoinedNotification{
+			GroupId:        currentGroupID,
+			ParticipantSid: participantSid,
+		}, participantSid)
+	}
+}
+
+func (r *Room) handleStoreGroupEvent(evt *RoomStoreEvent) {
 	switch evt.Operation {
 	case store.OpPut:
-		if evt.Group != nil {
-			if existing, ok := r.groups[evt.Group.GroupId]; ok {
-				existing.name = evt.Group.Name
-			} else {
-				r.groups[evt.Group.GroupId] = &Group{
-					sid:  evt.Group.GroupId,
-					name: evt.Group.Name,
-				}
-			}
+		if evt.Group == nil {
+			return
+		}
+		groupInfo := evt.Group
+		r.mu.Lock()
+		_, existed := r.storeGroups[groupInfo.GroupId]
+		r.storeGroups[groupInfo.GroupId] = groupInfo
+		enriched := r.enrichGroupInfoLocked(groupInfo)
+		r.mu.Unlock()
+		if existed {
+			r.BroadcastNotification(proto.MethodGroupUpdated, &proto.GroupUpdatedNotification{
+				Group: enriched,
+			}, groupInfo.OwnerSid)
+		} else {
+			r.BroadcastNotification(proto.MethodGroupCreated, &proto.GroupCreatedNotification{
+				Group: enriched,
+			}, groupInfo.OwnerSid)
 		}
 	case store.OpDelete:
-		delete(r.groups, evt.Key)
+		r.mu.Lock()
+		prev := r.storeGroups[evt.Key]
+		delete(r.storeGroups, evt.Key)
+		r.mu.Unlock()
+		if prev != nil {
+			r.BroadcastNotification(proto.MethodGroupDeleted, &proto.GroupDeletedNotification{
+				GroupId: evt.Key,
+			}, prev.OwnerSid)
+		}
 	}
-	r.mu.Unlock()
 }
 
-func (r *Room) handleRemoteMessageEvent(evt RoomStoreEvent) {
+func (r *Room) handleStoreMessageEvent(evt *RoomStoreEvent) {
 	switch evt.Operation {
 	case store.OpPut:
 		if evt.Message == nil {
 			return
 		}
 		r.mu.Lock()
-		if r.remoteMsgIds[evt.Message.ID] {
-			r.mu.Unlock()
-			return
+		replaced := false
+		for i, m := range r.messages {
+			if m.ID == evt.Message.ID {
+				r.messages[i] = evt.Message
+				replaced = true
+				break
+			}
 		}
-		r.remoteMsgIds[evt.Message.ID] = true
-		r.messages = append(r.messages, evt.Message)
+		if !replaced {
+			r.messages = append(r.messages, evt.Message)
+		}
 		r.mu.Unlock()
 
-		r.BroadcastNotification(proto.MethodMessageReceived, evt.Message, "")
+		r.BroadcastNotification(proto.MethodMessageReceived, evt.Message, evt.Message.ParticipantSid)
 
 	case store.OpDelete:
 		r.mu.Lock()
 		msgID := evt.Key
+		participantSid := ""
 		for i, m := range r.messages {
 			if m.ID == msgID {
+				participantSid = m.ParticipantSid
 				r.messages = append(r.messages[:i], r.messages[i+1:]...)
 				break
 			}
 		}
-		delete(r.remoteMsgIds, msgID)
 		r.mu.Unlock()
+
+		r.BroadcastNotification(proto.MethodMessageDeleted, &proto.MessageDeletedNotification{
+			IDs: []string{msgID},
+		}, participantSid)
 	}
 }
 
-func (r *Room) handleRemoteStateEvent(evt RoomStoreEvent) {
-	r.mu.Lock()
+func (r *Room) handleStoreStateEvent(evt *RoomStoreEvent) {
 	switch evt.Operation {
 	case store.OpPut:
+		r.mu.Lock()
 		r.sharedState[evt.Key] = evt.StateValue
 		r.mu.Unlock()
 		r.BroadcastNotification(proto.MethodStateUpdated, &proto.StateUpdatedNotification{
@@ -308,60 +463,53 @@ func (r *Room) handleRemoteStateEvent(evt RoomStoreEvent) {
 			Value: evt.StateValue,
 		}, "")
 	case store.OpDelete:
+		r.mu.Lock()
 		delete(r.sharedState, evt.Key)
 		r.mu.Unlock()
 		r.BroadcastNotification(proto.MethodStateDeleted, &proto.StateDeletedNotification{
 			Key: evt.Key,
 		}, "")
-	default:
-		r.mu.Unlock()
 	}
 }
 
-func (r *Room) handleRemoteTrackSubEvent(evt RoomStoreEvent) {
-	// evt.Key format: <trackSid>.<nodeId>
-	parts := strings.SplitN(evt.Key, ".", 2)
-	if len(parts) != 2 {
+func (r *Room) handleStoreTrackSubEvent(evt *RoomStoreEvent) {
+	if evt.SubKey == "" || evt.SubKey == r.Store().nodeID {
 		return
 	}
-	trackSid := parts[0]
-	nodeID := parts[1]
 
-	track := r.FindPublishedTrack(trackSid)
+	track := r.FindPublishedTrack(evt.Key)
 	if track == nil {
 		return
 	}
 
 	switch evt.Operation {
 	case store.OpPut:
-		if evt.TrackSub != nil {
-			track.updateRemoteSubscription(nodeID, evt.TrackSub)
-		}
+		track.updateRemoteSubscription(evt.SubKey, evt.TrackSub)
 	case store.OpDelete:
-		track.removeRemoteSubscription(nodeID)
+		track.removeRemoteSubscription(evt.SubKey)
 	}
 }
 
-func (r *Room) handleRemoteTrackEvent(evt RoomStoreEvent) {
-	trackSid := evt.SubKey
-	participantSid := evt.Key
+func (r *Room) handleStoreTrackEvent(evt *RoomStoreEvent) {
+	trackSid := evt.Key
 
 	switch evt.Operation {
 	case store.OpPut:
 		if evt.Track == nil {
 			return
 		}
+		trackInfo := evt.Track
+		participantSid := trackInfo.ParticipantSid
 		r.mu.Lock()
-		mt := r.remoteMediaTracks[trackSid]
+		mt := r.storeTracks[trackSid]
 		if mt == nil {
-			mt = &remoteMediaTrack{}
-			r.remoteMediaTracks[trackSid] = mt
+			mt = &storeTrackEntry{}
+			r.storeTracks[trackSid] = mt
 		}
 		existing := mt.info
-		mt.info = evt.Track
-		if mt.published != nil {
-			mt.published.publisher.sid = participantSid
-			applyRemoteTrackProto(mt.published.track, evt.Track, nil, r.Dynacast())
+		mt.info = trackInfo
+		if mt.track != nil {
+			applyRemoteTrackProto(mt.track, trackInfo, nil, r.Dynacast())
 		}
 		r.mu.Unlock()
 
@@ -369,106 +517,151 @@ func (r *Room) handleRemoteTrackEvent(evt RoomStoreEvent) {
 			if existing == nil {
 				r.BroadcastNotification(proto.MethodTrackPublished, &proto.TrackPublishedNotification{
 					ParticipantSid: participantSid,
-					Track:          evt.Track,
-				}, "")
+					Track:          trackInfo,
+				}, participantSid)
 
 				if r.config.AutoSubscribe {
-					var publisherGroupId string
-					if r.roomStore != nil {
-						if remoteP := r.roomStore.GetParticipant(participantSid); remoteP != nil {
-							publisherGroupId = remoteP.GroupId
-						}
-					}
-
-					others := r.GetOtherParticipants(participantSid)
-					for _, sub := range others {
-						if !sub.IsReady() || !sub.CanSubscribe() || !sub.AutoSubscribe() {
-							continue
-						}
-						if !r.shouldPeerSubscribe(publisherGroupId, sub.GetGroupId()) {
-							continue
-						}
-						go func(subscriber *Participant) {
-							track, publisher, err := r.resolveRemoteTrack(evt.Track, participantSid)
-							if err != nil {
-								r.logger.Warn("Resolve remote track failed",
-									"subscriber", subscriber.identity, "track", trackSid, "error", err)
-								return
-							}
-							if err := subscriber.Subscribe(track, publisher); err != nil {
-								r.logger.Warn("Auto subscribe remote track failed",
-									"subscriber", subscriber.identity, "track", trackSid, "error", err)
-							}
-						}(sub)
-					}
+					r.autoSubscribeTrack(trackSid, trackInfo, participantSid)
 				}
 			} else if existing.Muted != evt.Track.Muted {
 				r.BroadcastNotification(proto.MethodTrackMuted, &proto.TrackMutedNotification{
 					ParticipantSid: participantSid,
 					TrackSid:       trackSid,
 					Muted:          evt.Track.Muted,
-				}, "")
+				}, participantSid)
 			}
 		}
 	case store.OpDelete:
 		r.mu.Lock()
-		delete(r.remoteMediaTracks, trackSid)
+		prev := r.storeTracks[trackSid]
+		delete(r.storeTracks, trackSid)
 		r.mu.Unlock()
 
+		var participantSid string
+		if prev != nil && prev.info != nil {
+			participantSid = prev.info.ParticipantSid
+		}
 		r.BroadcastNotification(proto.MethodTrackUnpublished, &proto.TrackUnpublishedNotification{
 			ParticipantSid: participantSid,
 			TrackSid:       trackSid,
-		}, "")
+		}, participantSid)
 	}
 }
 
-func (r *Room) handleRemoteDataTrackEvent(evt RoomStoreEvent) {
-	r.mu.Lock()
-	trackSid := evt.SubKey
-	participantSid := evt.Key
+func (r *Room) autoSubscribeTrack(trackSid string, trackInfo *proto.TrackInfo, participantSid string) {
+	publisherGroupId := r.storeParticipantGroupID(participantSid)
+	localTrack, localPub := r.FindPublishedTrackAndPublisher(trackSid)
+
+	others := r.GetOtherParticipants(participantSid)
+	for _, sub := range others {
+		if !sub.IsReady() || !sub.CanSubscribe() || !sub.AutoSubscribe() {
+			continue
+		}
+		if !r.shouldPeerSubscribe(publisherGroupId, sub.GetGroupId()) {
+			continue
+		}
+		if localTrack != nil {
+			go func(subscriber *Participant) {
+				if err := subscriber.Subscribe(localTrack, localPub); err != nil {
+					r.logger.Warn("Auto subscribe local track failed",
+						"subscriber", subscriber.identity, "track", trackSid, "error", err)
+				}
+			}(sub)
+		} else {
+			go func(subscriber *Participant) {
+				track, publisher, err := r.resolveRemoteTrack(trackInfo, participantSid)
+				if err != nil {
+					r.logger.Warn("Resolve remote track failed",
+						"subscriber", subscriber.identity, "track", trackSid, "error", err)
+					return
+				}
+				if err := subscriber.Subscribe(track, publisher); err != nil {
+					r.logger.Warn("Auto subscribe remote track failed",
+						"subscriber", subscriber.identity, "track", trackSid, "error", err)
+				}
+			}(sub)
+		}
+	}
+}
+
+func (r *Room) autoSubscribeDataTrack(trackSid string, dataTrackInfo *proto.DataTrackInfo, participantSid string) {
+	publisherGroupId := r.storeParticipantGroupID(participantSid)
+	localPub := r.GetParticipant(participantSid)
+
+	others := r.GetOtherParticipants(participantSid)
+	for _, sub := range others {
+		if !sub.IsReady() || !sub.CanSubscribe() || !sub.AutoSubscribe() {
+			continue
+		}
+		if !r.shouldPeerSubscribe(publisherGroupId, sub.GetGroupId()) {
+			continue
+		}
+		if localPub != nil {
+			localTrack := localPub.GetDataPublishedTrack(trackSid)
+			if localTrack != nil {
+				go func(subscriber *Participant) {
+					if err := subscriber.SubscribeData(localTrack, localPub); err != nil {
+						r.logger.Warn("Auto subscribe local data track failed",
+							"subscriber", subscriber.identity, "dataTrack", trackSid, "error", err)
+					}
+				}(sub)
+				continue
+			}
+		}
+		go func(subscriber *Participant) {
+			track, publisher, err := r.resolveRemoteDataTrack(dataTrackInfo, participantSid)
+			if err != nil {
+				r.logger.Warn("Resolve remote data track failed",
+					"subscriber", subscriber.identity, "dataTrack", trackSid, "error", err)
+				return
+			}
+			if err := subscriber.SubscribeData(track, publisher); err != nil {
+				r.logger.Warn("Auto subscribe remote data track failed",
+					"subscriber", subscriber.identity, "dataTrack", trackSid, "error", err)
+			}
+		}(sub)
+	}
+}
+
+func (r *Room) handleStoreDataTrackEvent(evt *RoomStoreEvent) {
+	trackSid := evt.Key
 
 	switch evt.Operation {
 	case store.OpPut:
 		if evt.DataTrack == nil {
-			r.mu.Unlock()
 			return
 		}
+		dataTrackInfo := evt.DataTrack
+		participantSid := dataTrackInfo.ParticipantSid
+		r.mu.Lock()
+		existing := r.storeDataTracks[trackSid]
+		r.storeDataTracks[trackSid] = dataTrackInfo
 		r.mu.Unlock()
 
-		if participantSid != "" && r.config.AutoSubscribe {
-			var publisherGroupId string
-			if r.roomStore != nil {
-				if remoteP := r.roomStore.GetParticipant(participantSid); remoteP != nil {
-					publisherGroupId = remoteP.GroupId
-				}
-			}
+		if participantSid != "" && existing == nil {
+			r.BroadcastNotification(proto.MethodDataTrackPublished, &proto.DataTrackPublishedNotification{
+				ParticipantSid: participantSid,
+				DataTrack:      dataTrackInfo,
+			}, participantSid)
+		}
 
-			others := r.GetOtherParticipants(participantSid)
-			for _, sub := range others {
-				if !sub.IsReady() || !sub.CanSubscribe() || !sub.AutoSubscribe() {
-					continue
-				}
-				if !r.shouldPeerSubscribe(publisherGroupId, sub.GetGroupId()) {
-					continue
-				}
-				go func(subscriber *Participant) {
-					track, publisher, err := r.resolveRemoteDataTrack(evt.DataTrack, participantSid)
-					if err != nil {
-						r.logger.Warn("Resolve remote data track failed",
-							"subscriber", subscriber.identity, "dataTrack", trackSid, "error", err)
-						return
-					}
-					if err := subscriber.SubscribeData(track, publisher); err != nil {
-						r.logger.Warn("Auto subscribe remote data track failed",
-							"subscriber", subscriber.identity, "dataTrack", trackSid, "error", err)
-					}
-				}(sub)
-			}
+		if participantSid != "" && existing == nil && r.config.AutoSubscribe {
+			r.autoSubscribeDataTrack(trackSid, dataTrackInfo, participantSid)
 		}
 	case store.OpDelete:
+		r.mu.Lock()
+		prev := r.storeDataTracks[trackSid]
+		delete(r.storeDataTracks, trackSid)
 		r.mu.Unlock()
-	default:
-		r.mu.Unlock()
+
+		var participantSid string
+		if prev != nil {
+			participantSid = prev.ParticipantSid
+		}
+		r.BroadcastNotification(proto.MethodDataTrackUnpublished, &proto.DataTrackUnpublishedNotification{
+			ParticipantSid: participantSid,
+			DataTrackSid:   trackSid,
+		}, participantSid)
 	}
 }
 
@@ -520,42 +713,30 @@ func (r *Room) resolveRemoteTrack(trackInfo *proto.TrackInfo, publisherSid strin
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.remoteMediaTracks == nil {
-		r.remoteMediaTracks = make(map[string]*remoteMediaTrack)
-	}
 
 	sid := trackInfo.Sid
-	mt := r.remoteMediaTracks[sid]
+	mt := r.storeTracks[sid]
 	if mt == nil {
-		mt = &remoteMediaTrack{info: trackInfo}
-		r.remoteMediaTracks[sid] = mt
+		mt = &storeTrackEntry{info: cloneTrackInfo(trackInfo)}
+		r.storeTracks[sid] = mt
 	} else {
-		mt.info = trackInfo
+		mt.info = cloneTrackInfo(trackInfo)
 	}
 
-	if mt.published != nil {
-		ent := mt.published
-		ent.publisher.sid = publisherSid
-		ent.publisher.router = lp.Router
-		ent.publisher.room = r
-		applyRemoteTrackProto(ent.track, trackInfo, lp.Producer, r.Dynacast())
-		return ent.track, ent.publisher, nil
+	if mt.track != nil {
+		return mt.track, mt.track.publisher, nil
 	}
 
-	// Stub publisher carries room + router so dynacast (activeConsumers) and
-	// backup consumer bookkeeping (backupConsumers) can sync TrackSub to KV.
-	// No signal channel here; requestBackupCodec uses cascade.RequestBackupCodec
-	// (NATS to the publisher's node) when configured.
-	stubPub := &Participant{
+	stub := &Participant{
 		sid:    publisherSid,
 		router: lp.Router,
 		room:   r,
-		logger: slog.Default().With("component", "RemotePublisherStub", "participantSid", publisherSid),
+		logger: slog.Default().With("component", "RemotePublisherStub", "room", r.name, "participantSid", publisherSid),
 	}
-	track := &PublishedTrack{publisher: stubPub}
+	track := &PublishedTrack{publisher: stub}
 	applyRemoteTrackProto(track, trackInfo, lp.Producer, r.Dynacast())
-	mt.published = &remotePublishedEntry{track: track, publisher: stubPub}
-	return track, stubPub, nil
+	mt.track = track
+	return track, stub, nil
 }
 
 // resolveRemoteDataTrack is the data-track counterpart of resolveRemoteTrack.
@@ -579,15 +760,17 @@ func (r *Room) resolveRemoteDataTrack(trackInfo *proto.DataTrackInfo, publisherS
 	publisher := &Participant{
 		sid:    publisherSid,
 		router: lp.Router,
+		room:   r,
+		logger: slog.Default().With("component", "RemotePublisherStub", "room", r.name, "participantSid", publisherSid),
 	}
 	return track, publisher, nil
 }
 
 func (r *Room) AddParticipant(p *Participant) error {
 	// First pass: detect duplicate identity and check capacity.
-	r.mu.Lock()
+	r.mu.RLock()
 	if r.closed {
-		r.mu.Unlock()
+		r.mu.RUnlock()
 		return ErrRoomClosed
 	}
 
@@ -599,15 +782,29 @@ func (r *Room) AddParticipant(p *Participant) error {
 		}
 	}
 
-	effectiveCount := len(r.participants)
+	effectiveCount := r.totalParticipantCountLocked()
 	if existing != nil {
 		effectiveCount--
 	}
+	// Kick remote duplicate: write DISCONNECTED to the store so the remote
+	// node's store-watch closes it. We then proceed to add the new participant.
+	var remoteKicks []*proto.ParticipantInfo
+	if existing == nil {
+		for _, info := range r.storeParticipants {
+			if info.Identity == p.identity && info.Sid != p.sid && r.participants[info.Sid] == nil {
+				kicked := cloneParticipantInfo(info)
+				kicked.State = proto.ParticipantInfo_DISCONNECTED
+				kicked.DisconnectReason = proto.DisconnectReason_DUPLICATE_IDENTITY
+				remoteKicks = append(remoteKicks, kicked)
+				effectiveCount--
+			}
+		}
+	}
 	if r.config.MaxParticipants > 0 && effectiveCount >= r.config.MaxParticipants {
-		r.mu.Unlock()
+		r.mu.RUnlock()
 		return ErrRoomFull
 	}
-	r.mu.Unlock()
+	r.mu.RUnlock()
 
 	// Close old participant synchronously (outside the lock) so its
 	// producers/consumers are fully torn down before the new one is added.
@@ -616,6 +813,10 @@ func (r *Room) AddParticipant(p *Participant) error {
 	if existing != nil {
 		r.logger.Info("Kicking duplicate identity", "identity", p.identity, "oldSid", existing.sid)
 		existing.Close(proto.DisconnectReason_DUPLICATE_IDENTITY)
+	}
+	for _, kicked := range remoteKicks {
+		r.logger.Info("Kicking remote duplicate identity", "identity", p.identity, "remoteSid", kicked.Sid)
+		r.roomStore.PutParticipant(kicked)
 	}
 
 	// Second pass: add the new participant.
@@ -634,9 +835,7 @@ func (r *Room) AddParticipant(p *Participant) error {
 	r.logger.Info("Participant added", "participant", p.identity, "sid", p.sid,
 		"count", len(r.participants))
 
-	if r.roomStore != nil {
-		r.runAsync(func() { r.roomStore.PutParticipant(p.ToProto()) })
-	}
+	r.runAsync(func() { r.roomStore.PutParticipant(p.ToProto()) })
 
 	return nil
 }
@@ -649,28 +848,19 @@ func (r *Room) RemoveParticipant(sid string, reason proto.DisconnectReason) {
 		return
 	}
 	delete(r.participants, sid)
+	delete(r.storeParticipants, sid)
 	count := len(r.participants)
 	r.mu.Unlock()
 
 	r.logger.Info("Participant removed", "participant", p.identity, "sid", sid, "remaining", count)
 
-	if r.roomStore != nil {
-		r.runAsync(func() {
-			r.roomStore.PutParticipant(p.ToProto())
-			r.roomStore.DeleteParticipant(sid)
-		})
-	}
-
-	r.BroadcastNotification(proto.MethodParticipantLeft, &proto.ParticipantLeftNotification{
-		ParticipantSid: sid,
-		Reason:         reason,
-	}, sid)
+	r.runAsync(func() {
+		r.roomStore.PutParticipant(p.ToProto())
+		r.roomStore.DeleteParticipant(sid)
+	})
 
 	if count == 0 {
 		r.mu.Lock()
-		// Groups still contain refs to participant SIDs but those
-		// participants are now gone. Only start the empty timer when
-		// there are truly no participants left in the room at all.
 		r.startEmptyTimer()
 		r.mu.Unlock()
 	}
@@ -735,10 +925,36 @@ func (r *Room) GetOtherParticipants(excludeSid string) []*Participant {
 	return result
 }
 
+// ParticipantCount returns the best-effort total number of participants across
+// all nodes. It combines the locally-connected set with the store-driven cache
+// to account for async propagation delay.
 func (r *Room) ParticipantCount() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return len(r.participants)
+	return r.totalParticipantCountLocked()
+}
+
+// totalParticipantCountLocked returns a de-duplicated count of active
+// participants from both the local map and the store cache. DISCONNECTED
+// entries in storeParticipants are excluded. Must be called with r.mu held.
+func (r *Room) totalParticipantCountLocked() int {
+	if len(r.storeParticipants) == 0 {
+		return len(r.participants)
+	}
+	count := 0
+	for sid, info := range r.storeParticipants {
+		if info.State == proto.ParticipantInfo_DISCONNECTED {
+			continue
+		}
+		_ = sid
+		count++
+	}
+	for sid := range r.participants {
+		if _, inStore := r.storeParticipants[sid]; !inStore {
+			count++
+		}
+	}
+	return count
 }
 
 func (r *Room) ToProto() *proto.Room {
@@ -746,17 +962,9 @@ func (r *Room) ToProto() *proto.Room {
 	defer r.mu.RUnlock()
 
 	numPublishers := uint32(0)
-	for _, p := range r.participants {
-		if p.IsPublisher() {
+	for _, p := range r.storeParticipants {
+		if p.IsPublisher {
 			numPublishers++
-		}
-	}
-
-	var ss map[string]string
-	if len(r.sharedState) > 0 {
-		ss = make(map[string]string, len(r.sharedState))
-		for k, v := range r.sharedState {
-			ss[k] = v
 		}
 	}
 
@@ -768,89 +976,97 @@ func (r *Room) ToProto() *proto.Room {
 		MaxParticipants:  uint32(r.config.MaxParticipants),
 		CreationTime:     r.creationTime.UnixMilli(),
 		Metadata:         r.metadata,
-		NumParticipants:  uint32(len(r.participants)),
+		NumParticipants:  uint32(r.totalParticipantCountLocked()),
 		NumPublishers:    numPublishers,
-		SharedState:      ss,
+		SharedState:      maps.Clone(r.sharedState),
 	}
 }
 
 func (r *Room) runAsync(f func()) {
-	r.asyncWG.Add(1)
-	go func() {
-		defer r.asyncWG.Done()
-		f()
-	}()
+	r.asyncWG.Go(f)
 }
 
-// GetAllParticipantInfos returns ParticipantInfo for all participants across
-// all nodes. Local participants are serialized from in-memory state; remote
-// participants are fetched from the shared store.
+func (r *Room) storeParticipantGroupID(participantSid string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if info := r.storeParticipants[participantSid]; info != nil {
+		return info.GroupId
+	}
+	if p := r.participants[participantSid]; p != nil {
+		return p.GetGroupId()
+	}
+	return ""
+}
+
+// GetAllParticipantInfos returns ParticipantInfo for all participants using the
+// local runtime objects plus the store-driven participant/track caches.
 func (r *Room) GetAllParticipantInfos(excludeSid string) []*proto.ParticipantInfo {
 	r.mu.RLock()
-	localSids := make(map[string]bool, len(r.participants))
-	var result []*proto.ParticipantInfo
-	for _, p := range r.participants {
-		localSids[p.sid] = true
-		if p.sid != excludeSid {
-			result = append(result, p.ToProto())
+	trackInfosByParticipant := make(map[string][]*proto.TrackInfo)
+	for _, mt := range r.storeTracks {
+		if mt == nil || mt.info == nil || mt.info.ParticipantSid == "" {
+			continue
 		}
+		trackInfosByParticipant[mt.info.ParticipantSid] = append(trackInfosByParticipant[mt.info.ParticipantSid], cloneTrackInfo(mt.info))
+	}
+	dataTrackInfosByParticipant := make(map[string][]*proto.DataTrackInfo)
+	for _, dt := range r.storeDataTracks {
+		if dt == nil || dt.ParticipantSid == "" {
+			continue
+		}
+		dataTrackInfosByParticipant[dt.ParticipantSid] = append(dataTrackInfosByParticipant[dt.ParticipantSid], cloneDataTrackInfo(dt))
+	}
+	result := make([]*proto.ParticipantInfo, 0, len(r.storeParticipants))
+	for _, p := range r.participants {
+		if p.sid != excludeSid {
+			result = append(result, cloneParticipantInfo(p.ToProto()))
+		}
+	}
+	for sid, info := range r.storeParticipants {
+		if sid == excludeSid {
+			continue
+		}
+		if _, ok := r.participants[sid]; ok {
+			continue
+		}
+		cloned := cloneParticipantInfo(info)
+		cloned.Tracks = trackInfosByParticipant[sid]
+		cloned.DataTracks = dataTrackInfosByParticipant[sid]
+		result = append(result, cloned)
 	}
 	r.mu.RUnlock()
-
-	if r.roomStore != nil {
-		remote := r.roomStore.GetAllParticipants()
-
-		// Fetch all remote tracks and data tracks to populate the remote participants
-		tracksByParticipant := r.roomStore.GetAllTracks()
-		dataTracksByParticipant := r.roomStore.GetAllDataTracks()
-
-		for _, info := range remote {
-			if info.Sid == excludeSid || localSids[info.Sid] {
-				continue
-			}
-
-			// Populate tracks
-			if tracks, ok := tracksByParticipant[info.Sid]; ok {
-				info.Tracks = tracks
-			}
-			if dataTracks, ok := dataTracksByParticipant[info.Sid]; ok {
-				info.DataTracks = dataTracks
-			}
-
-			result = append(result, info)
-		}
-	}
 	return result
 }
 
-// GetAllGroupInfos returns GroupInfo for all groups across all nodes.
+// GetAllGroupInfos returns GroupInfo for all groups, with ParticipantCount
+// derived from storeParticipants for cross-node accuracy.
 func (r *Room) GetAllGroupInfos() []*proto.GroupInfo {
 	r.mu.RLock()
-	localIds := make(map[string]bool, len(r.groups))
-	var result []*proto.GroupInfo
-	for _, g := range r.groups {
-		localIds[g.SID()] = true
-		result = append(result, g.ToProto())
-	}
-	r.mu.RUnlock()
-
-	if r.roomStore != nil {
-		remote := r.roomStore.GetAllGroups()
-		for _, info := range remote {
-			if localIds[info.GroupId] {
-				continue
-			}
-			result = append(result, info)
-		}
+	defer r.mu.RUnlock()
+	result := make([]*proto.GroupInfo, 0, len(r.storeGroups))
+	for _, info := range r.storeGroups {
+		result = append(result, r.enrichGroupInfoLocked(info))
 	}
 	return result
 }
 
-// GetAllMessagesSince returns messages across all nodes since the given
-// timestamp. Local messages come from in-memory cache; remote from the store.
+// enrichGroupInfoLocked clones a GroupInfo and populates ParticipantCount
+// from storeParticipants. Must be called with r.mu held.
+func (r *Room) enrichGroupInfoLocked(info *proto.GroupInfo) *proto.GroupInfo {
+	cloned := cloneGroupInfo(info)
+	count := 0
+	for _, p := range r.storeParticipants {
+		if p.GroupId == info.GroupId && p.State != proto.ParticipantInfo_DISCONNECTED {
+			count++
+		}
+	}
+	cloned.ParticipantCount = count
+	return cloned
+}
+
+// GetAllMessagesSince returns messages from the local message cache.
 func (r *Room) GetAllMessagesSince(since int64) []*proto.MessageNotification {
 	r.mu.RLock()
-	localIds := make(map[string]bool, len(r.messages))
 	var result []*proto.MessageNotification
 	for _, m := range r.messages {
 		ts := m.Timestamp
@@ -858,25 +1074,14 @@ func (r *Room) GetAllMessagesSince(since int64) []*proto.MessageNotification {
 			ts = *m.EditTimestamp
 		}
 		if since == 0 || ts > since {
-			localIds[m.ID] = true
-			result = append(result, m)
+			result = append(result, cloneMessage(m))
 		}
 	}
 	r.mu.RUnlock()
-
-	if r.roomStore != nil {
-		remote := r.roomStore.GetMessagesSince(since)
-		for _, m := range remote {
-			if localIds[m.ID] {
-				continue
-			}
-			result = append(result, m)
-		}
-	}
 	return result
 }
 
-// GetAllSharedState returns the merged shared state from local and store.
+// GetAllSharedState returns the current shared-state cache.
 func (r *Room) GetAllSharedState() map[string]string {
 	r.mu.RLock()
 	result := make(map[string]string, len(r.sharedState))
@@ -884,27 +1089,22 @@ func (r *Room) GetAllSharedState() map[string]string {
 		result[k] = v
 	}
 	r.mu.RUnlock()
-
-	if r.roomStore != nil {
-		remote := r.roomStore.GetAllState()
-		for k, v := range remote {
-			if _, exists := result[k]; !exists {
-				result[k] = v
-			}
-		}
-	}
 	return result
 }
 
 // BroadcastNotification sends a notification to all participants except the excluded one.
 func (r *Room) BroadcastNotification(method string, body any, excludeSid string) {
 	r.mu.RLock()
-	defer r.mu.RUnlock()
-
+	participants := make([]*Participant, 0, len(r.participants))
 	for _, p := range r.participants {
 		if p.sid == excludeSid {
 			continue
 		}
+		participants = append(participants, p)
+	}
+	r.mu.RUnlock()
+
+	for _, p := range participants {
 		if err := p.SendNotification(method, body); err != nil {
 			r.logger.Warn("Failed to send notification", "method", method,
 				"participant", p.identity, "error", err)
@@ -927,18 +1127,14 @@ func (r *Room) StoreMessage(msg *proto.MessageNotification) {
 		for i, m := range r.messages {
 			if m.ID == msg.ID {
 				r.messages[i] = msg
-				if r.roomStore != nil {
-					r.runAsync(func() { r.roomStore.PutMessage(msg) })
-				}
+				r.runAsync(func() { r.roomStore.PutMessage(msg) })
 				return
 			}
 		}
 	}
 
 	r.messages = append(r.messages, msg)
-	if r.roomStore != nil {
-		r.runAsync(func() { r.roomStore.PutMessage(msg) })
-	}
+	r.runAsync(func() { r.roomStore.PutMessage(msg) })
 
 	r.evictOldMessages()
 }
@@ -954,30 +1150,28 @@ func (r *Room) evictOldMessages() {
 	evicted := r.messages[:overflow]
 	r.messages = r.messages[overflow:]
 
-	if r.roomStore != nil {
-		ids := make([]string, len(evicted))
-		for i, m := range evicted {
-			ids[i] = m.ID
-		}
-		r.runAsync(func() { r.roomStore.DeleteMessagesByIDs(ids) })
+	ids := make([]string, len(evicted))
+	for i, m := range evicted {
+		ids[i] = m.ID
 	}
+	r.runAsync(func() { r.roomStore.DeleteMessagesByIDs(ids) })
 }
 
 // DeleteMessage removes a single message by ID. Returns true if found.
-func (r *Room) DeleteMessage(id string) bool {
+func (r *Room) DeleteMessage(id, participantSid string) bool {
 	r.mu.Lock()
 	found := false
-	for i, m := range r.messages {
+	for _, m := range r.messages {
 		if m.ID == id {
-			r.messages = append(r.messages[:i], r.messages[i+1:]...)
+			m.Deleted = true
 			found = true
 			break
 		}
 	}
 	r.mu.Unlock()
 
-	if found && r.roomStore != nil {
-		go r.roomStore.DeleteMessage(id)
+	if found {
+		r.runAsync(func() { r.roomStore.DeleteMessage(id) })
 	}
 	return found
 }
@@ -986,56 +1180,36 @@ func (r *Room) DeleteMessage(id string) bool {
 func (r *Room) DeleteMessagesByType(msgType string) []string {
 	r.mu.Lock()
 	var ids []string
-	filtered := r.messages[:0]
 	for _, m := range r.messages {
 		if m.Type == msgType {
 			ids = append(ids, m.ID)
-		} else {
-			filtered = append(filtered, m)
+			m.Deleted = true
 		}
 	}
-	r.messages = filtered
 	r.mu.Unlock()
 
-	if len(ids) > 0 && r.roomStore != nil {
-		go r.roomStore.DeleteMessagesByIDs(ids)
+	if len(ids) > 0 {
+		r.runAsync(func() { r.roomStore.DeleteMessagesByIDs(ids) })
 	}
 	return ids
 }
 
-// UpdateState sets a key in the room's shared state and broadcasts the change.
+// UpdateState sets a key in the room's shared state.
 func (r *Room) UpdateState(key, value, participantSid, participantIdentity string) {
 	r.mu.Lock()
 	r.sharedState[key] = value
 	r.mu.Unlock()
 
-	if r.roomStore != nil {
-		r.runAsync(func() { r.roomStore.PutState(key, value) })
-	}
-
-	r.BroadcastNotification(proto.MethodStateUpdated, &proto.StateUpdatedNotification{
-		Key:                 key,
-		Value:               value,
-		ParticipantSid:      participantSid,
-		ParticipantIdentity: participantIdentity,
-	}, "")
+	r.runAsync(func() { r.roomStore.PutState(key, value) })
 }
 
-// DeleteState removes a key from the room's shared state and broadcasts the change.
+// DeleteState removes a key from the room's shared state.
 func (r *Room) DeleteState(key, participantSid, participantIdentity string) {
 	r.mu.Lock()
 	delete(r.sharedState, key)
 	r.mu.Unlock()
 
-	if r.roomStore != nil {
-		r.runAsync(func() { r.roomStore.DeleteState(key) })
-	}
-
-	r.BroadcastNotification(proto.MethodStateDeleted, &proto.StateDeletedNotification{
-		Key:                 key,
-		ParticipantSid:      participantSid,
-		ParticipantIdentity: participantIdentity,
-	}, "")
+	r.runAsync(func() { r.roomStore.DeleteState(key) })
 }
 
 // GetMessagesSince returns all messages with a timestamp strictly
@@ -1044,23 +1218,23 @@ func (r *Room) GetMessagesSince(since int64) []*proto.MessageNotification {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	if since == 0 {
-		out := make([]*proto.MessageNotification, len(r.messages))
-		copy(out, r.messages)
-		return out
-	}
-
 	var out []*proto.MessageNotification
 	for _, m := range r.messages {
 		ts := m.Timestamp
 		if m.EditTimestamp != nil && *m.EditTimestamp > ts {
 			ts = *m.EditTimestamp
 		}
-		if ts > since {
+		if ts > since && !m.Deleted {
 			out = append(out, m)
 		}
 	}
 	return out
+}
+
+// OnParticipantUpdated syncs the participant snapshot to the shared store.
+// The store watch handles broadcasting ParticipantUpdated to other participants.
+func (r *Room) OnParticipantUpdated(p *Participant) {
+	r.runAsync(func() { r.roomStore.PutParticipant(p.ToProto()) })
 }
 
 // OnTrackPublished handles a new track being published.
@@ -1070,34 +1244,7 @@ func (r *Room) OnTrackPublished(publisher *Participant, track *PublishedTrack) {
 		r.cascade.OnTrackPublished(track.sid, track.producer)
 	}
 
-	r.BroadcastNotification(proto.MethodTrackPublished, &proto.TrackPublishedNotification{
-		ParticipantSid: publisher.sid,
-		Track:          track.ToProto(),
-	}, publisher.sid)
-	if r.roomStore != nil {
-		r.runAsync(func() { r.roomStore.PutTrack(publisher.sid, track.ToProto()) })
-	}
-
-	if !r.config.AutoSubscribe {
-		return
-	}
-
-	publisherGroupId := publisher.GetGroupId()
-	others := r.GetOtherParticipants(publisher.sid)
-	for _, sub := range others {
-		if !sub.IsReady() || !sub.CanSubscribe() || !sub.AutoSubscribe() {
-			continue
-		}
-		if !r.shouldPeerSubscribe(publisherGroupId, sub.GetGroupId()) {
-			continue
-		}
-		go func(subscriber *Participant) {
-			if err := subscriber.Subscribe(track, publisher); err != nil {
-				r.logger.Warn("Auto-subscribe failed", "subscriber", subscriber.identity,
-					"track", track.sid, "error", err)
-			}
-		}(sub)
-	}
+	r.runAsync(func() { r.roomStore.PutTrack(track.ToProto()) })
 }
 
 // OnTrackUnpublished handles a track being unpublished.
@@ -1106,26 +1253,13 @@ func (r *Room) OnTrackUnpublished(publisher *Participant, trackSid string) {
 		r.cascade.OnTrackUnpublished(trackSid)
 	}
 
-	r.BroadcastNotification(proto.MethodTrackUnpublished, &proto.TrackUnpublishedNotification{
-		ParticipantSid: publisher.sid,
-		TrackSid:       trackSid,
-	}, publisher.sid)
-	if r.roomStore != nil {
-		r.runAsync(func() { r.roomStore.DeleteTrack(publisher.sid, trackSid) })
-	}
+	r.runAsync(func() { r.roomStore.DeleteTrack(trackSid) })
 }
 
 // OnTrackMuted handles a track being muted/unmuted.
 func (r *Room) OnTrackMuted(publisher *Participant, trackSid string, muted bool) {
-	r.BroadcastNotification(proto.MethodTrackMuted, &proto.TrackMutedNotification{
-		ParticipantSid: publisher.sid,
-		TrackSid:       trackSid,
-		Muted:          muted,
-	}, publisher.sid)
-	if r.roomStore != nil {
-		if track := r.FindPublishedTrack(trackSid); track != nil {
-			r.runAsync(func() { r.roomStore.PutTrack(publisher.sid, track.ToProto()) })
-		}
+	if track := r.FindPublishedTrack(trackSid); track != nil {
+		r.runAsync(func() { r.roomStore.PutTrack(track.ToProto()) })
 	}
 }
 
@@ -1134,26 +1268,7 @@ func (r *Room) OnDataTrackPublished(publisher *Participant, track *DataPublished
 	if r.cascade.OnDataTrackPublished != nil {
 		r.cascade.OnDataTrackPublished(track.sid, track.dataProducer)
 	}
-	if r.roomStore != nil {
-		r.runAsync(func() { r.roomStore.PutDataTrack(publisher.sid, track.ToProto()) })
-	}
-
-	if !r.config.AutoSubscribe {
-		return
-	}
-
-	others := r.GetOtherParticipants(publisher.sid)
-	for _, sub := range others {
-		if !sub.IsReady() || !sub.CanSubscribe() || !sub.AutoSubscribe() {
-			continue
-		}
-		go func(subscriber *Participant) {
-			if err := subscriber.SubscribeData(track, publisher); err != nil {
-				r.logger.Warn("Auto data subscribe failed", "subscriber", subscriber.identity,
-					"dataTrack", track.sid, "error", err)
-			}
-		}(sub)
-	}
+	r.runAsync(func() { r.roomStore.PutDataTrack(track.ToProto()) })
 }
 
 // OnDataTrackUnpublished handles a data track being unpublished.
@@ -1161,9 +1276,7 @@ func (r *Room) OnDataTrackUnpublished(publisher *Participant, dataTrackSid strin
 	if r.cascade.OnDataTrackUnpublished != nil {
 		r.cascade.OnDataTrackUnpublished(dataTrackSid)
 	}
-	if r.roomStore != nil {
-		r.runAsync(func() { r.roomStore.DeleteDataTrack(publisher.sid, dataTrackSid) })
-	}
+	r.runAsync(func() { r.roomStore.DeleteDataTrack(dataTrackSid) })
 }
 
 // SubscribeExistingTracks subscribes a new participant to all tracks carried
@@ -1237,25 +1350,21 @@ func (r *Room) SubscribeExistingTracks(subscriber *Participant, otherInfos []*pr
 // Group (Breakout Room) Management
 // ============================================================
 
-func (r *Room) CreateGroup(name string, permissions *proto.ParticipantPermission) *Group {
+func (r *Room) CreateGroup(name, ownerSid string, permissions *proto.ParticipantPermission) *Group {
 	g := NewGroup(name, permissions)
+	g.ownerSid = ownerSid
+	groupInfo := g.ToProto()
 	r.mu.Lock()
 	r.groups[g.SID()] = g
 	r.mu.Unlock()
 
-	if r.roomStore != nil {
-		r.runAsync(func() { r.roomStore.PutGroup(g.ToProto()) })
-	}
+	r.runAsync(func() { r.roomStore.PutGroup(groupInfo) })
 
-	r.BroadcastNotification(proto.MethodGroupCreated, &proto.GroupCreatedNotification{
-		Group: g.ToProto(),
-	}, "")
-
-	r.logger.Info("Group created", "groupId", g.SID(), "name", name)
+	r.logger.Info("Group created", "groupId", g.SID(), "name", name, "owner", ownerSid)
 	return g
 }
 
-func (r *Room) DeleteGroup(groupId string) error {
+func (r *Room) DeleteGroup(groupId, ownerSid string) error {
 	r.mu.Lock()
 	g, ok := r.groups[groupId]
 	if !ok {
@@ -1263,6 +1372,10 @@ func (r *Room) DeleteGroup(groupId string) error {
 		return errors.New("group not found")
 	}
 	delete(r.groups, groupId)
+	// Stamp ownerSid so the store-watch broadcast can exclude the deleter.
+	if info := r.storeGroups[groupId]; info != nil {
+		info.OwnerSid = ownerSid
+	}
 	r.mu.Unlock()
 
 	participantSids := g.ParticipantSids()
@@ -1274,15 +1387,9 @@ func (r *Room) DeleteGroup(groupId string) error {
 		r.participantLeaveGroup(p, g)
 	}
 
-	if r.roomStore != nil {
-		r.runAsync(func() { r.roomStore.DeleteGroup(groupId) })
-	}
+	r.runAsync(func() { r.roomStore.DeleteGroup(groupId) })
 
-	r.BroadcastNotification(proto.MethodGroupDeleted, &proto.GroupDeletedNotification{
-		GroupId: groupId,
-	}, "")
-
-	r.logger.Info("Group deleted", "groupId", groupId, "participantsReturned", len(participantSids))
+	r.logger.Info("Group deleted", "groupId", groupId, "owner", ownerSid, "participantsReturned", len(participantSids))
 	return nil
 }
 
@@ -1305,8 +1412,8 @@ func (r *Room) ListGroups() []*Group {
 // JoinGroup moves a participant from their current context (main room or
 // another group) into the specified group.  Subscriptions are rewired:
 // old peers lose this participant's tracks, new peers gain them.
-// Returns the list of other participants already in the group.
-func (r *Room) JoinGroup(p *Participant, groupId string) ([]*Participant, error) {
+// Returns ParticipantInfo for all other group members (local + remote).
+func (r *Room) JoinGroup(p *Participant, groupId string) ([]*proto.ParticipantInfo, error) {
 	r.mu.RLock()
 	g, ok := r.groups[groupId]
 	r.mu.RUnlock()
@@ -1322,9 +1429,6 @@ func (r *Room) JoinGroup(p *Participant, groupId string) ([]*Participant, error)
 		}
 	}
 
-	// Snapshot the existing members before adding the new participant.
-	existingSids := g.ParticipantSids()
-
 	g.AddParticipant(p.sid)
 	p.SetGroupId(groupId)
 
@@ -1334,29 +1438,45 @@ func (r *Room) JoinGroup(p *Participant, groupId string) ([]*Participant, error)
 
 	r.rewireSubscriptions(p)
 
-	if r.roomStore != nil {
-		go r.roomStore.PutParticipant(p.ToProto())
-		go r.roomStore.PutGroup(g.ToProto())
-	}
+	r.mu.Lock()
+	r.storeGroups[groupId] = cloneGroupInfo(g.ToProto())
+	r.mu.Unlock()
 
-	r.BroadcastNotification(proto.MethodGroupParticipantJoined, &proto.GroupParticipantJoinedNotification{
-		GroupId:        groupId,
-		ParticipantSid: p.sid,
-	}, "")
+	r.runAsync(func() { r.roomStore.PutParticipant(p.ToProto()) })
+	r.runAsync(func() { r.roomStore.PutGroup(g.ToProto()) })
 
-	// Collect ParticipantInfo for existing group members.
-	r.mu.RLock()
-	others := make([]*Participant, 0, len(existingSids))
-	for _, sid := range existingSids {
-		if peer, ok := r.participants[sid]; ok {
-			others = append(others, peer)
-		}
-	}
-	r.mu.RUnlock()
+	others := r.groupMemberInfos(groupId, p.sid)
 
 	r.logger.Info("Participant joined group", "participant", p.identity,
 		"groupId", groupId, "from", oldGroupId)
 	return others, nil
+}
+
+// groupMemberInfos returns ParticipantInfo for all group members (local +
+// remote) excluding excludeSid.
+func (r *Room) groupMemberInfos(groupId, excludeSid string) []*proto.ParticipantInfo {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	seen := make(map[string]bool)
+	var result []*proto.ParticipantInfo
+	for _, lp := range r.participants {
+		if lp.sid == excludeSid || lp.GetGroupId() != groupId {
+			continue
+		}
+		seen[lp.sid] = true
+		result = append(result, cloneParticipantInfo(lp.ToProto()))
+	}
+	for sid, info := range r.storeParticipants {
+		if sid == excludeSid || info.GroupId != groupId || seen[sid] {
+			continue
+		}
+		if info.State == proto.ParticipantInfo_DISCONNECTED {
+			continue
+		}
+		result = append(result, cloneParticipantInfo(info))
+	}
+	return result
 }
 
 // LeaveGroup returns a participant to the main room.
@@ -1371,11 +1491,6 @@ func (r *Room) LeaveGroup(p *Participant) error {
 		r.participantLeaveGroup(p, g)
 	}
 
-	r.BroadcastNotification(proto.MethodGroupParticipantLeft, &proto.GroupParticipantLeftNotification{
-		GroupId:        groupId,
-		ParticipantSid: p.sid,
-	}, "")
-
 	return nil
 }
 
@@ -1383,17 +1498,23 @@ func (r *Room) LeaveGroup(p *Participant) error {
 // from a group, restores room-level permissions, and rewires subscriptions.
 func (r *Room) participantLeaveGroup(p *Participant, g *Group) {
 	g.RemoveParticipant(p.sid)
-	if r.roomStore != nil {
-		r.runAsync(func() { r.roomStore.PutGroup(g.ToProto()) })
+	shouldPersistGroup := false
+	r.mu.Lock()
+	if _, ok := r.groups[g.SID()]; ok {
+		shouldPersistGroup = true
+		r.storeGroups[g.SID()] = cloneGroupInfo(g.ToProto())
+	}
+	r.mu.Unlock()
+	if shouldPersistGroup {
+		groupInfo := g.ToProto()
+		r.runAsync(func() { r.roomStore.PutGroup(groupInfo) })
 	}
 	p.SetGroupId("")
 	p.RestoreRoomPermission()
 
 	r.rewireSubscriptions(p)
 
-	if r.roomStore != nil {
-		r.runAsync(func() { r.roomStore.PutParticipant(p.ToProto()) })
-	}
+	r.runAsync(func() { r.roomStore.PutParticipant(p.ToProto()) })
 
 	r.logger.Info("Participant left group", "participant", p.identity, "groupId", g.SID())
 }
@@ -1417,6 +1538,97 @@ func (r *Room) rewireSubscriptions(target *Participant) {
 			r.ensureCrossSubscription(target, other)
 		} else {
 			r.removeCrossSubscription(target, other)
+		}
+	}
+
+	// Handle remote tracks: subscribe/unsubscribe target to tracks whose
+	// publisher lives on another node.
+	if !target.IsReady() || !target.CanSubscribe() || !target.AutoSubscribe() {
+		return
+	}
+	r.mu.RLock()
+	var toSubscribe []*proto.TrackInfo
+	var toUnsubscribe []string
+	for trackSid, entry := range r.storeTracks {
+		if entry == nil || entry.info == nil || entry.info.ParticipantSid == target.sid {
+			continue
+		}
+		pubSid := entry.info.ParticipantSid
+		if r.participants[pubSid] != nil {
+			continue // local publisher, already handled above
+		}
+		pubGroupId := ""
+		if pi := r.storeParticipants[pubSid]; pi != nil {
+			pubGroupId = pi.GroupId
+		}
+		shouldSub := r.shouldPeerSubscribe(targetGroupId, pubGroupId)
+		if shouldSub && !target.HasSubscription(trackSid) {
+			toSubscribe = append(toSubscribe, entry.info)
+		} else if !shouldSub && target.HasSubscription(trackSid) {
+			toUnsubscribe = append(toUnsubscribe, trackSid)
+		}
+	}
+	r.mu.RUnlock()
+
+	for _, info := range toSubscribe {
+		go func(info *proto.TrackInfo) {
+			track, pub, err := r.resolveRemoteTrack(info, info.ParticipantSid)
+			if err != nil {
+				return
+			}
+			_ = target.Subscribe(track, pub)
+		}(info)
+	}
+	for _, trackSid := range toUnsubscribe {
+		go target.CloseSubscription(trackSid)
+	}
+}
+
+// rewireRemoteParticipantSubscriptions is called when a remote participant's
+// groupId changes. It adjusts local subscribers' subscriptions to that
+// remote participant's tracks.
+func (r *Room) rewireRemoteParticipantSubscriptions(remoteSid, remoteGroupId string) {
+	if !r.config.AutoSubscribe {
+		return
+	}
+	r.mu.RLock()
+	if r.participants[remoteSid] != nil {
+		r.mu.RUnlock()
+		return // local participant, handled by rewireSubscriptions
+	}
+	type trackRef struct {
+		sid  string
+		info *proto.TrackInfo
+	}
+	var tracks []trackRef
+	for _, entry := range r.storeTracks {
+		if entry != nil && entry.info != nil && entry.info.ParticipantSid == remoteSid {
+			tracks = append(tracks, trackRef{sid: entry.info.Sid, info: entry.info})
+		}
+	}
+	locals := make([]*Participant, 0, len(r.participants))
+	for _, p := range r.participants {
+		locals = append(locals, p)
+	}
+	r.mu.RUnlock()
+
+	for _, sub := range locals {
+		if !sub.IsReady() || !sub.CanSubscribe() || !sub.AutoSubscribe() {
+			continue
+		}
+		shouldSub := r.shouldPeerSubscribe(sub.GetGroupId(), remoteGroupId)
+		for _, t := range tracks {
+			if shouldSub && !sub.HasSubscription(t.sid) {
+				go func(subscriber *Participant, info *proto.TrackInfo) {
+					track, pub, err := r.resolveRemoteTrack(info, remoteSid)
+					if err != nil {
+						return
+					}
+					_ = subscriber.Subscribe(track, pub)
+				}(sub, t.info)
+			} else if !shouldSub && sub.HasSubscription(t.sid) {
+				go sub.CloseSubscription(t.sid)
+			}
 		}
 	}
 }
@@ -1492,15 +1704,12 @@ func (r *Room) stopEmptyTimer() {
 // deleteLocalParticipantKV removes this participant's dynacast tracksub rows and
 // participant row for the local node only (no KV key listing).
 func (r *Room) deleteLocalParticipantKV(p *Participant) {
-	if r.roomStore == nil {
-		return
-	}
 	for _, t := range p.GetPublishedTracks() {
-		r.roomStore.DeleteTrack(p.Sid(), t.sid)
+		r.roomStore.DeleteTrack(t.sid)
 		r.roomStore.DeleteTrackSub(t.sid)
 	}
 	for _, t := range p.GetDataPublishedTracks() {
-		r.roomStore.DeleteDataTrack(p.Sid(), t.sid)
+		r.roomStore.DeleteDataTrack(t.sid)
 	}
 	r.roomStore.DeleteParticipant(p.Sid())
 }
@@ -1513,12 +1722,22 @@ func (r *Room) Close(reason proto.DisconnectReason) {
 	}
 	r.closed = true
 	r.stopEmptyTimer()
+	r.mu.Unlock()
+
+	if r.watchClose != nil {
+		r.watchClose()
+	}
+	r.watchWG.Wait()
+
+	r.mu.Lock()
 	participants := make([]*Participant, 0, len(r.participants))
 	for _, p := range r.participants {
 		participants = append(participants, p)
 	}
 	r.participants = make(map[string]*Participant)
-	r.remoteMediaTracks = make(map[string]*remoteMediaTrack)
+	r.storeParticipants = make(map[string]*proto.ParticipantInfo)
+	r.storeTracks = make(map[string]*storeTrackEntry)
+	r.storeDataTracks = make(map[string]*proto.DataTrackInfo)
 	r.mu.Unlock()
 
 	for _, p := range participants {
@@ -1527,10 +1746,6 @@ func (r *Room) Close(reason proto.DisconnectReason) {
 	}
 
 	r.asyncWG.Wait()
-
-	if r.watchClose != nil {
-		r.watchClose()
-	}
 
 	if r.onClose != nil {
 		r.onClose(r)

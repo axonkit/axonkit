@@ -9,8 +9,10 @@ import (
 
 type StreamID string
 
+const streamIDSep = "/"
+
 func NewStreamID(routerId, producerId string) StreamID {
-	return StreamID(routerId + "." + producerId)
+	return StreamID(routerId + streamIDSep + producerId)
 }
 
 func (s StreamID) IsDataProducer() bool {
@@ -18,13 +20,17 @@ func (s StreamID) IsDataProducer() bool {
 }
 
 func (s StreamID) RouterID() string {
-	parts := strings.Split(string(s), ".")
-	return parts[0]
+	if i := strings.Index(string(s), streamIDSep); i >= 0 {
+		return string(s[:i])
+	}
+	return string(s)
 }
 
 func (s StreamID) ProducerID() string {
-	parts := strings.Split(string(s), ".")
-	return parts[len(parts)-1]
+	if i := strings.LastIndex(string(s), streamIDSep); i >= 0 {
+		return string(s[i+len(streamIDSep):])
+	}
+	return string(s)
 }
 
 type NodeID string

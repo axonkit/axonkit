@@ -17,6 +17,8 @@ type Entry interface {
 	Operation() Operation
 }
 
+// Watcher watches for changes in the store. Updates() delivers Entry values;
+// a nil Entry signals that the initial snapshot has been fully delivered.
 type Watcher interface {
 	Updates() <-chan Entry
 	Stop()
