@@ -973,6 +973,10 @@ func (p *Participant) State() proto.ParticipantInfo_State {
 
 func (p *Participant) SetState(state proto.ParticipantInfo_State) {
 	p.mu.Lock()
+	if p.state == state {
+		p.mu.Unlock()
+		return
+	}
 	p.state = state
 	p.mu.Unlock()
 	if p.room != nil {
@@ -1066,25 +1070,15 @@ func (p *Participant) handleIceStateChange(state mediasoup.IceState) {
 	case mediasoup.IceStateConnected, mediasoup.IceStateCompleted:
 		p.logger.Info("ICE state changed", "state", state)
 		p.mu.Lock()
-		switch p.state {
-		case proto.ParticipantInfo_SUSPENDED:
-			p.state = proto.ParticipantInfo_JOINED
-			p.mu.Unlock()
-			if p.room != nil {
-				p.room.OnParticipantUpdated(p)
-			}
-		default:
-			p.mu.Unlock()
+		state := p.state
+		p.mu.Unlock()
+		if state == proto.ParticipantInfo_SUSPENDED {
+			p.SetState(proto.ParticipantInfo_JOINED)
 		}
 
 	case mediasoup.IceStateDisconnected:
 		p.logger.Warn("ICE disconnected, suspending participant")
-		p.mu.Lock()
-		p.state = proto.ParticipantInfo_SUSPENDED
-		p.mu.Unlock()
-		if p.room != nil {
-			p.room.OnParticipantUpdated(p)
-		}
+		p.SetState(proto.ParticipantInfo_SUSPENDED)
 
 	case mediasoup.IceStateClosed:
 		p.logger.Warn("ICE closed, closing participant")
