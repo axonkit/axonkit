@@ -929,12 +929,12 @@ func (p *Participant) IsPinned(sid string) bool {
 }
 
 // PinnedParticipantSids returns a copy of the pinned participant SIDs.
-func (p *Participant) PinnedParticipantSids() map[string]struct{} {
+func (p *Participant) PinnedParticipantSids() []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	result := make(map[string]struct{}, len(p.pinnedParticipants))
-	for k, v := range p.pinnedParticipants {
-		result[k] = v
+	result := make([]string, 0, len(p.pinnedParticipants))
+	for k := range p.pinnedParticipants {
+		result = append(result, k)
 	}
 	return result
 }

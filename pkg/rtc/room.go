@@ -1415,7 +1415,7 @@ func (r *Room) updateLastNSubscriptions() {
 
 		// 1) Pinned participants always take priority.
 		targetPubs := make(map[string]struct{}, n)
-		for sid := range pinned {
+		for _, sid := range pinned {
 			if sid == sub.Sid() {
 				continue
 			}
