@@ -92,6 +92,12 @@ func (p *Participant) dispatchRPC(msg *proto.Message) {
 	case proto.MethodSubscriptionUnsubscribe:
 		body, status, errMsg = p.handleSubscriptionUnsubscribe(msg)
 
+	case proto.MethodPinParticipant:
+		body, status, errMsg = p.handlePinParticipant(msg)
+
+	case proto.MethodUnpinParticipant:
+		body, status, errMsg = p.handleUnpinParticipant(msg)
+
 	case proto.MethodSubscriptionUpdatePermissions:
 		body, status, errMsg = p.handleSubscriptionUpdatePermissions(msg)
 
@@ -536,6 +542,14 @@ func (p *Participant) handleSubscriptionSubscribe(msg *proto.Message) (any, int,
 	}
 	p.mu.RUnlock()
 
+	// Enforce lastN hard limit: total subscribed publishers cannot exceed lastN.
+	if n := p.LastN(); n > 0 {
+		currentPubs := p.SubscribedPublisherSids()
+		if _, alreadySubbed := currentPubs[publisher.sid]; !alreadySubbed && len(currentPubs) >= n {
+			return nil, proto.StatusForbidden, "lastN limit reached, pin the participant first"
+		}
+	}
+
 	go func() {
 		if err := p.Subscribe(track, publisher); err != nil {
 			p.logger.Warn("Manual subscribe failed", "trackSid", req.TrackSid, "error", err)
@@ -573,6 +587,37 @@ func (p *Participant) handleSubscriptionUnsubscribe(msg *proto.Message) (any, in
 		SubscriptionSid: targetSubSid,
 	})
 
+	return nil, proto.StatusOK, ""
+}
+
+func (p *Participant) handlePinParticipant(msg *proto.Message) (any, int, string) {
+	var req proto.PinParticipantRequest
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
+	}
+	if req.ParticipantSid == p.sid {
+		return nil, proto.StatusBadRequest, "cannot pin self"
+	}
+	p.PinParticipant(req.ParticipantSid)
+	p.logger.Info("Pinned participant", "target", req.ParticipantSid)
+
+	if p.room != nil && p.lastN > 0 {
+		go p.room.updateLastNSubscriptions()
+	}
+	return nil, proto.StatusOK, ""
+}
+
+func (p *Participant) handleUnpinParticipant(msg *proto.Message) (any, int, string) {
+	var req proto.UnpinParticipantRequest
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
+	}
+	p.UnpinParticipant(req.ParticipantSid)
+	p.logger.Info("Unpinned participant", "target", req.ParticipantSid)
+
+	if p.room != nil && p.lastN > 0 {
+		go p.room.updateLastNSubscriptions()
+	}
 	return nil, proto.StatusOK, ""
 }
 

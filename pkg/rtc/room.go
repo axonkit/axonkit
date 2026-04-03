@@ -83,6 +83,12 @@ type Room struct {
 	closed     bool
 	asyncWG    sync.WaitGroup
 	watchWG    sync.WaitGroup
+
+	// Active speaker detection via mediasoup AudioLevelObserver.
+	// One observer per router (participants may land on different workers).
+	audioObservers             map[string]*mediasoup.RtpObserver // routerID → observer
+	audioProducerToParticipant map[string]string                 // producerID → participantSID
+	recentSpeakers             []string                          // participantSIDs, most-recent first
 }
 
 // storeTrackEntry joins the room-store TrackInfo with optional materialized
@@ -110,22 +116,24 @@ func NewRoom(params RoomParams) *Room {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	room := &Room{
-		sid:               params.Sid,
-		name:              params.Name,
-		config:            params.Config,
-		metadata:          params.Metadata,
-		participants:      make(map[string]*Participant),
-		storeParticipants: make(map[string]*proto.ParticipantInfo),
-		groups:            make(map[string]*Group),
-		storeGroups:       make(map[string]*proto.GroupInfo),
-		storeTracks:       make(map[string]*storeTrackEntry),
-		storeDataTracks:   make(map[string]*proto.DataTrackInfo),
-		sharedState:       make(map[string]string),
-		creationTime:      params.CreationTime,
-		roomStore:         params.RoomStore,
-		watchCtx:          ctx,
-		watchClose:        cancel,
-		logger:            slog.Default().With("component", "Room", "room", params.Name, "roomSid", params.Sid),
+		sid:                        params.Sid,
+		name:                       params.Name,
+		config:                     params.Config,
+		metadata:                   params.Metadata,
+		participants:               make(map[string]*Participant),
+		storeParticipants:          make(map[string]*proto.ParticipantInfo),
+		groups:                     make(map[string]*Group),
+		storeGroups:                make(map[string]*proto.GroupInfo),
+		storeTracks:                make(map[string]*storeTrackEntry),
+		storeDataTracks:            make(map[string]*proto.DataTrackInfo),
+		sharedState:                make(map[string]string),
+		creationTime:               params.CreationTime,
+		roomStore:                  params.RoomStore,
+		watchCtx:                   ctx,
+		watchClose:                 cancel,
+		logger:                     slog.Default().With("component", "Room", "room", params.Name, "roomSid", params.Sid),
+		audioObservers:             make(map[string]*mediasoup.RtpObserver),
+		audioProducerToParticipant: make(map[string]string),
 	}
 	room.startStoreWatch(ctx)
 	return room
@@ -552,12 +560,18 @@ func (r *Room) autoSubscribeTrack(trackSid string, trackInfo *proto.TrackInfo, p
 	publisherGroupId := r.storeParticipantGroupID(participantSid)
 	localTrack, localPub := r.FindPublishedTrackAndPublisher(trackSid)
 
+	hasLastNSubscribers := false
 	others := r.GetOtherParticipants(participantSid)
 	for _, sub := range others {
 		if !sub.IsReady() || !sub.CanSubscribe() || !sub.AutoSubscribe() {
 			continue
 		}
 		if !r.shouldPeerSubscribe(publisherGroupId, sub.GetGroupId()) {
+			continue
+		}
+		// lastN participants are managed entirely by updateLastNSubscriptions.
+		if sub.LastN() > 0 {
+			hasLastNSubscribers = true
 			continue
 		}
 		if localTrack != nil {
@@ -581,6 +595,10 @@ func (r *Room) autoSubscribeTrack(trackSid string, trackInfo *proto.TrackInfo, p
 				}
 			}(sub)
 		}
+	}
+
+	if hasLastNSubscribers {
+		go r.updateLastNSubscriptions()
 	}
 }
 
@@ -849,6 +867,13 @@ func (r *Room) RemoveParticipant(sid string, reason proto.DisconnectReason) {
 	}
 	delete(r.participants, sid)
 	delete(r.storeParticipants, sid)
+	// Clean up active speaker tracking for this participant.
+	r.recentSpeakers = slices.DeleteFunc(r.recentSpeakers, func(s string) bool { return s == sid })
+	for prodID, pSid := range r.audioProducerToParticipant {
+		if pSid == sid {
+			delete(r.audioProducerToParticipant, prodID)
+		}
+	}
 	count := len(r.participants)
 	r.mu.Unlock()
 
@@ -1244,6 +1269,10 @@ func (r *Room) OnTrackPublished(publisher *Participant, track *PublishedTrack) {
 		r.cascade.OnTrackPublished(track.sid, track.producer)
 	}
 
+	if track.kind == mediasoup.MediaKindAudio && track.producer != nil {
+		r.addAudioProducer(publisher, track.producer)
+	}
+
 	r.runAsync(func() { r.roomStore.PutTrack(track.ToProto()) })
 }
 
@@ -1254,6 +1283,230 @@ func (r *Room) OnTrackUnpublished(publisher *Participant, trackSid string) {
 	}
 
 	r.runAsync(func() { r.roomStore.DeleteTrack(trackSid) })
+}
+
+// addAudioProducer registers an audio producer with the AudioLevelObserver
+// on the producer's router so the room can detect active speakers.
+func (r *Room) addAudioProducer(publisher *Participant, producer *mediasoup.Producer) {
+	router := publisher.Router()
+	if router == nil {
+		return
+	}
+	routerID := router.Id()
+
+	r.mu.Lock()
+	observer, exists := r.audioObservers[routerID]
+	r.audioProducerToParticipant[producer.Id()] = publisher.Sid()
+	r.mu.Unlock()
+
+	if !exists {
+		obs, err := router.CreateAudioLevelObserver(&mediasoup.AudioLevelObserverOptions{
+			MaxEntries: 10,
+			Threshold:  -50,
+			Interval:   800,
+		})
+		if err != nil {
+			r.logger.Warn("Failed to create AudioLevelObserver", "error", err)
+			return
+		}
+		observer = obs
+
+		r.mu.Lock()
+		r.audioObservers[routerID] = observer
+		r.mu.Unlock()
+
+		observer.OnVolume(func(volumes []mediasoup.AudioLevelObserverVolume) {
+			r.handleAudioVolumes(volumes)
+		})
+	}
+
+	if err := observer.AddProducer(producer.Id()); err != nil {
+		r.logger.Warn("Failed to add producer to AudioLevelObserver",
+			"producerId", producer.Id(), "error", err)
+	}
+}
+
+// removeAudioProducer removes a producer from tracking when a participant leaves.
+func (r *Room) removeAudioProducer(producerID string) {
+	r.mu.Lock()
+	delete(r.audioProducerToParticipant, producerID)
+	r.mu.Unlock()
+}
+
+// handleAudioVolumes processes AudioLevelObserver volume events, updates the
+// recent speakers list, broadcasts active speaker notifications, and
+// re-evaluates lastN subscriptions.
+func (r *Room) handleAudioVolumes(volumes []mediasoup.AudioLevelObserverVolume) {
+	r.mu.Lock()
+
+	activeSids := make([]string, 0, len(volumes))
+	for _, v := range volumes {
+		sid, ok := r.audioProducerToParticipant[v.Producer.Id()]
+		if ok {
+			activeSids = append(activeSids, sid)
+		}
+	}
+
+	if len(activeSids) == 0 {
+		r.mu.Unlock()
+		return
+	}
+
+	// Move active speakers to the front of recentSpeakers, preserving order.
+	activeSet := make(map[string]struct{}, len(activeSids))
+	for _, sid := range activeSids {
+		activeSet[sid] = struct{}{}
+	}
+
+	newOrder := make([]string, 0, len(r.recentSpeakers)+len(activeSids))
+	newOrder = append(newOrder, activeSids...)
+	for _, sid := range r.recentSpeakers {
+		if _, isActive := activeSet[sid]; !isActive {
+			newOrder = append(newOrder, sid)
+		}
+	}
+	// Ensure all active SIDs are present even if they were not in recentSpeakers.
+	r.recentSpeakers = newOrder
+
+	r.mu.Unlock()
+
+	// Broadcast active speaker notification.
+	speakers := make([]*proto.SpeakerInfo, 0, len(volumes))
+	for i, v := range volumes {
+		if i < len(activeSids) {
+			speakers = append(speakers, &proto.SpeakerInfo{
+				ParticipantSid: activeSids[i],
+				Level:          float32(v.Volume),
+				Active:         true,
+			})
+		}
+	}
+	r.BroadcastNotification(proto.MethodActiveSpeakersChanged, &proto.ActiveSpeakersNotification{
+		Speakers: speakers,
+	}, "")
+
+	// Re-evaluate lastN subscriptions based on updated speaker order.
+	r.updateLastNSubscriptions()
+}
+
+// updateLastNSubscriptions re-evaluates subscriptions for all participants
+// with lastN > 0. Pinned participants always occupy slots; remaining slots
+// are filled by the most recent active speakers. Publishers outside the
+// resulting set are unsubscribed.
+func (r *Room) updateLastNSubscriptions() {
+	r.mu.RLock()
+	speakers := slices.Clone(r.recentSpeakers)
+	var lastNParticipants []*Participant
+	for _, p := range r.participants {
+		if p.LastN() > 0 && p.IsReady() && p.CanSubscribe() {
+			lastNParticipants = append(lastNParticipants, p)
+		}
+	}
+	r.mu.RUnlock()
+
+	if len(lastNParticipants) == 0 {
+		return
+	}
+
+	for _, sub := range lastNParticipants {
+		n := sub.LastN()
+		subscriberGroupId := sub.GetGroupId()
+		pinned := sub.PinnedParticipantSids()
+
+		// 1) Pinned participants always take priority.
+		targetPubs := make(map[string]struct{}, n)
+		for sid := range pinned {
+			if sid == sub.Sid() {
+				continue
+			}
+			targetPubs[sid] = struct{}{}
+		}
+
+		// 2) Fill remaining slots with recent active speakers.
+		for _, sid := range speakers {
+			if len(targetPubs) >= n {
+				break
+			}
+			if sid == sub.Sid() {
+				continue
+			}
+			if _, already := targetPubs[sid]; already {
+				continue
+			}
+			if !r.shouldPeerSubscribe(r.storeParticipantGroupID(sid), subscriberGroupId) {
+				continue
+			}
+			targetPubs[sid] = struct{}{}
+		}
+
+		currentPubs := sub.SubscribedPublisherSids()
+
+		// Subscribe to new publishers.
+		for pubSid := range targetPubs {
+			if _, already := currentPubs[pubSid]; already {
+				continue
+			}
+			r.subscribeToPublisher(sub, pubSid)
+		}
+
+		// Unsubscribe from publishers no longer in the target set.
+		for pubSid := range currentPubs {
+			if _, keep := targetPubs[pubSid]; !keep {
+				r.unsubscribeFromPublisher(sub, pubSid)
+			}
+		}
+	}
+}
+
+// subscribeToPublisher subscribes a participant to all tracks of a given publisher.
+func (r *Room) subscribeToPublisher(subscriber *Participant, publisherSid string) {
+	if localPub := r.GetParticipant(publisherSid); localPub != nil {
+		for _, t := range localPub.GetPublishedTracks() {
+			go func(track *PublishedTrack, pub *Participant) {
+				if err := subscriber.Subscribe(track, pub); err != nil {
+					r.logger.Warn("lastN subscribe failed",
+						"subscriber", subscriber.Identity(), "track", track.sid, "error", err)
+				}
+			}(t, localPub)
+		}
+		return
+	}
+
+	// Remote publisher — resolve via store.
+	r.mu.RLock()
+	var tracks []*proto.TrackInfo
+	for _, entry := range r.storeTracks {
+		if entry.info != nil && entry.info.ParticipantSid == publisherSid {
+			tracks = append(tracks, entry.info)
+		}
+	}
+	r.mu.RUnlock()
+
+	for _, ti := range tracks {
+		go func(trackInfo *proto.TrackInfo) {
+			track, publisher, err := r.resolveRemoteTrack(trackInfo, publisherSid)
+			if err != nil {
+				r.logger.Warn("lastN resolve remote track failed",
+					"subscriber", subscriber.Identity(), "track", trackInfo.Sid, "error", err)
+				return
+			}
+			if err := subscriber.Subscribe(track, publisher); err != nil {
+				r.logger.Warn("lastN subscribe remote track failed",
+					"subscriber", subscriber.Identity(), "track", trackInfo.Sid, "error", err)
+			}
+		}(ti)
+	}
+}
+
+// unsubscribeFromPublisher closes all subscriptions from a subscriber to a publisher.
+func (r *Room) unsubscribeFromPublisher(subscriber *Participant, publisherSid string) {
+	subSids := subscriber.GetSubscriptionsByPublisher(publisherSid)
+	for _, sid := range subSids {
+		if err := subscriber.CloseSubscription(sid); err != nil {
+			r.logger.Warn("lastN unsubscribe failed",
+				"subscriber", subscriber.Identity(), "publisherSid", publisherSid, "error", err)
+		}
+	}
 }
 
 // OnTrackMuted handles a track being muted/unmuted.
@@ -1284,6 +1537,12 @@ func (r *Room) OnDataTrackUnpublished(publisher *Participant, dataTrackSid strin
 // server-side subscriptions are consistent with what the client sees.
 func (r *Room) SubscribeExistingTracks(subscriber *Participant, otherInfos []*proto.ParticipantInfo) {
 	if !r.config.AutoSubscribe || !subscriber.CanSubscribe() || !subscriber.AutoSubscribe() {
+		return
+	}
+
+	// lastN participants are managed entirely by updateLastNSubscriptions.
+	if subscriber.LastN() > 0 {
+		go r.updateLastNSubscriptions()
 		return
 	}
 
@@ -1738,7 +1997,15 @@ func (r *Room) Close(reason proto.DisconnectReason) {
 	r.storeParticipants = make(map[string]*proto.ParticipantInfo)
 	r.storeTracks = make(map[string]*storeTrackEntry)
 	r.storeDataTracks = make(map[string]*proto.DataTrackInfo)
+	observers := r.audioObservers
+	r.audioObservers = make(map[string]*mediasoup.RtpObserver)
+	r.audioProducerToParticipant = make(map[string]string)
+	r.recentSpeakers = nil
 	r.mu.Unlock()
+
+	for _, obs := range observers {
+		obs.Close()
+	}
 
 	for _, p := range participants {
 		r.deleteLocalParticipantKV(p)

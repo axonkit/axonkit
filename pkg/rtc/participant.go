@@ -757,6 +757,8 @@ type Participant struct {
 	statsFile     *os.File
 
 	autoSubscribe                     bool
+	lastN                             int
+	pinnedParticipants                map[string]struct{}
 	allParticipantsAllowedToSubscribe bool
 	trackPermissions                  []proto.TrackPermission
 
@@ -788,6 +790,7 @@ type ParticipantParams struct {
 	Router     *mediasoup.Router
 
 	AutoSubscribe   bool
+	LastN           int
 	PingInterval    time.Duration
 	PingTimeout     time.Duration
 	StatsInterval   time.Duration
@@ -817,6 +820,8 @@ func NewParticipant(params ParticipantParams) *Participant {
 		msgCh:                             make(chan *proto.Message, msgQueueSize),
 		done:                              make(chan struct{}),
 		autoSubscribe:                     params.AutoSubscribe,
+		lastN:                             params.LastN,
+		pinnedParticipants:                make(map[string]struct{}),
 		allParticipantsAllowedToSubscribe: true,
 		pingInterval:                      params.PingInterval,
 		pingTimeout:                       params.PingTimeout,
@@ -845,10 +850,11 @@ func (p *Participant) RequestBackupCodecForTrack(trackSid string) error {
 	return nil
 }
 
-func (p *Participant) Sid() string      { return p.sid }
-func (p *Participant) Identity() string { return p.identity }
-func (p *Participant) Name() string     { return p.name }
-func (p *Participant) Room() *Room      { return p.room }
+func (p *Participant) Sid() string               { return p.sid }
+func (p *Participant) Identity() string          { return p.identity }
+func (p *Participant) Name() string              { return p.name }
+func (p *Participant) Room() *Room               { return p.room }
+func (p *Participant) Router() *mediasoup.Router { return p.router }
 
 func (p *Participant) IsPublisher() bool {
 	p.mu.RLock()
@@ -872,6 +878,74 @@ func (p *Participant) CanPublish() bool {
 
 func (p *Participant) AutoSubscribe() bool {
 	return p.autoSubscribe
+}
+
+func (p *Participant) LastN() int {
+	return p.lastN
+}
+
+// SubscribedPublisherSids returns the set of distinct publisher SIDs this
+// participant is currently subscribed to (media tracks only).
+func (p *Participant) SubscribedPublisherSids() map[string]struct{} {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	publishers := make(map[string]struct{})
+	for _, sub := range p.subscriptions {
+		publishers[sub.publisherSid] = struct{}{}
+	}
+	return publishers
+}
+
+// GetSubscriptionsByPublisher returns all subscription SIDs for a given publisher.
+func (p *Participant) GetSubscriptionsByPublisher(publisherSid string) []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	var sids []string
+	for _, sub := range p.subscriptions {
+		if sub.publisherSid == publisherSid {
+			sids = append(sids, sub.sid)
+		}
+	}
+	return sids
+}
+
+func (p *Participant) PinParticipant(sid string) {
+	p.mu.Lock()
+	p.pinnedParticipants[sid] = struct{}{}
+	p.mu.Unlock()
+}
+
+func (p *Participant) UnpinParticipant(sid string) {
+	p.mu.Lock()
+	delete(p.pinnedParticipants, sid)
+	p.mu.Unlock()
+}
+
+func (p *Participant) IsPinned(sid string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	_, ok := p.pinnedParticipants[sid]
+	return ok
+}
+
+// PinnedParticipantSids returns a copy of the pinned participant SIDs.
+func (p *Participant) PinnedParticipantSids() map[string]struct{} {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	result := make(map[string]struct{}, len(p.pinnedParticipants))
+	for k, v := range p.pinnedParticipants {
+		result[k] = v
+	}
+	return result
+}
+
+// IsLastNFull returns true if this participant has lastN set and is at the limit.
+func (p *Participant) IsLastNFull() bool {
+	n := p.lastN
+	if n <= 0 {
+		return false
+	}
+	return len(p.SubscribedPublisherSids()) >= n
 }
 
 // SetRefreshToken stores the refresh token and starts the background refresh scheduler.

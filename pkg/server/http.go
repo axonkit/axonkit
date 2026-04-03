@@ -254,8 +254,10 @@ func (s *HTTPServer) handleJoinLocal(w http.ResponseWriter, req *proto.JoinReque
 	}
 
 	autoSubscribe := s.cfg.Room.AutoSubscribe
+	var lastN int
 	if req.ConnectionSettings != nil {
 		autoSubscribe = req.ConnectionSettings.AutoSubscribe
+		lastN = int(req.ConnectionSettings.LastN)
 	}
 
 	participant := rtc.NewParticipant(rtc.ParticipantParams{
@@ -267,6 +269,7 @@ func (s *HTTPServer) handleJoinLocal(w http.ResponseWriter, req *proto.JoinReque
 		Grants:          claims.Grants,
 		Router:          router,
 		AutoSubscribe:   autoSubscribe,
+		LastN:           lastN,
 		PingInterval:    s.cfg.Room.PingInterval,
 		PingTimeout:     s.cfg.Room.PingTimeout,
 		StatsInterval:   s.cfg.Room.StatsInterval,

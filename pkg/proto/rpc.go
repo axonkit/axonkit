@@ -48,6 +48,10 @@ const (
 	MethodSubscriptionUnsubscribe       = "subscription.unsubscribe"
 	MethodSubscriptionUpdatePermissions = "subscription.updatePermissions"
 
+	// Client -> Server: Pin/Unpin participant (lastN)
+	MethodPinParticipant   = "participant.pin"
+	MethodUnpinParticipant = "participant.unpin"
+
 	// Client -> Server: Group (breakout room) operations
 	MethodGroupCreate = "group.create"
 	MethodGroupDelete = "group.delete"

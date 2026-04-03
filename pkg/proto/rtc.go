@@ -26,14 +26,17 @@ type JoinRequest struct {
 }
 
 type ConnectionSettings struct {
-	AllowPublishing      bool                        `json:"allowPublishing,omitempty"`
-	AllowSubscribing     bool                        `json:"allowSubscribing,omitempty"`
-	AutoSubscribe        bool                        `json:"autoSubscribe,omitempty"`
-	AutoSubscribeData    *bool                       `json:"autoSubscribeData,omitempty"`
-	SubscriberAllowPause *bool                       `json:"subscriberAllowPause,omitempty"`
-	AdaptiveStream       bool                        `json:"adaptiveStream,omitempty"`
-	ForceTcp             bool                        `json:"forceTcp,omitempty"`
-	DtlsFingerprints     []mediasoup.DtlsFingerprint `json:"dtlsFingerprints,omitempty"`
+	AllowPublishing      bool  `json:"allowPublishing,omitempty"`
+	AllowSubscribing     bool  `json:"allowSubscribing,omitempty"`
+	AutoSubscribe        bool  `json:"autoSubscribe,omitempty"`
+	AutoSubscribeData    *bool `json:"autoSubscribeData,omitempty"`
+	SubscriberAllowPause *bool `json:"subscriberAllowPause,omitempty"`
+	AdaptiveStream       bool  `json:"adaptiveStream,omitempty"`
+	// LastN limits the number of remote publishers whose media tracks
+	// this participant will receive. 0 means no limit (receive all).
+	LastN            int32                       `json:"lastN,omitempty"`
+	ForceTcp         bool                        `json:"forceTcp,omitempty"`
+	DtlsFingerprints []mediasoup.DtlsFingerprint `json:"dtlsFingerprints,omitempty"`
 }
 
 type CreateRoomRequest struct {
@@ -433,6 +436,18 @@ type SubscribeRequest struct {
 
 type UnsubscribeRequest struct {
 	TrackSid string `json:"trackSid"`
+}
+
+// ============================================================
+// Client -> Server: Pin/Unpin Participant (lastN)
+// ============================================================
+
+type PinParticipantRequest struct {
+	ParticipantSid string `json:"participantSid"`
+}
+
+type UnpinParticipantRequest struct {
+	ParticipantSid string `json:"participantSid"`
 }
 
 // ============================================================
