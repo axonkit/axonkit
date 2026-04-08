@@ -686,10 +686,11 @@ func (t *DataPublishedTrack) ToProto() *proto.DataTrackInfo {
 
 // Subscription holds a media subscription and its signaling metadata.
 type Subscription struct {
-	sid          string
-	trackSid     string
-	publisherSid string
-	consumer     *mediasoup.Consumer
+	sid           string
+	trackSid      string
+	publisherSid  string
+	consumer      *mediasoup.Consumer
+	pausedByLastN bool
 }
 
 // DataSubscription holds a data subscription for data tracks.
@@ -907,6 +908,77 @@ func (p *Participant) GetSubscriptionsByPublisher(publisherSid string) []string 
 		}
 	}
 	return sids
+}
+
+// ActivePublisherSids returns publisher SIDs whose subscriptions are not
+// paused by lastN. This reflects the set of publishers actively receiving
+// media rather than the full subscription set.
+func (p *Participant) ActivePublisherSids() map[string]struct{} {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	pubs := make(map[string]struct{})
+	for _, sub := range p.subscriptions {
+		if !sub.pausedByLastN {
+			pubs[sub.publisherSid] = struct{}{}
+		}
+	}
+	return pubs
+}
+
+// PauseSubscriptionsByPublisher pauses all subscriptions from the given
+// publisher and marks them as lastN-paused.
+func (p *Participant) PauseSubscriptionsByPublisher(publisherSid string) {
+	p.mu.RLock()
+	var targets []*Subscription
+	for _, sub := range p.subscriptions {
+		if sub.publisherSid == publisherSid && !sub.pausedByLastN {
+			targets = append(targets, sub)
+		}
+	}
+	p.mu.RUnlock()
+
+	for _, sub := range targets {
+		if err := sub.consumer.Pause(); err != nil {
+			p.logger.Warn("lastN pause failed", "subscriptionSid", sub.sid, "error", err)
+			continue
+		}
+		if p.room != nil {
+			if track := p.room.FindPublishedTrack(sub.trackSid); track != nil {
+				track.updateConsumerPaused(sub.consumer.Id(), true)
+			}
+		}
+		p.mu.Lock()
+		sub.pausedByLastN = true
+		p.mu.Unlock()
+	}
+}
+
+// ResumeSubscriptionsByPublisher resumes all lastN-paused subscriptions from
+// the given publisher.
+func (p *Participant) ResumeSubscriptionsByPublisher(publisherSid string) {
+	p.mu.RLock()
+	var targets []*Subscription
+	for _, sub := range p.subscriptions {
+		if sub.publisherSid == publisherSid && sub.pausedByLastN {
+			targets = append(targets, sub)
+		}
+	}
+	p.mu.RUnlock()
+
+	for _, sub := range targets {
+		if err := sub.consumer.Resume(); err != nil {
+			p.logger.Warn("lastN resume failed", "subscriptionSid", sub.sid, "error", err)
+			continue
+		}
+		if p.room != nil {
+			if track := p.room.FindPublishedTrack(sub.trackSid); track != nil {
+				track.updateConsumerPaused(sub.consumer.Id(), false)
+			}
+		}
+		p.mu.Lock()
+		sub.pausedByLastN = false
+		p.mu.Unlock()
+	}
 }
 
 func (p *Participant) PinParticipant(sid string) {

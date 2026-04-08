@@ -14,6 +14,7 @@ import (
 	"github.com/axonkit/axonkit/pkg/media"
 	"github.com/axonkit/axonkit/pkg/proto"
 	"github.com/axonkit/axonkit/pkg/store"
+	"github.com/axonkit/axonkit/pkg/types"
 	"github.com/jiyeyuran/mediasoup-go/v2"
 )
 
@@ -569,20 +570,23 @@ func (r *Room) autoSubscribeTrack(trackSid string, trackInfo *proto.TrackInfo, p
 		if !r.shouldPeerSubscribe(publisherGroupId, sub.GetGroupId()) {
 			continue
 		}
-		// lastN participants are managed entirely by updateLastNSubscriptions.
-		if sub.LastN() > 0 {
+		isLastN := sub.LastN() > 0
+		if isLastN {
 			hasLastNSubscribers = true
-			continue
 		}
 		if localTrack != nil {
-			go func(subscriber *Participant) {
+			go func(subscriber *Participant, lastN bool) {
 				if err := subscriber.Subscribe(localTrack, localPub); err != nil {
 					r.logger.Warn("Auto subscribe local track failed",
 						"subscriber", subscriber.identity, "track", trackSid, "error", err)
+					return
 				}
-			}(sub)
+				if lastN {
+					subscriber.PauseSubscriptionsByPublisher(participantSid)
+				}
+			}(sub, isLastN)
 		} else {
-			go func(subscriber *Participant) {
+			go func(subscriber *Participant, lastN bool) {
 				track, publisher, err := r.resolveRemoteTrack(trackInfo, participantSid)
 				if err != nil {
 					r.logger.Warn("Resolve remote track failed",
@@ -592,8 +596,12 @@ func (r *Room) autoSubscribeTrack(trackSid string, trackInfo *proto.TrackInfo, p
 				if err := subscriber.Subscribe(track, publisher); err != nil {
 					r.logger.Warn("Auto subscribe remote track failed",
 						"subscriber", subscriber.identity, "track", trackSid, "error", err)
+					return
 				}
-			}(sub)
+				if lastN {
+					subscriber.PauseSubscriptionsByPublisher(participantSid)
+				}
+			}(sub, isLastN)
 		}
 	}
 
@@ -730,7 +738,6 @@ func (r *Room) resolveRemoteTrack(trackInfo *proto.TrackInfo, publisherSid strin
 	}
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	sid := trackInfo.Sid
 	mt := r.storeTracks[sid]
@@ -742,6 +749,7 @@ func (r *Room) resolveRemoteTrack(trackInfo *proto.TrackInfo, publisherSid strin
 	}
 
 	if mt.track != nil {
+		r.mu.Unlock()
 		return mt.track, mt.track.publisher, nil
 	}
 
@@ -754,6 +762,14 @@ func (r *Room) resolveRemoteTrack(trackInfo *proto.TrackInfo, publisherSid strin
 	track := &PublishedTrack{publisher: stub}
 	applyRemoteTrackProto(track, trackInfo, lp.Producer, r.Dynacast())
 	mt.track = track
+	r.mu.Unlock()
+
+	// Register piped audio producer with the AudioLevelObserver so remote
+	// participants are included in active speaker detection on this node.
+	if trackInfo.Kind == mediasoup.MediaKindAudio {
+		r.addAudioProducer(lp.Router, lp.Producer, publisherSid)
+	}
+
 	return track, stub, nil
 }
 
@@ -1270,7 +1286,7 @@ func (r *Room) OnTrackPublished(publisher *Participant, track *PublishedTrack) {
 	}
 
 	if track.kind == mediasoup.MediaKindAudio && track.producer != nil {
-		r.addAudioProducer(publisher, track.producer)
+		r.addAudioProducer(publisher.Router(), track.producer, publisher.Sid())
 	}
 
 	r.runAsync(func() { r.roomStore.PutTrack(track.ToProto()) })
@@ -1282,23 +1298,23 @@ func (r *Room) OnTrackUnpublished(publisher *Participant, trackSid string) {
 		r.cascade.OnTrackUnpublished(trackSid)
 	}
 
+	r.removeAudioProducer(types.StreamID(trackSid).ProducerID())
 	r.runAsync(func() { r.roomStore.DeleteTrack(trackSid) })
 }
 
 // addAudioProducer registers an audio producer with the AudioLevelObserver
-// on the producer's router so the room can detect active speakers.
-func (r *Room) addAudioProducer(publisher *Participant, producer *mediasoup.Producer) {
-	router := publisher.Router()
+// on the given router so the room can detect active speakers.
+// participantSid maps the producer back to its publisher for speaker detection.
+func (r *Room) addAudioProducer(router *mediasoup.Router, producer *mediasoup.Producer, participantSid string) {
 	if router == nil {
 		return
 	}
 	routerID := router.Id()
 
 	r.mu.Lock()
-	observer, exists := r.audioObservers[routerID]
-	r.audioProducerToParticipant[producer.Id()] = publisher.Sid()
-	r.mu.Unlock()
+	r.audioProducerToParticipant[producer.Id()] = participantSid
 
+	observer, exists := r.audioObservers[routerID]
 	if !exists {
 		obs, err := router.CreateAudioLevelObserver(&mediasoup.AudioLevelObserverOptions{
 			MaxEntries: 10,
@@ -1306,19 +1322,18 @@ func (r *Room) addAudioProducer(publisher *Participant, producer *mediasoup.Prod
 			Interval:   800,
 		})
 		if err != nil {
+			r.mu.Unlock()
 			r.logger.Warn("Failed to create AudioLevelObserver", "error", err)
 			return
 		}
 		observer = obs
-
-		r.mu.Lock()
 		r.audioObservers[routerID] = observer
-		r.mu.Unlock()
 
 		observer.OnVolume(func(volumes []mediasoup.AudioLevelObserverVolume) {
 			r.handleAudioVolumes(volumes)
 		})
 	}
+	r.mu.Unlock()
 
 	if err := observer.AddProducer(producer.Id()); err != nil {
 		r.logger.Warn("Failed to add producer to AudioLevelObserver",
@@ -1365,10 +1380,15 @@ func (r *Room) handleAudioVolumes(volumes []mediasoup.AudioLevelObserverVolume) 
 			newOrder = append(newOrder, sid)
 		}
 	}
-	// Ensure all active SIDs are present even if they were not in recentSpeakers.
+
+	changed := !slices.Equal(r.recentSpeakers, newOrder)
 	r.recentSpeakers = newOrder
 
 	r.mu.Unlock()
+
+	if !changed {
+		return
+	}
 
 	// Broadcast active speaker notification.
 	speakers := make([]*proto.SpeakerInfo, 0, len(volumes))
@@ -1389,10 +1409,10 @@ func (r *Room) handleAudioVolumes(volumes []mediasoup.AudioLevelObserverVolume) 
 	r.updateLastNSubscriptions()
 }
 
-// updateLastNSubscriptions re-evaluates subscriptions for all participants
-// with lastN > 0. Pinned participants always occupy slots; remaining slots
-// are filled by the most recent active speakers. Publishers outside the
-// resulting set are unsubscribed.
+// updateLastNSubscriptions re-evaluates which publishers are active for all
+// participants with lastN > 0. Pinned participants always occupy slots;
+// remaining slots are filled by the most recent active speakers. Publishers
+// outside the resulting set are paused; those inside are resumed.
 func (r *Room) updateLastNSubscriptions() {
 	r.mu.RLock()
 	speakers := slices.Clone(r.recentSpeakers)
@@ -1439,72 +1459,21 @@ func (r *Room) updateLastNSubscriptions() {
 			targetPubs[sid] = struct{}{}
 		}
 
-		currentPubs := sub.SubscribedPublisherSids()
+		activePubs := sub.ActivePublisherSids()
 
-		// Subscribe to new publishers.
+		// Resume subscriptions for publishers entering the active set.
 		for pubSid := range targetPubs {
-			if _, already := currentPubs[pubSid]; already {
+			if _, already := activePubs[pubSid]; already {
 				continue
 			}
-			r.subscribeToPublisher(sub, pubSid)
+			sub.ResumeSubscriptionsByPublisher(pubSid)
 		}
 
-		// Unsubscribe from publishers no longer in the target set.
-		for pubSid := range currentPubs {
+		// Pause subscriptions for publishers leaving the active set.
+		for pubSid := range activePubs {
 			if _, keep := targetPubs[pubSid]; !keep {
-				r.unsubscribeFromPublisher(sub, pubSid)
+				sub.PauseSubscriptionsByPublisher(pubSid)
 			}
-		}
-	}
-}
-
-// subscribeToPublisher subscribes a participant to all tracks of a given publisher.
-func (r *Room) subscribeToPublisher(subscriber *Participant, publisherSid string) {
-	if localPub := r.GetParticipant(publisherSid); localPub != nil {
-		for _, t := range localPub.GetPublishedTracks() {
-			go func(track *PublishedTrack, pub *Participant) {
-				if err := subscriber.Subscribe(track, pub); err != nil {
-					r.logger.Warn("lastN subscribe failed",
-						"subscriber", subscriber.Identity(), "track", track.sid, "error", err)
-				}
-			}(t, localPub)
-		}
-		return
-	}
-
-	// Remote publisher — resolve via store.
-	r.mu.RLock()
-	var tracks []*proto.TrackInfo
-	for _, entry := range r.storeTracks {
-		if entry.info != nil && entry.info.ParticipantSid == publisherSid {
-			tracks = append(tracks, entry.info)
-		}
-	}
-	r.mu.RUnlock()
-
-	for _, ti := range tracks {
-		go func(trackInfo *proto.TrackInfo) {
-			track, publisher, err := r.resolveRemoteTrack(trackInfo, publisherSid)
-			if err != nil {
-				r.logger.Warn("lastN resolve remote track failed",
-					"subscriber", subscriber.Identity(), "track", trackInfo.Sid, "error", err)
-				return
-			}
-			if err := subscriber.Subscribe(track, publisher); err != nil {
-				r.logger.Warn("lastN subscribe remote track failed",
-					"subscriber", subscriber.Identity(), "track", trackInfo.Sid, "error", err)
-			}
-		}(ti)
-	}
-}
-
-// unsubscribeFromPublisher closes all subscriptions from a subscriber to a publisher.
-func (r *Room) unsubscribeFromPublisher(subscriber *Participant, publisherSid string) {
-	subSids := subscriber.GetSubscriptionsByPublisher(publisherSid)
-	for _, sid := range subSids {
-		if err := subscriber.CloseSubscription(sid); err != nil {
-			r.logger.Warn("lastN unsubscribe failed",
-				"subscriber", subscriber.Identity(), "publisherSid", publisherSid, "error", err)
 		}
 	}
 }
@@ -1540,27 +1509,27 @@ func (r *Room) SubscribeExistingTracks(subscriber *Participant, otherInfos []*pr
 		return
 	}
 
-	// lastN participants are managed entirely by updateLastNSubscriptions.
-	if subscriber.LastN() > 0 {
-		go r.updateLastNSubscriptions()
-		return
-	}
-
+	isLastN := subscriber.LastN() > 0
 	subscriberGroupId := subscriber.GetGroupId()
 	for _, info := range otherInfos {
 		if !r.shouldPeerSubscribe(subscriberGroupId, info.GroupId) {
 			continue
 		}
 
+		pubSid := info.Sid
 		// Local participant — use real track objects (supports backup codec)
-		if localPub := r.GetParticipant(info.Sid); localPub != nil {
+		if localPub := r.GetParticipant(pubSid); localPub != nil {
 			for _, t := range localPub.GetPublishedTracks() {
-				go func(track *PublishedTrack, pub *Participant) {
+				go func(track *PublishedTrack, pub *Participant, publisherSid string) {
 					if err := subscriber.Subscribe(track, pub); err != nil {
 						r.logger.Warn("Subscribe existing track failed",
 							"subscriber", subscriber.identity, "track", track.sid, "error", err)
+						return
 					}
-				}(t, localPub)
+					if isLastN {
+						subscriber.PauseSubscriptionsByPublisher(publisherSid)
+					}
+				}(t, localPub, pubSid)
 			}
 			for _, dt := range localPub.GetDataPublishedTracks() {
 				go func(track *DataPublishedTrack, pub *Participant) {
@@ -1585,8 +1554,12 @@ func (r *Room) SubscribeExistingTracks(subscriber *Participant, otherInfos []*pr
 				if err := subscriber.Subscribe(track, publisher); err != nil {
 					r.logger.Warn("Subscribe existing remote track failed",
 						"subscriber", subscriber.identity, "track", trackInfo.Sid, "error", err)
+					return
 				}
-			}(ti, info.Sid)
+				if isLastN {
+					subscriber.PauseSubscriptionsByPublisher(pSid)
+				}
+			}(ti, pubSid)
 		}
 		for _, dti := range info.DataTracks {
 			go func(dataTrackInfo *proto.DataTrackInfo, pSid string) {
@@ -1600,8 +1573,12 @@ func (r *Room) SubscribeExistingTracks(subscriber *Participant, otherInfos []*pr
 					r.logger.Warn("Subscribe existing remote data track failed",
 						"subscriber", subscriber.identity, "dataTrack", dataTrackInfo.Sid, "error", err)
 				}
-			}(dti, info.Sid)
+			}(dti, pubSid)
 		}
+	}
+
+	if isLastN {
+		go r.updateLastNSubscriptions()
 	}
 }
 

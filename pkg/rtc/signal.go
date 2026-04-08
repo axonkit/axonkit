@@ -542,10 +542,10 @@ func (p *Participant) handleSubscriptionSubscribe(msg *proto.Message) (any, int,
 	}
 	p.mu.RUnlock()
 
-	// Enforce lastN hard limit: total subscribed publishers cannot exceed lastN.
+	// Enforce lastN hard limit: total active (non-paused) publishers cannot exceed lastN.
 	if n := p.LastN(); n > 0 {
-		currentPubs := p.SubscribedPublisherSids()
-		if _, alreadySubbed := currentPubs[publisher.sid]; !alreadySubbed && len(currentPubs) >= n {
+		activePubs := p.ActivePublisherSids()
+		if _, alreadyActive := activePubs[publisher.sid]; !alreadyActive && len(activePubs) >= n {
 			return nil, proto.StatusForbidden, "lastN limit reached, pin the participant first"
 		}
 	}
