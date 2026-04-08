@@ -1260,11 +1260,17 @@ func (p *Participant) PublishTrack(req *proto.PublishTrackRequest) (*PublishedTr
 		return nil, fmt.Errorf("send transport not available")
 	}
 
+	appData := req.AppData
+	if appData == nil {
+		appData = map[string]any{}
+	}
+	appData["participantSid"] = p.sid
+
 	producer, err := transport.Produce(&mediasoup.ProducerOptions{
 		Kind:          req.Kind,
 		RtpParameters: req.RtpParameters,
 		Paused:        req.Muted,
-		AppData:       req.AppData,
+		AppData:       appData,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("produce failed: %w", err)

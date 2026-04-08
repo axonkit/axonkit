@@ -3,6 +3,7 @@ package rtc
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"math/rand"
 	"sync"
@@ -33,9 +34,10 @@ type RoomManager struct {
 	finder   *discovery.Finder
 	mediaMgr *media.Manager
 
-	kv      store.Store // ROOM_STATE: meta, participants, tracks, …
-	leaseKV store.Store // ROOM_LEASE: one key per room name (liveness)
-	nodeID  string
+	kv           store.Store // ROOM_STATE: meta, participants, tracks, …
+	leaseKV      store.Store // ROOM_LEASE: one key per room name (liveness)
+	nodeID       string
+	sharedRouter bool
 
 	backupCodecFwdMu sync.RWMutex
 	backupCodecFwd   func(publisherSid, trackSid, publisherNodeId string) error
@@ -52,21 +54,23 @@ type RoomManagerParams struct {
 	KV           store.Store
 	LeaseKV      store.Store
 	NodeID       string
+	SharedRouter bool
 }
 
 func NewRoomManager(params RoomManagerParams) *RoomManager {
 	return &RoomManager{
-		rooms:      make(map[string]*Room),
-		roomsBySid: make(map[string]*Room),
-		config:     params.Config,
-		rib:        params.RIB,
-		fib:        params.FIB,
-		finder:     params.Finder,
-		mediaMgr:   params.MediaManager,
-		kv:         params.KV,
-		leaseKV:    params.LeaseKV,
-		nodeID:     params.NodeID,
-		logger:     slog.Default().With("component", "RoomManager"),
+		rooms:        make(map[string]*Room),
+		roomsBySid:   make(map[string]*Room),
+		config:       params.Config,
+		rib:          params.RIB,
+		fib:          params.FIB,
+		finder:       params.Finder,
+		mediaMgr:     params.MediaManager,
+		kv:           params.KV,
+		leaseKV:      params.LeaseKV,
+		nodeID:       params.NodeID,
+		sharedRouter: params.SharedRouter,
+		logger:       slog.Default().With("component", "RoomManager"),
 	}
 }
 
@@ -223,6 +227,7 @@ func (rm *RoomManager) GetOrCreateRoom(name string, maxParticipants int, metadat
 		PutRoomMeta(rm.kv, meta)
 	}
 
+	routerIndex := rm.routerIndexForRoom(name)
 	room := NewRoom(RoomParams{
 		Sid:          meta.Sid,
 		Name:         meta.Name,
@@ -231,6 +236,8 @@ func (rm *RoomManager) GetOrCreateRoom(name string, maxParticipants int, metadat
 		Metadata:     meta.Metadata,
 		NodeID:       rm.nodeID,
 		RoomStore:    NewRoomStore(rm.kv, name, rm.nodeID),
+		SharedRouter: rm.sharedRouter,
+		RouterIndex:  routerIndex,
 	})
 	room.SetOnClose(func(r *Room) {
 		rm.removeRoom(r)
@@ -405,6 +412,22 @@ func (rm *RoomManager) setupCascadeCallbacks(room *Room) {
 			return fn(publisherSid, trackSid, publisherNodeId)
 		},
 	}
+}
+
+// routerIndexForRoom returns a deterministic router index for a room name
+// so that all participants in the same room land on the same worker when
+// SharedRouter is enabled.
+func (rm *RoomManager) routerIndexForRoom(roomName string) int {
+	if rm.mediaMgr == nil {
+		return 0
+	}
+	n := len(rm.mediaMgr.Routers())
+	if n == 0 {
+		return 0
+	}
+	h := fnv.New32a()
+	h.Write([]byte(roomName))
+	return int(h.Sum32() % uint32(n))
 }
 
 func (rm *RoomManager) Close() {

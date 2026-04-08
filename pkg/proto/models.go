@@ -303,9 +303,9 @@ type ICEServer struct {
 
 // SpeakerInfo provides audio level information for active speaker detection.
 type SpeakerInfo struct {
-	ParticipantSid string  `json:"participantSid"`
-	Level          float32 `json:"level"`
-	Active         bool    `json:"active"`
+	ParticipantSid string `json:"participantSid"`
+	Volume         int8   `json:"volume"`
+	Active         bool   `json:"active"`
 }
 
 type VideoQuality int32

@@ -167,6 +167,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		KV:           roomKV,
 		LeaseKV:      roomLeaseKV,
 		NodeID:       string(myNode.ID),
+		SharedRouter: cfg.Media.SharedRouter,
 	})
 	n.roomManager = roomManager
 

@@ -49,6 +49,11 @@ type MediaConfig struct {
 	WorkerBin   string       `json:"workerBin"`
 	WorkerCount int          `json:"workerCount"`
 	WebRtc      WebRtcConfig `json:"webRtc"`
+	// SharedRouter forces all participants in the same room to use the same
+	// mediasoup Router (and its associated WebRtcServer). This eliminates
+	// cross-router PipeToRouter for intra-room traffic and ensures a single
+	// AudioLevelObserver for consistent active-speaker detection.
+	SharedRouter bool `json:"sharedRouter"`
 }
 
 type WebRtcConfig struct {

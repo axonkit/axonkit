@@ -241,9 +241,14 @@ func (s *HTTPServer) handleJoinLocal(w http.ResponseWriter, req *proto.JoinReque
 		req.Room.Metadata,
 	)
 
-	routerIdx := int(time.Now().UnixNano() % int64(len(s.routers)))
-	if routerIdx < 0 {
-		routerIdx = -routerIdx
+	var routerIdx int
+	if room.SharedRouter() {
+		routerIdx = room.RouterIndex()
+	} else {
+		routerIdx = int(time.Now().UnixNano() % int64(len(s.routers)))
+		if routerIdx < 0 {
+			routerIdx = -routerIdx
+		}
 	}
 	router := s.routers[routerIdx]
 	webRtcServer := s.webRtcServers[routerIdx]

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,7 +15,6 @@ import (
 	"github.com/axonkit/axonkit/pkg/media"
 	"github.com/axonkit/axonkit/pkg/proto"
 	"github.com/axonkit/axonkit/pkg/store"
-	"github.com/axonkit/axonkit/pkg/types"
 	"github.com/jiyeyuran/mediasoup-go/v2"
 )
 
@@ -87,9 +87,15 @@ type Room struct {
 
 	// Active speaker detection via mediasoup AudioLevelObserver.
 	// One observer per router (participants may land on different workers).
-	audioObservers             map[string]*mediasoup.RtpObserver // routerID → observer
-	audioProducerToParticipant map[string]string                 // producerID → participantSID
-	recentSpeakers             []string                          // participantSIDs, most-recent first
+	audioObservers    map[string]*mediasoup.RtpObserver               // routerID → observer
+	perRouterSpeakers map[string][]mediasoup.AudioLevelObserverVolume // routerID → recent sids (most-recent first)
+	recentSpeakers    []mediasoup.AudioLevelObserverVolume            // merged global list
+
+	// When sharedRouter is true all local participants use the same router,
+	// giving a single AudioLevelObserver for consistent active-speaker detection.
+	// routerIndex is the chosen index into the node's router slice.
+	sharedRouter bool
+	routerIndex  int
 }
 
 // storeTrackEntry joins the room-store TrackInfo with optional materialized
@@ -107,6 +113,8 @@ type RoomParams struct {
 	Metadata     string
 	NodeID       string
 	RoomStore    *RoomStore
+	SharedRouter bool
+	RouterIndex  int
 }
 
 func NewRoom(params RoomParams) *Room {
@@ -117,24 +125,26 @@ func NewRoom(params RoomParams) *Room {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	room := &Room{
-		sid:                        params.Sid,
-		name:                       params.Name,
-		config:                     params.Config,
-		metadata:                   params.Metadata,
-		participants:               make(map[string]*Participant),
-		storeParticipants:          make(map[string]*proto.ParticipantInfo),
-		groups:                     make(map[string]*Group),
-		storeGroups:                make(map[string]*proto.GroupInfo),
-		storeTracks:                make(map[string]*storeTrackEntry),
-		storeDataTracks:            make(map[string]*proto.DataTrackInfo),
-		sharedState:                make(map[string]string),
-		creationTime:               params.CreationTime,
-		roomStore:                  params.RoomStore,
-		watchCtx:                   ctx,
-		watchClose:                 cancel,
-		logger:                     slog.Default().With("component", "Room", "room", params.Name, "roomSid", params.Sid),
-		audioObservers:             make(map[string]*mediasoup.RtpObserver),
-		audioProducerToParticipant: make(map[string]string),
+		sid:               params.Sid,
+		name:              params.Name,
+		config:            params.Config,
+		metadata:          params.Metadata,
+		participants:      make(map[string]*Participant),
+		storeParticipants: make(map[string]*proto.ParticipantInfo),
+		groups:            make(map[string]*Group),
+		storeGroups:       make(map[string]*proto.GroupInfo),
+		storeTracks:       make(map[string]*storeTrackEntry),
+		storeDataTracks:   make(map[string]*proto.DataTrackInfo),
+		sharedState:       make(map[string]string),
+		creationTime:      params.CreationTime,
+		roomStore:         params.RoomStore,
+		watchCtx:          ctx,
+		watchClose:        cancel,
+		logger:            slog.Default().With("component", "Room", "room", params.Name, "roomSid", params.Sid),
+		audioObservers:    make(map[string]*mediasoup.RtpObserver),
+		perRouterSpeakers: make(map[string][]mediasoup.AudioLevelObserverVolume),
+		sharedRouter:      params.SharedRouter,
+		routerIndex:       params.RouterIndex,
 	}
 	room.startStoreWatch(ctx)
 	return room
@@ -235,6 +245,8 @@ func (r *Room) Name() string         { return r.name }
 func (r *Room) Metadata() string     { return r.metadata }
 func (r *Room) SetMetadata(m string) { r.metadata = m }
 func (r *Room) Dynacast() bool       { return r.config.Dynacast }
+func (r *Room) SharedRouter() bool   { return r.sharedRouter }
+func (r *Room) RouterIndex() int     { return r.routerIndex }
 func (r *Room) Store() *RoomStore    { return r.roomStore }
 
 // ShouldRegressCodec returns true when the PREFER_REGRESSION policy should
@@ -884,12 +896,9 @@ func (r *Room) RemoveParticipant(sid string, reason proto.DisconnectReason) {
 	delete(r.participants, sid)
 	delete(r.storeParticipants, sid)
 	// Clean up active speaker tracking for this participant.
-	r.recentSpeakers = slices.DeleteFunc(r.recentSpeakers, func(s string) bool { return s == sid })
-	for prodID, pSid := range r.audioProducerToParticipant {
-		if pSid == sid {
-			delete(r.audioProducerToParticipant, prodID)
-		}
-	}
+	r.recentSpeakers = slices.DeleteFunc(r.recentSpeakers, func(s mediasoup.AudioLevelObserverVolume) bool {
+		return producerParticipantSid(s.Producer) == sid
+	})
 	count := len(r.participants)
 	r.mu.Unlock()
 
@@ -1298,22 +1307,28 @@ func (r *Room) OnTrackUnpublished(publisher *Participant, trackSid string) {
 		r.cascade.OnTrackUnpublished(trackSid)
 	}
 
-	r.removeAudioProducer(types.StreamID(trackSid).ProducerID())
 	r.runAsync(func() { r.roomStore.DeleteTrack(trackSid) })
 }
 
 // addAudioProducer registers an audio producer with the AudioLevelObserver
 // on the given router so the room can detect active speakers.
-// participantSid maps the producer back to its publisher for speaker detection.
+// participantSid is stored in the producer's AppData so handleAudioVolumes
+// can map volume events back to the speaker without an extra lookup map.
 func (r *Room) addAudioProducer(router *mediasoup.Router, producer *mediasoup.Producer, participantSid string) {
 	if router == nil {
 		return
 	}
+
+	// Ensure participantSid is present in the producer's AppData.
+	// For local producers this is set at Produce time; for piped producers
+	// we inject it here since their AppData is not under our control.
+	if ad := producer.AppData(); ad != nil {
+		ad["participantSid"] = participantSid
+	}
+
 	routerID := router.Id()
 
 	r.mu.Lock()
-	r.audioProducerToParticipant[producer.Id()] = participantSid
-
 	observer, exists := r.audioObservers[routerID]
 	if !exists {
 		obs, err := router.CreateAudioLevelObserver(&mediasoup.AudioLevelObserverOptions{
@@ -1330,7 +1345,10 @@ func (r *Room) addAudioProducer(router *mediasoup.Router, producer *mediasoup.Pr
 		r.audioObservers[routerID] = observer
 
 		observer.OnVolume(func(volumes []mediasoup.AudioLevelObserverVolume) {
-			r.handleAudioVolumes(volumes)
+			r.handleAudioVolumes(routerID, volumes)
+		})
+		observer.OnSilence(func() {
+			r.handleAudioSilence(routerID)
 		})
 	}
 	r.mu.Unlock()
@@ -1341,46 +1359,28 @@ func (r *Room) addAudioProducer(router *mediasoup.Router, producer *mediasoup.Pr
 	}
 }
 
-// removeAudioProducer removes a producer from tracking when a participant leaves.
-func (r *Room) removeAudioProducer(producerID string) {
-	r.mu.Lock()
-	delete(r.audioProducerToParticipant, producerID)
-	r.mu.Unlock()
+// producerParticipantSid reads the publisher's participantSid from the
+// producer's AppData (injected at Produce time or in addAudioProducer).
+func producerParticipantSid(producer *mediasoup.Producer) string {
+	if ad := producer.AppData(); ad != nil {
+		if sid, ok := ad["participantSid"].(string); ok {
+			return sid
+		}
+	}
+	return ""
 }
 
 // handleAudioVolumes processes AudioLevelObserver volume events, updates the
 // recent speakers list, broadcasts active speaker notifications, and
 // re-evaluates lastN subscriptions.
-func (r *Room) handleAudioVolumes(volumes []mediasoup.AudioLevelObserverVolume) {
+//
+// Each router fires its own callback with only its local volumes. We maintain
+// a per-router speaker list and merge them into a single global recentSpeakers
+// so that multi-router rooms produce a consistent ordering.
+func (r *Room) handleAudioVolumes(routerID string, volumes []mediasoup.AudioLevelObserverVolume) {
 	r.mu.Lock()
-
-	activeSids := make([]string, 0, len(volumes))
-	for _, v := range volumes {
-		sid, ok := r.audioProducerToParticipant[v.Producer.Id()]
-		if ok {
-			activeSids = append(activeSids, sid)
-		}
-	}
-
-	if len(activeSids) == 0 {
-		r.mu.Unlock()
-		return
-	}
-
-	// Move active speakers to the front of recentSpeakers, preserving order.
-	activeSet := make(map[string]struct{}, len(activeSids))
-	for _, sid := range activeSids {
-		activeSet[sid] = struct{}{}
-	}
-
-	newOrder := make([]string, 0, len(r.recentSpeakers)+len(activeSids))
-	newOrder = append(newOrder, activeSids...)
-	for _, sid := range r.recentSpeakers {
-		if _, isActive := activeSet[sid]; !isActive {
-			newOrder = append(newOrder, sid)
-		}
-	}
-
+	r.perRouterSpeakers[routerID] = volumes
+	newOrder := mergeRouterSpeakers(r.perRouterSpeakers)
 	changed := !slices.Equal(r.recentSpeakers, newOrder)
 	r.recentSpeakers = newOrder
 
@@ -1390,23 +1390,65 @@ func (r *Room) handleAudioVolumes(volumes []mediasoup.AudioLevelObserverVolume) 
 		return
 	}
 
-	// Broadcast active speaker notification.
-	speakers := make([]*proto.SpeakerInfo, 0, len(volumes))
-	for i, v := range volumes {
-		if i < len(activeSids) {
-			speakers = append(speakers, &proto.SpeakerInfo{
-				ParticipantSid: activeSids[i],
-				Level:          float32(v.Volume),
-				Active:         true,
-			})
-		}
+	volumeMap := make(map[string]float32, len(volumes))
+	for _, e := range volumes {
+		volumeMap[producerParticipantSid(e.Producer)] = float32(e.Volume)
+	}
+	speakers := make([]*proto.SpeakerInfo, 0, len(newOrder))
+	for _, speaker := range newOrder {
+		speakers = append(speakers, &proto.SpeakerInfo{
+			ParticipantSid: producerParticipantSid(speaker.Producer),
+			Volume:         speaker.Volume,
+			Active:         true,
+		})
 	}
 	r.BroadcastNotification(proto.MethodActiveSpeakersChanged, &proto.ActiveSpeakersNotification{
 		Speakers: speakers,
 	}, "")
 
-	// Re-evaluate lastN subscriptions based on updated speaker order.
 	r.updateLastNSubscriptions()
+}
+
+// handleAudioSilence is called when an AudioLevelObserver detects that all
+// producers on a router have dropped below the volume threshold. We clear
+// that router's per-router speaker list and re-merge the global list so
+// stale speakers are no longer prioritized.
+func (r *Room) handleAudioSilence(routerID string) {
+	r.mu.Lock()
+
+	prev := r.perRouterSpeakers[routerID]
+	if len(prev) == 0 {
+		r.mu.Unlock()
+		return
+	}
+	r.perRouterSpeakers[routerID] = nil
+
+	newOrder := mergeRouterSpeakers(r.perRouterSpeakers)
+	changed := !slices.Equal(r.recentSpeakers, newOrder)
+	r.recentSpeakers = newOrder
+
+	r.mu.Unlock()
+
+	if !changed {
+		return
+	}
+
+	r.updateLastNSubscriptions()
+}
+
+// mergeRouterSpeakers interleaves per-router speaker lists into a single global list.
+func mergeRouterSpeakers(perRouter map[string][]mediasoup.AudioLevelObserverVolume) []mediasoup.AudioLevelObserverVolume {
+	volumes := []mediasoup.AudioLevelObserverVolume{}
+
+	for _, list := range perRouter {
+		volumes = append(volumes, list...)
+	}
+
+	slices.SortFunc(volumes, func(a, b mediasoup.AudioLevelObserverVolume) int {
+		return strings.Compare(a.Producer.Id(), b.Producer.Id())
+	})
+
+	return volumes
 }
 
 // updateLastNSubscriptions re-evaluates which publishers are active for all
@@ -1443,10 +1485,11 @@ func (r *Room) updateLastNSubscriptions() {
 		}
 
 		// 2) Fill remaining slots with recent active speakers.
-		for _, sid := range speakers {
+		for _, speaker := range speakers {
 			if len(targetPubs) >= n {
 				break
 			}
+			sid := producerParticipantSid(speaker.Producer)
 			if sid == sub.Sid() {
 				continue
 			}
@@ -1976,7 +2019,7 @@ func (r *Room) Close(reason proto.DisconnectReason) {
 	r.storeDataTracks = make(map[string]*proto.DataTrackInfo)
 	observers := r.audioObservers
 	r.audioObservers = make(map[string]*mediasoup.RtpObserver)
-	r.audioProducerToParticipant = make(map[string]string)
+	r.perRouterSpeakers = make(map[string][]mediasoup.AudioLevelObserverVolume)
 	r.recentSpeakers = nil
 	r.mu.Unlock()
 
