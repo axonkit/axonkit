@@ -37,15 +37,20 @@ type CascadeCallbacks struct {
 	OnDataTrackPublished func(streamID string, dataProducer *mediasoup.DataProducer)
 	// OnDataTrackUnpublished stops the data stream advertisement.
 	OnDataTrackUnpublished func(streamID string)
-	// EnsureStream is called before subscribing. For remote streams it
-	// triggers fib.Subscribe to pipe the media locally; for local streams
-	// it is a no-op.
-	EnsureStream func(streamID string) error
+	// EnsureStream makes a stream locally consumable and returns its
+	// LocalProducer. For remote streams it triggers fib.Subscribe (pipe in
+	// + refcount++); for local streams it's a fast path that just returns
+	// the existing producer. Every successful call must be balanced by
+	// ReleaseStream when the consumer no longer needs the stream.
+	EnsureStream func(streamID string) (*media.LocalProducer, error)
 	// ReleaseStream is called when a consumer closes. It decrements the
 	// FIB ref-count and tears down the pipe when no consumers remain.
 	ReleaseStream func(streamID string)
-	// GetLocalProducer returns the piped producer for a remote stream.
-	GetLocalProducer func(streamID string) *media.LocalProducer
+	// GetProducer returns the local or piped producer without touching the
+	// FIB refcount. Only use when the caller knows another holder is
+	// keeping the stream alive (e.g. cache-miss fallback). For subscribe
+	// flows prefer EnsureStream which returns the producer directly.
+	GetProducer func(streamID string) *media.LocalProducer
 	// GetRouter returns a local router by ID.
 	GetRouter func(routerId string) *mediasoup.Router
 	// RequestBackupCodec forwards a backup-codec request to the node that
@@ -738,13 +743,13 @@ func applyRemoteTrackProto(t *PublishedTrack, info *proto.TrackInfo, producer *m
 // router differs from targetRouter, does a cross-router PipeToRouter so the
 // returned producer is directly consumable on targetRouter.
 func (r *Room) resolveRemoteTrack(trackInfo *proto.TrackInfo, publisherSid string) (*PublishedTrack, *Participant, error) {
-	if r.cascade.EnsureStream == nil || r.cascade.GetLocalProducer == nil {
+	if r.cascade.EnsureStream == nil {
 		return nil, nil, errors.New("cascade not configured")
 	}
-	if err := r.cascade.EnsureStream(trackInfo.Sid); err != nil {
+	lp, err := r.cascade.EnsureStream(trackInfo.Sid)
+	if err != nil {
 		return nil, nil, fmt.Errorf("ensure stream: %w", err)
 	}
-	lp := r.cascade.GetLocalProducer(trackInfo.Sid)
 	if lp == nil || lp.Producer == nil {
 		return nil, nil, fmt.Errorf("local producer not found for %s", trackInfo.Sid)
 	}
@@ -787,13 +792,13 @@ func (r *Room) resolveRemoteTrack(trackInfo *proto.TrackInfo, publisherSid strin
 
 // resolveRemoteDataTrack is the data-track counterpart of resolveRemoteTrack.
 func (r *Room) resolveRemoteDataTrack(trackInfo *proto.DataTrackInfo, publisherSid string) (*DataPublishedTrack, *Participant, error) {
-	if r.cascade.EnsureStream == nil || r.cascade.GetLocalProducer == nil {
+	if r.cascade.EnsureStream == nil {
 		return nil, nil, errors.New("cascade not configured")
 	}
-	if err := r.cascade.EnsureStream(trackInfo.Sid); err != nil {
+	lp, err := r.cascade.EnsureStream(trackInfo.Sid)
+	if err != nil {
 		return nil, nil, fmt.Errorf("ensure stream: %w", err)
 	}
-	lp := r.cascade.GetLocalProducer(trackInfo.Sid)
 	if lp == nil || lp.DataProducer == nil {
 		return nil, nil, fmt.Errorf("local data producer not found for %s", trackInfo.Sid)
 	}
@@ -2044,7 +2049,8 @@ func (r *Room) Close(reason proto.DisconnectReason) {
 // TestEnsureStream exposes the cascade EnsureStream callback for integration testing.
 func (r *Room) TestEnsureStream(streamID string) error {
 	if r.cascade.EnsureStream != nil {
-		return r.cascade.EnsureStream(streamID)
+		_, err := r.cascade.EnsureStream(streamID)
+		return err
 	}
 	return nil
 }

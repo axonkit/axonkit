@@ -10,10 +10,8 @@ import (
 	"time"
 
 	"github.com/axonkit/axonkit/pkg/config"
-	"github.com/axonkit/axonkit/pkg/discovery"
 	"github.com/axonkit/axonkit/pkg/media"
 	"github.com/axonkit/axonkit/pkg/proto"
-	"github.com/axonkit/axonkit/pkg/routing"
 	"github.com/axonkit/axonkit/pkg/store"
 	"github.com/axonkit/axonkit/pkg/types"
 	"github.com/jiyeyuran/mediasoup-go/v2"
@@ -29,9 +27,6 @@ type RoomManager struct {
 	mu         sync.RWMutex
 	config     config.RoomConfig
 
-	rib      *routing.RIB
-	fib      *routing.FIB
-	finder   *discovery.Finder
 	mediaMgr *media.Manager
 
 	kv           store.Store // ROOM_STATE: meta, participants, tracks, …
@@ -47,9 +42,6 @@ type RoomManager struct {
 
 type RoomManagerParams struct {
 	Config       config.RoomConfig
-	RIB          *routing.RIB
-	FIB          *routing.FIB
-	Finder       *discovery.Finder
 	MediaManager *media.Manager
 	KV           store.Store
 	LeaseKV      store.Store
@@ -62,9 +54,6 @@ func NewRoomManager(params RoomManagerParams) *RoomManager {
 		rooms:        make(map[string]*Room),
 		roomsBySid:   make(map[string]*Room),
 		config:       params.Config,
-		rib:          params.RIB,
-		fib:          params.FIB,
-		finder:       params.Finder,
 		mediaMgr:     params.MediaManager,
 		kv:           params.KV,
 		leaseKV:      params.LeaseKV,
@@ -72,17 +61,6 @@ func NewRoomManager(params RoomManagerParams) *RoomManager {
 		sharedRouter: params.SharedRouter,
 		logger:       slog.Default().With("component", "RoomManager"),
 	}
-}
-
-// FindPath returns the same FIB findPath callback used by the RoomManager's
-// cascade. It is exposed so that other subsystems on this node (e.g. the
-// WHIP/WHEP HTTP handlers that pipe in remote standalone publishers) can
-// drive fib.Subscribe consistently with the Room flow.
-func (rm *RoomManager) FindPath(streamID types.StreamID) (*types.RouteKVValue, error) {
-	if rm.finder == nil {
-		return nil, fmt.Errorf("room manager has no discovery finder")
-	}
-	return rm.finder.FindPath(streamID)
 }
 
 // SetRequestBackupCodec sets the NATS (or in-process) forwarder used when a
@@ -333,79 +311,47 @@ func (rm *RoomManager) GetParticipantBySid(sid string) *Participant {
 }
 
 func (rm *RoomManager) setupCascadeCallbacks(room *Room) {
-	unadvertise := func(sid string) {
-		streamID := types.StreamID(sid)
-		if rm.rib != nil {
-			if err := rm.rib.StopAdvertise(streamID); err != nil {
-				rm.logger.Error("Failed to stop advertise", "stream_id", streamID, "error", err)
-			}
-		}
-		if rm.mediaMgr != nil {
-			rm.mediaMgr.UnregisterProducer(streamID)
-		}
-	}
-
 	room.cascade = CascadeCallbacks{
 		OnTrackPublished: func(sid string, producer *mediasoup.Producer) {
-			streamID := types.StreamID(sid)
 			if rm.mediaMgr != nil {
-				rm.mediaMgr.RegisterProducer(streamID, producer)
-			}
-			if rm.rib != nil {
-				if err := rm.rib.StartAdvertise(routing.AdvertiseOptions{
-					StreamID: streamID,
-					IsOrigin: true,
-				}); err != nil {
-					rm.logger.Error("Failed to advertise stream", "stream_id", streamID, "error", err)
-				}
+				rm.mediaMgr.RegisterProducer(types.StreamID(sid), producer)
 			}
 		},
-		OnTrackUnpublished: unadvertise,
+		OnTrackUnpublished: func(sid string) {
+			if rm.mediaMgr != nil {
+				rm.mediaMgr.UnregisterProducer(types.StreamID(sid))
+			}
+		},
 		OnDataTrackPublished: func(sid string, dataProducer *mediasoup.DataProducer) {
-			streamID := types.StreamID(sid)
 			if rm.mediaMgr != nil {
-				rm.mediaMgr.RegisterDataProducer(streamID, dataProducer)
-			}
-			if rm.rib != nil {
-				if err := rm.rib.StartAdvertise(routing.AdvertiseOptions{
-					StreamID: streamID,
-					IsOrigin: true,
-				}); err != nil {
-					rm.logger.Error("Failed to advertise stream", "stream_id", streamID, "error", err)
-				}
+				rm.mediaMgr.RegisterDataProducer(types.StreamID(sid), dataProducer)
 			}
 		},
-		OnDataTrackUnpublished: unadvertise,
-		EnsureStream: func(sid string) error {
-			streamID := types.StreamID(sid)
-			// Local producer — no FIB piping needed
-			if rm.mediaMgr != nil && rm.mediaMgr.GetLocalProducer(streamID) != nil {
-				return nil
+		OnDataTrackUnpublished: func(sid string) {
+			if rm.mediaMgr != nil {
+				rm.mediaMgr.UnregisterProducer(types.StreamID(sid))
 			}
-			if rm.fib == nil || rm.finder == nil {
-				return nil
+		},
+		EnsureStream: func(sid string) (*media.LocalProducer, error) {
+			if rm.mediaMgr == nil {
+				return nil, nil
 			}
-			if _, _, err := rm.fib.Subscribe(streamID, rm.finder.FindPath); err != nil {
-				return fmt.Errorf("fib subscribe failed for %s: %w", streamID, err)
+			lp, err := rm.mediaMgr.EnsureProducer(types.StreamID(sid))
+			if err != nil {
+				return nil, fmt.Errorf("ensure producer for %s: %w", sid, err)
 			}
-			return nil
+			return lp, nil
 		},
 		ReleaseStream: func(sid string) {
-			streamID := types.StreamID(sid)
-			// Only release remote streams managed by FIB
-			if rm.fib == nil {
-				return
+			if rm.mediaMgr != nil {
+				rm.mediaMgr.ReleaseProducer(types.StreamID(sid))
 			}
-			if rm.mediaMgr != nil && rm.mediaMgr.GetLocalProducer(streamID) != nil {
-				return
-			}
-			rm.fib.Unsubscribe(streamID)
 		},
-		GetLocalProducer: func(sid string) *media.LocalProducer {
+		GetProducer: func(sid string) *media.LocalProducer {
 			if rm.mediaMgr == nil {
 				return nil
 			}
-			return rm.mediaMgr.GetLocalProducer(types.StreamID(sid))
+			return rm.mediaMgr.GetProducer(types.StreamID(sid))
 		},
 		GetRouter: func(routerId string) *mediasoup.Router {
 			if rm.mediaMgr == nil {

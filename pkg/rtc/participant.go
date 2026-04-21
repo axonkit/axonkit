@@ -1813,14 +1813,11 @@ func (t *PublishedTrack) runRemoteBackupDrain() {
 			if pub == nil || pub.room == nil {
 				return
 			}
-			if pub.room.cascade.EnsureStream != nil {
-				_ = pub.room.cascade.EnsureStream(backupSid)
-			}
-			if pub.room.cascade.GetLocalProducer == nil {
+			if pub.room.cascade.EnsureStream == nil {
 				continue
 			}
-			lp := pub.room.cascade.GetLocalProducer(backupSid)
-			if lp == nil || lp.Producer == nil {
+			lp, err := pub.room.cascade.EnsureStream(backupSid)
+			if err != nil || lp == nil || lp.Producer == nil {
 				continue
 			}
 			t.mu.Lock()
@@ -1860,8 +1857,8 @@ func (p *Participant) consumeFromBackup(
 	sid := track.backupSid
 	track.mu.Unlock()
 
-	if prod == nil && sid != "" && publisher.room != nil && publisher.room.cascade.GetLocalProducer != nil {
-		if lp := publisher.room.cascade.GetLocalProducer(sid); lp != nil && lp.Producer != nil {
+	if prod == nil && sid != "" && publisher.room != nil && publisher.room.cascade.GetProducer != nil {
+		if lp := publisher.room.cascade.GetProducer(sid); lp != nil && lp.Producer != nil {
 			prod = lp.Producer
 		}
 	}

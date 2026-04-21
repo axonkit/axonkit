@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/axonkit/axonkit/pkg/config"
+	"github.com/axonkit/axonkit/pkg/media"
 	"github.com/axonkit/axonkit/pkg/proto"
 	"github.com/jiyeyuran/mediasoup-go/v2"
 )
@@ -704,7 +705,10 @@ func TestRoom_TestHelpers(t *testing.T) {
 	// With callbacks
 	var ensured, released []string
 	r.cascade = CascadeCallbacks{
-		EnsureStream:  func(sid string) error { ensured = append(ensured, sid); return nil },
+		EnsureStream: func(sid string) (*media.LocalProducer, error) {
+			ensured = append(ensured, sid)
+			return nil, nil
+		},
 		ReleaseStream: func(sid string) { released = append(released, sid) },
 	}
 	if err := r.TestEnsureStream("stream-2"); err != nil {

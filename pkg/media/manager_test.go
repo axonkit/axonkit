@@ -185,13 +185,13 @@ func TestManager_RegisterUnregisterProducer(t *testing.T) {
 	defer m.Close()
 
 	streamID := testPublish(t, m)
-	lp := m.GetLocalProducer(streamID)
+	lp := m.GetProducer(streamID)
 	if lp == nil || lp.Id() == "" {
 		t.Fatalf("expected producer id")
 	}
 
 	m.UnregisterProducer(streamID)
-	if m.GetLocalProducer(streamID) != nil {
+	if m.GetProducer(streamID) != nil {
 		t.Fatalf("expected producer removed")
 	}
 }
@@ -228,7 +228,7 @@ func TestManager_ConnectPipeLocal(t *testing.T) {
 	defer m.Close()
 
 	streamID := testPublish(t, m)
-	pipeID, err := m.ConnectPipe(streamID, m.nodeID)
+	pipeID, err := m.connectPipe(streamID, m.nodeID)
 	if err != nil {
 		t.Fatalf("ConnectPipe failed: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestManager_ConnectPipeInvalidStream(t *testing.T) {
 	m := setupManager(t, "node-invalid-stream", nc)
 	defer m.Close()
 
-	if _, err := m.ConnectPipe(types.StreamID(".producer"), "node-x"); err == nil {
+	if _, err := m.connectPipe(types.StreamID(".producer"), "node-x"); err == nil {
 		t.Fatalf("expected error for invalid stream id")
 	}
 }
@@ -259,7 +259,7 @@ func TestManager_ConnectPipeLocalMissingStream(t *testing.T) {
 	m := setupManager(t, "node-local-missing", nc)
 	defer m.Close()
 
-	if _, err := m.ConnectPipe("missing.stream", m.nodeID); err == nil {
+	if _, err := m.connectPipe("missing.stream", m.nodeID); err == nil {
 		t.Fatalf("expected error for missing local stream")
 	}
 }
@@ -281,7 +281,7 @@ func TestManager_PipeBetweenManagersPauseResume(t *testing.T) {
 	defer mB.Close()
 
 	streamID := testPublish(t, mA)
-	pipeID, err := mB.ConnectPipe(streamID, "node-a")
+	pipeID, err := mB.connectPipe(streamID, "node-a")
 	if err != nil {
 		t.Fatalf("ConnectPipe failed: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestManager_PipeBetweenManagersPauseResume(t *testing.T) {
 		t.Fatalf("Resume response error: %s", resp.Error)
 	}
 
-	if err := mB.DisconnectPipe(streamID, pipeID, "node-a"); err != nil {
+	if err := mB.disconnectPipe(streamID, pipeID, "node-a"); err != nil {
 		t.Fatalf("DisconnectPipe failed: %v", err)
 	}
 	mA.UnregisterProducer(streamID)
@@ -335,7 +335,7 @@ func TestManager_PipeProducerStateMismatch(t *testing.T) {
 	defer mB.Close()
 
 	streamID := testPublish(t, mA)
-	pipeID, err := mB.ConnectPipe(streamID, "node-a")
+	pipeID, err := mB.connectPipe(streamID, "node-a")
 	if err != nil {
 		t.Fatalf("ConnectPipe failed: %v", err)
 	}
@@ -352,7 +352,7 @@ func TestManager_PipeProducerStateMismatch(t *testing.T) {
 		t.Fatalf("expected mismatch error")
 	}
 
-	if err := mB.DisconnectPipe(streamID, pipeID, "node-a"); err != nil {
+	if err := mB.disconnectPipe(streamID, pipeID, "node-a"); err != nil {
 		t.Fatalf("DisconnectPipe failed: %v", err)
 	}
 	mA.UnregisterProducer(streamID)
@@ -375,7 +375,7 @@ func TestManager_PublishDataPipeBetweenManagers(t *testing.T) {
 	defer mB.Close()
 
 	streamID := testPublishData(t, mA)
-	pipeID, err := mB.ConnectPipe(streamID, "node-a")
+	pipeID, err := mB.connectPipe(streamID, "node-a")
 	if err != nil {
 		t.Fatalf("ConnectPipe failed: %v", err)
 	}
@@ -406,7 +406,7 @@ func TestManager_PublishDataPipeBetweenManagers(t *testing.T) {
 		t.Fatalf("Resume response error: %s", resp.Error)
 	}
 
-	if err := mB.DisconnectPipe(streamID, pipeID, "node-a"); err != nil {
+	if err := mB.disconnectPipe(streamID, pipeID, "node-a"); err != nil {
 		t.Fatalf("DisconnectPipe failed: %v", err)
 	}
 	mA.UnregisterProducer(streamID)
@@ -429,7 +429,7 @@ func TestManager_HandleClosePipeRequest(t *testing.T) {
 	defer mB.Close()
 
 	streamID := testPublish(t, mA)
-	pipeID, err := mB.ConnectPipe(streamID, "node-a")
+	pipeID, err := mB.connectPipe(streamID, "node-a")
 	if err != nil {
 		t.Fatalf("ConnectPipe failed: %v", err)
 	}
@@ -495,7 +495,7 @@ func TestManager_PipeCleanupSignaling(t *testing.T) {
 	defer mB.Close()
 
 	streamID := testPublish(t, mA)
-	if _, err := mB.ConnectPipe(streamID, "node-a"); err != nil {
+	if _, err := mB.connectPipe(streamID, "node-a"); err != nil {
 		t.Fatalf("ConnectPipe failed: %v", err)
 	}
 
@@ -581,11 +581,11 @@ func TestManager_PipeReuseBetweenManagers(t *testing.T) {
 	defer mB.Close()
 
 	streamID := testPublish(t, mA)
-	pipeID1, err := mB.ConnectPipe(streamID, "node-a")
+	pipeID1, err := mB.connectPipe(streamID, "node-a")
 	if err != nil {
 		t.Fatalf("ConnectPipe failed: %v", err)
 	}
-	pipeID2, err := mB.ConnectPipe(streamID, "node-a")
+	pipeID2, err := mB.connectPipe(streamID, "node-a")
 	if err != nil {
 		t.Fatalf("ConnectPipe failed: %v", err)
 	}
@@ -598,7 +598,7 @@ func TestManager_PipeReuseBetweenManagers(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("expected one producer, got %d", count)
 	}
-	if err := mB.DisconnectPipe(streamID, pipeID1, "node-a"); err != nil {
+	if err := mB.disconnectPipe(streamID, pipeID1, "node-a"); err != nil {
 		t.Fatalf("DisconnectPipe failed: %v", err)
 	}
 	mA.UnregisterProducer(streamID)
@@ -674,11 +674,11 @@ func TestManager_WorkerCloseCleanup(t *testing.T) {
 	mB := setupManager(t, "node-b", ncB)
 
 	streamID := testPublish(t, mA)
-	if _, err := mB.ConnectPipe(streamID, "node-a"); err != nil {
+	if _, err := mB.connectPipe(streamID, "node-a"); err != nil {
 		t.Fatalf("ConnectPipe failed: %v", err)
 	}
 	dataStreamID := testPublishData(t, mA)
-	if _, err := mB.ConnectPipe(dataStreamID, "node-a"); err != nil {
+	if _, err := mB.connectPipe(dataStreamID, "node-a"); err != nil {
 		t.Fatalf("ConnectPipe failed: %v", err)
 	}
 	waitUntil(t, func() bool {

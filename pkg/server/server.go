@@ -35,7 +35,6 @@ type Server struct {
 
 	rib         *routing.RIB
 	linkDB      *routing.LinkDB
-	fib         *routing.FIB
 	mediaMgr    *media.Manager
 	registry    *discovery.Registry
 	roomManager *rtc.RoomManager
@@ -101,24 +100,17 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	rib := routing.NewRIB(kv, myNode)
 	linkDB := routing.NewLinkDB(myNode)
 	finder := discovery.NewFinder(rib, linkDB, myNode)
-	fib := routing.NewFIB(rib, myNode.ID)
-	n.rib, n.linkDB, n.fib = rib, linkDB, fib
+	n.rib, n.linkDB = rib, linkDB
 
-	mediaMgr := media.NewManager(myNode.ID, nc, cfg.Media.WorkerBin, cfg.Media.WebRtc)
-	mediaMgr.OnStreamClosed = func(streamID types.StreamID) {
-		if err := rib.StopAdvertise(streamID); err != nil {
-			slog.Error("Failed to stop advertise", "stream_id", streamID, "error", err)
-		}
-	}
+	mediaMgr := media.NewManager(myNode.ID, nc, cfg.Media.WorkerBin, cfg.Media.WebRtc,
+		media.WithRIB(rib, finder),
+	)
 	if err := mediaMgr.Start(); err != nil {
 		n.closeDeps()
 		return nil, fmt.Errorf("media manager: %w", err)
 	}
 	n.mediaMgr = mediaMgr
 	linkDB.SetRTTProvider(mediaMgr.ProbeRTT)
-
-	fib.ConnectPipe = mediaMgr.ConnectPipe
-	fib.DisconnectPipe = mediaMgr.DisconnectPipe
 
 	nodeStore, err := store.NewNatsStore(context.Background(), js, discovery.NodeBucketName, discovery.NodeTTL)
 	if err != nil {
@@ -167,9 +159,6 @@ func NewServer(cfg *config.Config) (*Server, error) {
 
 	roomManager := rtc.NewRoomManager(rtc.RoomManagerParams{
 		Config:       cfg.Room,
-		RIB:          rib,
-		FIB:          fib,
-		Finder:       finder,
 		MediaManager: mediaMgr,
 		KV:           roomKV,
 		LeaseKV:      roomLeaseKV,
@@ -191,8 +180,6 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		Routers:       mediaMgr.Routers(),
 		WebRtcServers: mediaMgr.WebRtcServers(),
 		MediaManager:  mediaMgr,
-		RIB:           rib,
-		FIB:           fib,
 		WHIPKV:        whipKV,
 	})
 	n.httpAPI = httpAPI
@@ -223,17 +210,13 @@ func (n *Server) ForwardRequestBackupCodec(publisherSid, trackSid, publisherNode
 }
 
 func (n *Server) closeDeps() {
+	// Shut down in reverse dependency order: consumers of the routing/media
+	// layer first, then the data layers, then registry, then NATS. This in
+	// particular guarantees mediaMgr.Close() can still reach the RIB to
+	// un-advertise residual producers.
 	if n.rpcSub != nil {
 		_ = n.rpcSub.Unsubscribe()
 		n.rpcSub = nil
-	}
-	if n.fib != nil {
-		n.fib.Close()
-		n.fib = nil
-	}
-	if n.rib != nil {
-		n.rib.Close()
-		n.rib = nil
 	}
 	if n.roomManager != nil {
 		n.roomManager.Close()
@@ -242,6 +225,10 @@ func (n *Server) closeDeps() {
 	if n.mediaMgr != nil {
 		n.mediaMgr.Close()
 		n.mediaMgr = nil
+	}
+	if n.rib != nil {
+		n.rib.Close()
+		n.rib = nil
 	}
 	if n.registry != nil {
 		n.registry.Close()

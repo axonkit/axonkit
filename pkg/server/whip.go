@@ -12,7 +12,6 @@ import (
 
 	"github.com/axonkit/axonkit/pkg/auth"
 	"github.com/axonkit/axonkit/pkg/proto"
-	"github.com/axonkit/axonkit/pkg/routing"
 	"github.com/axonkit/axonkit/pkg/rtc"
 	"github.com/axonkit/axonkit/pkg/rtc/whip"
 	"github.com/axonkit/axonkit/pkg/types"
@@ -368,17 +367,17 @@ func (s *HTTPServer) handleWHEPPostByParticipant(w http.ResponseWriter, r *http.
 
 // producersForStandaloneResource resolves a WHIP resourceId to live
 // mediasoup Producers on THIS node. If the publisher lives on another node
-// we consult the WHIP_RESOURCES KV to find its StreamIDs and pipe them in
-// via FIB before returning.
+// we consult the WHIP_RESOURCES KV to find its StreamIDs and ask the media
+// manager to pipe them in before returning.
 func (s *HTTPServer) producersForStandaloneResource(resourceID string) ([]*mediasoup.Producer, error) {
 	// Fast path: local registry has the publisher.
 	if local := s.whipSvc.Sources.ProducersForResource(resourceID); len(local) > 0 {
 		return local, nil
 	}
 
-	// Cross-node path: consult KV + FIB. If either piece is not wired
-	// (tests), treat as "not found".
-	if s.whipResources == nil || s.fib == nil || s.mediaMgr == nil {
+	// Cross-node path: consult KV + media manager. If either piece is not
+	// wired (tests), treat as "not found".
+	if s.whipResources == nil || s.mediaMgr == nil {
 		return nil, fmt.Errorf("whip resource %q not hosted on this node", resourceID)
 	}
 
@@ -394,18 +393,14 @@ func (s *HTTPServer) producersForStandaloneResource(resourceID string) ([]*media
 		return nil, fmt.Errorf("whip resource %q locally absent despite KV record", resourceID)
 	}
 
-	findPath := s.roomManager.FindPath
 	out := make([]*mediasoup.Producer, 0, len(rec.StreamIDs))
 	for _, raw := range rec.StreamIDs {
 		streamID := types.StreamID(raw)
-		if lp := s.mediaMgr.GetLocalProducer(streamID); lp != nil && lp.Producer != nil {
-			out = append(out, lp.Producer)
-			continue
-		}
-		if _, _, err := s.fib.Subscribe(streamID, findPath); err != nil {
+		lp, err := s.mediaMgr.EnsureProducer(streamID)
+		if err != nil {
 			return nil, fmt.Errorf("pipe %s: %w", streamID, err)
 		}
-		if lp := s.mediaMgr.GetLocalProducer(streamID); lp != nil && lp.Producer != nil {
+		if lp != nil && lp.Producer != nil {
 			out = append(out, lp.Producer)
 		}
 	}
@@ -495,10 +490,11 @@ func (s *HTTPServer) installResourceTeardown(sess *whip.Session, resourceID stri
 }
 
 // advertiseStandaloneSession registers every producer from a WHIP standalone
-// session in the node's mediaMgr and RIB so remote nodes can discover &
-// pipe the stream on demand. Teardown is wired through Session.OnClose.
+// session in the node's media manager. RegisterProducer also advertises the
+// stream via RIB so remote nodes can discover and pipe it on demand.
+// Teardown is wired through Session.OnClose.
 func (s *HTTPServer) advertiseStandaloneSession(sess *whip.Session, streamIDs []types.StreamID) {
-	if sess == nil || s.mediaMgr == nil || s.rib == nil {
+	if sess == nil || s.mediaMgr == nil {
 		return
 	}
 	for i, sid := range streamIDs {
@@ -506,20 +502,11 @@ func (s *HTTPServer) advertiseStandaloneSession(sess *whip.Session, streamIDs []
 			break
 		}
 		s.mediaMgr.RegisterProducer(sid, sess.Producers[i])
-		if err := s.rib.StartAdvertise(routing.AdvertiseOptions{
-			StreamID: sid,
-			IsOrigin: true,
-		}); err != nil {
-			slog.Warn("WHIP RIB advertise failed", "err", err, "stream_id", sid)
-		}
 	}
 
 	prev := sess.OnClose
 	sess.OnClose = func() {
 		for _, sid := range streamIDs {
-			if err := s.rib.StopAdvertise(sid); err != nil {
-				slog.Warn("WHIP RIB unadvertise failed", "err", err, "stream_id", sid)
-			}
 			s.mediaMgr.UnregisterProducer(sid)
 		}
 		if prev != nil {

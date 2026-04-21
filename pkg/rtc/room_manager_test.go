@@ -8,12 +8,24 @@ import (
 	"time"
 
 	"github.com/axonkit/axonkit/pkg/config"
+	"github.com/axonkit/axonkit/pkg/discovery"
 	"github.com/axonkit/axonkit/pkg/media"
 	"github.com/axonkit/axonkit/pkg/proto"
 	"github.com/axonkit/axonkit/pkg/routing"
 	"github.com/axonkit/axonkit/pkg/store"
 	"github.com/axonkit/axonkit/pkg/types"
 )
+
+// testMediaWithRouting returns a Manager wired with RIB + Finder for the
+// given node. The LinkDB is throw-away — tests don't exercise RTT-based path
+// selection, they just need a non-nil finder so EnsureProducer paths are
+// reachable.
+func testMediaWithRouting(t *testing.T, nodeInfo types.NodeInfo, rib *routing.RIB) *media.Manager {
+	t.Helper()
+	finder := discovery.NewFinder(rib, routing.NewLinkDB(nodeInfo), nodeInfo)
+	return media.NewManager(nodeInfo.ID, nil, "", config.WebRtcConfig{},
+		media.WithRIB(rib, finder))
+}
 
 func defaultRMConfig() config.RoomConfig {
 	return config.RoomConfig{
@@ -173,7 +185,7 @@ func TestRoomManager_CascadeEnsureStream_LocalSkip(t *testing.T) {
 
 	room := rm.GetOrCreateRoom("test-room", 0, "")
 	// EnsureStream with no mediaMgr/fib should be no-op
-	if err := room.cascade.EnsureStream("rt-xxx.pr-yyy"); err != nil {
+	if _, err := room.cascade.EnsureStream("rt-xxx.pr-yyy"); err != nil {
 		t.Fatalf("expected no error for nil deps, got %v", err)
 	}
 }
@@ -195,11 +207,10 @@ func TestRoomManager_CascadeCallbacks_WithRIBAndMedia(t *testing.T) {
 	rib := routing.NewRIB(ms, nodeInfo)
 	defer rib.Close()
 
-	mediaMgr := media.NewManager(nodeInfo.ID, nil, "", config.WebRtcConfig{})
+	mediaMgr := testMediaWithRouting(t, nodeInfo, rib)
 
 	rm := NewRoomManager(RoomManagerParams{
 		Config:       defaultRMConfig(),
-		RIB:          rib,
 		MediaManager: mediaMgr,
 		KV:           store.NewMemoryStore(0),
 		LeaseKV:      store.NewMemoryStore(0),
@@ -213,7 +224,7 @@ func TestRoomManager_CascadeCallbacks_WithRIBAndMedia(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	streamID := types.StreamID("rt-aaa.pr-bbb")
-	if mediaMgr.GetLocalProducer(streamID) == nil {
+	if mediaMgr.GetProducer(streamID) == nil {
 		t.Fatal("expected local producer registered")
 	}
 
@@ -221,7 +232,7 @@ func TestRoomManager_CascadeCallbacks_WithRIBAndMedia(t *testing.T) {
 	room.cascade.OnTrackUnpublished("rt-aaa.pr-bbb")
 	time.Sleep(100 * time.Millisecond)
 
-	if mediaMgr.GetLocalProducer(streamID) != nil {
+	if mediaMgr.GetProducer(streamID) != nil {
 		t.Fatal("expected local producer unregistered")
 	}
 
@@ -230,7 +241,7 @@ func TestRoomManager_CascadeCallbacks_WithRIBAndMedia(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	dStreamID := types.StreamID("rt-aaa.dp-ccc")
-	if mediaMgr.GetLocalProducer(dStreamID) == nil {
+	if mediaMgr.GetProducer(dStreamID) == nil {
 		t.Fatal("expected data producer registered")
 	}
 
@@ -246,14 +257,10 @@ func TestRoomManager_CascadeEnsureStream_WithLocalProducer(t *testing.T) {
 	rib := routing.NewRIB(ms, nodeInfo)
 	defer rib.Close()
 
-	mediaMgr := media.NewManager(nodeInfo.ID, nil, "", config.WebRtcConfig{})
-	fib := routing.NewFIB(rib, nodeInfo.ID)
-	defer fib.Close()
+	mediaMgr := testMediaWithRouting(t, nodeInfo, rib)
 
 	rm := NewRoomManager(RoomManagerParams{
 		Config:       defaultRMConfig(),
-		RIB:          rib,
-		FIB:          fib,
 		MediaManager: mediaMgr,
 		KV:           store.NewMemoryStore(0),
 		LeaseKV:      store.NewMemoryStore(0),
@@ -267,7 +274,7 @@ func TestRoomManager_CascadeEnsureStream_WithLocalProducer(t *testing.T) {
 	mediaMgr.RegisterProducer(streamID, nil)
 
 	// EnsureStream should skip FIB because producer is local
-	if err := room.cascade.EnsureStream(string(streamID)); err != nil {
+	if _, err := room.cascade.EnsureStream(string(streamID)); err != nil {
 		t.Fatalf("expected no error for local producer, got %v", err)
 	}
 }
@@ -280,14 +287,10 @@ func TestRoomManager_CascadeReleaseStream_WithLocalProducer(t *testing.T) {
 	rib := routing.NewRIB(ms, nodeInfo)
 	defer rib.Close()
 
-	mediaMgr := media.NewManager(nodeInfo.ID, nil, "", config.WebRtcConfig{})
-	fib := routing.NewFIB(rib, nodeInfo.ID)
-	defer fib.Close()
+	mediaMgr := testMediaWithRouting(t, nodeInfo, rib)
 
 	rm := NewRoomManager(RoomManagerParams{
 		Config:       defaultRMConfig(),
-		RIB:          rib,
-		FIB:          fib,
 		MediaManager: mediaMgr,
 		KV:           store.NewMemoryStore(0),
 		LeaseKV:      store.NewMemoryStore(0),

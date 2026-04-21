@@ -26,7 +26,6 @@ type axonkitNode struct {
 	MediaMgr *media.Manager
 	RIB      *routing.RIB
 	FIB      *routing.FIB
-	Finder   *discovery.Finder
 	RoomMgr  *rtc.RoomManager
 	LinkDB   *routing.LinkDB
 	Conn     *nats.Conn
@@ -36,11 +35,12 @@ func (n *axonkitNode) Close() {
 	if n.RoomMgr != nil {
 		n.RoomMgr.Close()
 	}
-	n.FIB.Close()
-	n.RIB.Close()
+	// MediaMgr.Close() tears down the internal FIB; the RIB is owned by
+	// this test harness and must be closed separately.
 	if n.MediaMgr != nil {
 		n.MediaMgr.Close()
 	}
+	n.RIB.Close()
 	n.Conn.Close()
 }
 
@@ -92,16 +92,15 @@ func createAxonkitNode(t *testing.T, srv interface{ ClientURL() string }, nodeID
 	rib := routing.NewRIB(kv, nodeInfo)
 	linkDB := routing.NewLinkDB(nodeInfo)
 	finder := discovery.NewFinder(rib, linkDB, nodeInfo)
-	fib := routing.NewFIB(rib, nodeInfo.ID)
 
 	webRtcCfg := config.WebRtcConfig{ListenIP: "127.0.0.1"}
-	mgr := media.NewManager(nodeInfo.ID, nc, workerBin, webRtcCfg, media.WithWorkerCount(1))
+	mgr := media.NewManager(nodeInfo.ID, nc, workerBin, webRtcCfg,
+		media.WithWorkerCount(1),
+		media.WithRIB(rib, finder),
+	)
 	if err := mgr.Start(); err != nil {
 		t.Fatalf("MediaManager start failed for %s: %v", nodeID, err)
 	}
-
-	fib.ConnectPipe = mgr.ConnectPipe
-	fib.DisconnectPipe = mgr.DisconnectPipe
 
 	roomKV, err := store.NewNatsStore(context.Background(), js, "ROOM_STATE", 0)
 	if err != nil {
@@ -120,9 +119,6 @@ func createAxonkitNode(t *testing.T, srv interface{ ClientURL() string }, nodeID
 			AutoSubscribe:    true,
 			Dynacast:         true,
 		},
-		RIB:          rib,
-		FIB:          fib,
-		Finder:       finder,
 		MediaManager: mgr,
 		KV:           roomKV,
 		LeaseKV:      roomLeaseKV,
@@ -134,8 +130,7 @@ func createAxonkitNode(t *testing.T, srv interface{ ClientURL() string }, nodeID
 		Info:     nodeInfo,
 		MediaMgr: mgr,
 		RIB:      rib,
-		FIB:      fib,
-		Finder:   finder,
+		FIB:      mgr.FIB(),
 		RoomMgr:  roomMgr,
 		LinkDB:   linkDB,
 		Conn:     nc,
@@ -171,15 +166,9 @@ func publishTrackOnNode(t *testing.T, node *axonkitNode) types.StreamID {
 	}
 
 	streamID := types.NewStreamID(router.Id(), producer.Id())
+	// RegisterProducer also advertises via RIB when the MediaManager was
+	// constructed with media.WithRIB(...).
 	node.MediaMgr.RegisterProducer(streamID, producer)
-
-	if err := node.RIB.StartAdvertise(routing.AdvertiseOptions{
-		StreamID: streamID,
-		IsOrigin: true,
-	}); err != nil {
-		t.Fatalf("StartAdvertise failed: %v", err)
-	}
-
 	return streamID
 }
 
@@ -259,11 +248,11 @@ func TestCrossNodeSubscribe(t *testing.T) {
 
 	// --- Step 3: Verify pipe producer exists on NodeB ---
 	waitFor(t, func() bool {
-		return nodeB.MediaMgr.GetLocalProducer(streamID) != nil
+		return nodeB.MediaMgr.GetProducer(streamID) != nil
 	}, 5*time.Second)
 	t.Log("Pipe producer available on NodeB")
 
-	lpB := nodeB.MediaMgr.GetLocalProducer(streamID)
+	lpB := nodeB.MediaMgr.GetProducer(streamID)
 	if lpB == nil {
 		t.Fatal("expected pipe producer on NodeB")
 	}
@@ -325,14 +314,9 @@ func TestCrossNodeDataStream(t *testing.T) {
 	}
 
 	streamID := types.NewStreamID(router.Id(), dp.Id())
+	// RegisterDataProducer also advertises via RIB when the MediaManager was
+	// constructed with media.WithRIB(...).
 	nodeA.MediaMgr.RegisterDataProducer(streamID, dp)
-
-	if err := nodeA.RIB.StartAdvertise(routing.AdvertiseOptions{
-		StreamID: streamID,
-		IsOrigin: true,
-	}); err != nil {
-		t.Fatalf("Advertise data stream failed: %v", err)
-	}
 
 	waitFor(t, func() bool {
 		candidates, _ := nodeB.RIB.GetCandidates(streamID)
@@ -345,10 +329,10 @@ func TestCrossNodeDataStream(t *testing.T) {
 	}
 
 	waitFor(t, func() bool {
-		return nodeB.MediaMgr.GetLocalProducer(streamID) != nil
+		return nodeB.MediaMgr.GetProducer(streamID) != nil
 	}, 5*time.Second)
 
-	lpB := nodeB.MediaMgr.GetLocalProducer(streamID)
+	lpB := nodeB.MediaMgr.GetProducer(streamID)
 	if lpB == nil || lpB.Id() == "" {
 		t.Fatal("expected data pipe producer on NodeB")
 	}

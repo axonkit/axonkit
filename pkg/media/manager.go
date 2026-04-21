@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/axonkit/axonkit/pkg/config"
+	"github.com/axonkit/axonkit/pkg/discovery"
+	"github.com/axonkit/axonkit/pkg/routing"
 	"github.com/axonkit/axonkit/pkg/types"
 
 	"github.com/jiyeyuran/mediasoup-go/v2"
@@ -63,6 +65,14 @@ type Manager struct {
 	pingChannels map[types.NodeID]*PingChannel
 	pingMu       sync.Mutex
 
+	// Routing (optional; only wired in production). When nil, Register/
+	// Unregister skip advertise and EnsureProducer falls back to single-node
+	// behaviour. FIB is constructed internally when rib is provided; the
+	// finder supplied via WithRIB drives FIB.Subscribe for remote streams.
+	rib    *routing.RIB
+	fib    *routing.FIB
+	finder *discovery.Finder
+
 	closed atomic.Bool
 
 	OnStreamClosed func(streamID types.StreamID)
@@ -73,6 +83,18 @@ type ManagerOption func(*Manager)
 func WithWorkerCount(count int) ManagerOption {
 	return func(m *Manager) {
 		m.workerCount = count
+	}
+}
+
+// WithRIB wires the routing layer into the Manager. Both rib and finder must
+// be supplied together: rib powers producer advertise/unadvertise and backs
+// the internal FIB, while finder resolves the best upstream node for remote
+// streams during EnsureProducer. Without this option the Manager operates in
+// single-node mode and EnsureProducer errors for any non-local stream.
+func WithRIB(rib *routing.RIB, finder *discovery.Finder) ManagerOption {
+	return func(m *Manager) {
+		m.rib = rib
+		m.finder = finder
 	}
 }
 
@@ -133,6 +155,9 @@ func (lp *LocalProducer) Id() string {
 	return ""
 }
 
+// NewManager constructs a Manager for the given local node. Pass WithRIB to
+// enable cross-node streaming; without it the Manager operates in single-node
+// mode.
 func NewManager(nodeID types.NodeID, nc *nats.Conn, workerBin string, webRtcCfg config.WebRtcConfig, opts ...ManagerOption) *Manager {
 	m := &Manager{
 		nodeID:               nodeID,
@@ -150,8 +175,18 @@ func NewManager(nodeID types.NodeID, nc *nats.Conn, workerBin string, webRtcCfg 
 	for _, opt := range opts {
 		opt(m)
 	}
+	if m.rib != nil {
+		m.fib = routing.NewFIB(m.rib, m.nodeID)
+		m.fib.ConnectPipe = m.connectPipe
+		m.fib.DisconnectPipe = m.disconnectPipe
+	}
 	return m
 }
+
+// FIB returns the internal FIB, or nil if the Manager was constructed without
+// a RIB. Callers must not mutate ConnectPipe/DisconnectPipe on the returned
+// FIB — those are owned by the Manager.
+func (m *Manager) FIB() *routing.FIB { return m.fib }
 
 // Routers returns the mediasoup routers managed by this Manager.
 func (m *Manager) Routers() []*mediasoup.Router {
@@ -177,7 +212,9 @@ func (m *Manager) WebRtcServers() []*mediasoup.WebRtcServer {
 }
 
 // RegisterProducer registers a local producer (from a participant) so the
-// pipe system can find it when a remote node requests the stream.
+// pipe system can find it when a remote node requests the stream. When the
+// Manager was constructed with a RIB the stream is also advertised as an
+// origin route so remote nodes can discover it.
 func (m *Manager) RegisterProducer(streamID types.StreamID, producer *mediasoup.Producer) {
 	m.producersMu.Lock()
 	m.producers[streamID] = &LocalProducer{
@@ -186,11 +223,13 @@ func (m *Manager) RegisterProducer(streamID types.StreamID, producer *mediasoup.
 		Router:   m.RouterForId(streamID.RouterID()),
 	}
 	m.producersMu.Unlock()
+	m.advertiseOrigin(streamID)
 	m.logger.Info("Producer registered", "streamId", streamID)
 }
 
-// RegisterDataProducer registers a local data producer (from a participant) so the
-// pipe system can find it when a remote node requests the stream.
+// RegisterDataProducer registers a local data producer (from a participant) so
+// the pipe system can find it when a remote node requests the stream. Behaves
+// like RegisterProducer with respect to origin advertisement.
 func (m *Manager) RegisterDataProducer(streamID types.StreamID, dataProducer *mediasoup.DataProducer) {
 	m.producersMu.Lock()
 	m.producers[streamID] = &LocalProducer{
@@ -199,15 +238,19 @@ func (m *Manager) RegisterDataProducer(streamID types.StreamID, dataProducer *me
 		Router:       m.RouterForId(streamID.RouterID()),
 	}
 	m.producersMu.Unlock()
+	m.advertiseOrigin(streamID)
 	m.logger.Info("Data producer registered", "streamId", streamID)
 }
 
 // UnregisterProducer removes a producer and cleans up any downstream pipe
-// consumers that were serving the stream to remote nodes.
+// consumers that were serving the stream to remote nodes. Also stops the
+// origin advertisement when the Manager owns a RIB.
 func (m *Manager) UnregisterProducer(streamID types.StreamID) {
 	m.producersMu.Lock()
 	delete(m.producers, streamID)
 	m.producersMu.Unlock()
+
+	m.unadvertise(streamID)
 
 	m.servingMu.Lock()
 	for id, info := range m.servingConsumers {
@@ -230,12 +273,73 @@ func (m *Manager) UnregisterProducer(streamID types.StreamID) {
 	m.logger.Info("Producer unregistered", "streamId", streamID)
 }
 
-// GetLocalProducer looks up a producer by StreamID. It returns piped producers
-// (from ConnectPipe) as well as locally registered participant producers.
-func (m *Manager) GetLocalProducer(streamID types.StreamID) *LocalProducer {
+// GetProducer returns the local or already-piped producer for streamID, or nil
+// if the stream has not been materialized on this node. It is a non-blocking
+// lookup — use EnsureProducer when a remote pipe may need to be established.
+func (m *Manager) GetProducer(streamID types.StreamID) *LocalProducer {
 	m.producersMu.RLock()
 	defer m.producersMu.RUnlock()
 	return m.producers[streamID]
+}
+
+// EnsureProducer returns the local or piped producer for streamID. If the
+// stream is remote it triggers a FIB subscribe (increments the pipe refcount
+// and connects the pipe transport on demand) before returning. Every
+// successful call must be balanced by ReleaseProducer when the consumer no
+// longer needs the stream.
+//
+// Requires WithRIB+WithLinkDB at construction time; otherwise returns an
+// error for remote streams.
+func (m *Manager) EnsureProducer(streamID types.StreamID) (*LocalProducer, error) {
+	if lp := m.GetProducer(streamID); lp != nil {
+		return lp, nil
+	}
+	if m.fib == nil {
+		return nil, fmt.Errorf("media manager has no FIB configured; cannot pipe %s", streamID)
+	}
+	if m.finder == nil {
+		return nil, fmt.Errorf("media manager has no Finder configured (need WithLinkDB); cannot pipe %s", streamID)
+	}
+	if _, _, err := m.fib.Subscribe(streamID, m.finder.FindPath); err != nil {
+		return nil, err
+	}
+	return m.GetProducer(streamID), nil
+}
+
+// ReleaseProducer decrements the FIB refcount for a piped stream. It is a
+// no-op for locally originated producers (they are released via
+// UnregisterProducer) and when no FIB is configured.
+func (m *Manager) ReleaseProducer(streamID types.StreamID) {
+	if m.fib == nil {
+		return
+	}
+	if lp := m.GetProducer(streamID); lp != nil && lp.UpstreamNode == "" {
+		// Local origin — Unsubscribe would be a no-op but for clarity we
+		// skip rather than pass it through.
+		return
+	}
+	m.fib.Unsubscribe(streamID)
+}
+
+func (m *Manager) advertiseOrigin(streamID types.StreamID) {
+	if m.rib == nil {
+		return
+	}
+	if err := m.rib.StartAdvertise(routing.AdvertiseOptions{
+		StreamID: streamID,
+		IsOrigin: true,
+	}); err != nil {
+		m.logger.Error("Failed to advertise stream", "stream_id", streamID, "error", err)
+	}
+}
+
+func (m *Manager) unadvertise(streamID types.StreamID) {
+	if m.rib == nil {
+		return
+	}
+	if err := m.rib.StopAdvertise(streamID); err != nil {
+		m.logger.Error("Failed to stop advertise", "stream_id", streamID, "error", err)
+	}
 }
 
 func (m *Manager) Start() error {
@@ -270,7 +374,12 @@ func (m *Manager) Close() {
 	}
 	m.logger.Info("Closing Media Manager...")
 
-	// 1. Cleanup all streams (Unadvertise)
+	// Tear down FIB first so that outstanding pipe/refcount state releases
+	// before we close the underlying workers.
+	if m.fib != nil {
+		m.fib.Close()
+	}
+
 	m.producersMu.Lock()
 	streamIDs := make([]types.StreamID, 0, len(m.producers))
 	for streamID := range m.producers {
@@ -279,6 +388,7 @@ func (m *Manager) Close() {
 	m.producersMu.Unlock()
 
 	for _, streamID := range streamIDs {
+		m.unadvertise(streamID)
 		if m.OnStreamClosed != nil {
 			m.OnStreamClosed(streamID)
 		}
@@ -376,8 +486,11 @@ func (m *Manager) restartWorker(index int) {
 	}
 }
 
-// ConnectPipe (FIB Callback)
-func (m *Manager) ConnectPipe(streamID types.StreamID, upstreamNode types.NodeID) (string, error) {
+// connectPipe is the FIB ConnectPipe callback. It either returns an existing
+// local producer ID (when the stream is already hosted on this node) or
+// establishes a pipe transport with the upstream node and produces a local
+// "pipe" producer forwarding the media.
+func (m *Manager) connectPipe(streamID types.StreamID, upstreamNode types.NodeID) (string, error) {
 	// Optimization: If upstream is local
 	if upstreamNode == m.nodeID {
 		m.producersMu.RLock()
@@ -1203,15 +1316,17 @@ func (m *Manager) handleSignaling(msg *nats.Msg) {
 	msg.Respond(data)
 }
 
-func (m *Manager) DisconnectPipe(streamID types.StreamID, pipeID string, upstreamNode types.NodeID) error {
+// disconnectPipe is the FIB DisconnectPipe callback. It closes the local
+// pipe producer for streamID (so the pipe transport is freed) when the FIB
+// entry is being torn down.
+func (m *Manager) disconnectPipe(streamID types.StreamID, pipeID string, upstreamNode types.NodeID) error {
 	m.producersMu.Lock()
 	defer m.producersMu.Unlock()
 
 	lp, ok := m.producers[streamID]
 	if ok {
-		// Verify ID matches to avoid deleting wrong producer
 		if lp.UpstreamConsumerId != pipeID {
-			m.logger.Warn("DisconnectPipe mismatch, skipping", "stream_id", streamID, "expected", pipeID, "found", lp.UpstreamConsumerId)
+			m.logger.Warn("disconnectPipe mismatch, skipping", "stream_id", streamID, "expected", pipeID, "found", lp.UpstreamConsumerId)
 			return nil
 		}
 
@@ -1232,18 +1347,23 @@ func (m *Manager) DisconnectPipe(streamID types.StreamID, pipeID string, upstrea
 func (m *Manager) cleanupWorkerResources(deadRouterID string) {
 	m.logger.Info("Cleaning up worker resources", "router_id", deadRouterID)
 
-	// 1. Clean Producers
 	m.producersMu.Lock()
+	affectedStreams := make([]types.StreamID, 0)
 	for streamID, lp := range m.producers {
 		if lp.Router.Id() == deadRouterID {
 			delete(m.producers, streamID)
-			if m.OnStreamClosed != nil {
-				go m.OnStreamClosed(streamID)
-			}
+			affectedStreams = append(affectedStreams, streamID)
 			m.logger.Info("Cleaned up producer", "stream_id", streamID)
 		}
 	}
 	m.producersMu.Unlock()
+
+	for _, streamID := range affectedStreams {
+		m.unadvertise(streamID)
+		if m.OnStreamClosed != nil {
+			go m.OnStreamClosed(streamID)
+		}
+	}
 
 	// 2. Clean Pipe Transports
 	m.pipeMu.Lock()

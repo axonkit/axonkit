@@ -13,7 +13,6 @@ import (
 	"github.com/axonkit/axonkit/pkg/config"
 	"github.com/axonkit/axonkit/pkg/media"
 	"github.com/axonkit/axonkit/pkg/proto"
-	"github.com/axonkit/axonkit/pkg/routing"
 	"github.com/axonkit/axonkit/pkg/rtc"
 	"github.com/axonkit/axonkit/pkg/rtc/whip"
 	"github.com/axonkit/axonkit/pkg/store"
@@ -92,12 +91,10 @@ type HTTPServer struct {
 	routers       []*mediasoup.Router
 	webRtcServers []*mediasoup.WebRtcServer
 
-	// Routing + media manager are used by WHIP standalone to plug new
-	// publishers into the node's FIB/RIB so other nodes can subscribe
-	// via /whep/{resourceId}. They may be nil in lightweight tests.
+	// Media manager is used by WHIP standalone to register new publishers
+	// (which auto-advertises via RIB) so other nodes can subscribe via
+	// /whep/{resourceId}. May be nil in lightweight tests.
 	mediaMgr      *media.Manager
-	rib           *routing.RIB
-	fib           *routing.FIB
 	whipResources *whip.ResourceStore
 
 	whipSvc *whip.Service
@@ -112,8 +109,6 @@ type HTTPServerParams struct {
 	Routers       []*mediasoup.Router
 	WebRtcServers []*mediasoup.WebRtcServer
 	MediaManager  *media.Manager
-	RIB           *routing.RIB
-	FIB           *routing.FIB
 	// WHIPKV is the shared KV bucket used to advertise standalone WHIP
 	// resources across nodes. May be nil in tests.
 	WHIPKV store.Store
@@ -129,8 +124,6 @@ func NewHTTPServer(params HTTPServerParams) *HTTPServer {
 		routers:       params.Routers,
 		webRtcServers: params.WebRtcServers,
 		mediaMgr:      params.MediaManager,
-		rib:           params.RIB,
-		fib:           params.FIB,
 	}
 	if params.WHIPKV != nil {
 		s.whipResources = whip.NewResourceStore(params.WHIPKV)
