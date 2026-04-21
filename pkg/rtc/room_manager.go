@@ -74,6 +74,17 @@ func NewRoomManager(params RoomManagerParams) *RoomManager {
 	}
 }
 
+// FindPath returns the same FIB findPath callback used by the RoomManager's
+// cascade. It is exposed so that other subsystems on this node (e.g. the
+// WHIP/WHEP HTTP handlers that pipe in remote standalone publishers) can
+// drive fib.Subscribe consistently with the Room flow.
+func (rm *RoomManager) FindPath(streamID types.StreamID) (*types.RouteKVValue, error) {
+	if rm.finder == nil {
+		return nil, fmt.Errorf("room manager has no discovery finder")
+	}
+	return rm.finder.FindPath(streamID)
+}
+
 // SetRequestBackupCodec sets the NATS (or in-process) forwarder used when a
 // remote subscriber needs the publisher's node to send SubscribedQualityChanged.
 // Call before any room is created; safe for use from Server wiring only.

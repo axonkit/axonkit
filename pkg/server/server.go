@@ -13,6 +13,7 @@ import (
 	"github.com/axonkit/axonkit/pkg/media"
 	"github.com/axonkit/axonkit/pkg/routing"
 	"github.com/axonkit/axonkit/pkg/rtc"
+	"github.com/axonkit/axonkit/pkg/rtc/whip"
 	"github.com/axonkit/axonkit/pkg/store"
 	"github.com/axonkit/axonkit/pkg/types"
 
@@ -158,6 +159,12 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		return nil, fmt.Errorf("room lease store: %w", err)
 	}
 
+	whipKV, err := store.NewNatsStore(context.Background(), js, whip.ResourceBucketName, whip.ResourceBucketTTL)
+	if err != nil {
+		n.closeDeps()
+		return nil, fmt.Errorf("whip resource store: %w", err)
+	}
+
 	roomManager := rtc.NewRoomManager(rtc.RoomManagerParams{
 		Config:       cfg.Room,
 		RIB:          rib,
@@ -183,6 +190,10 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		NodeRPC:       nodeRPC,
 		Routers:       mediaMgr.Routers(),
 		WebRtcServers: mediaMgr.WebRtcServers(),
+		MediaManager:  mediaMgr,
+		RIB:           rib,
+		FIB:           fib,
+		WHIPKV:        whipKV,
 	})
 	n.httpAPI = httpAPI
 	registerDefaultNodeRPCHandlers(nodeRPC, httpAPI, roomManager)

@@ -11,8 +11,12 @@ import (
 
 	"github.com/axonkit/axonkit/pkg/auth"
 	"github.com/axonkit/axonkit/pkg/config"
+	"github.com/axonkit/axonkit/pkg/media"
 	"github.com/axonkit/axonkit/pkg/proto"
+	"github.com/axonkit/axonkit/pkg/routing"
 	"github.com/axonkit/axonkit/pkg/rtc"
+	"github.com/axonkit/axonkit/pkg/rtc/whip"
+	"github.com/axonkit/axonkit/pkg/store"
 	"github.com/axonkit/axonkit/pkg/types"
 	"github.com/jiyeyuran/mediasoup-go/v2"
 	"github.com/nats-io/nats.go"
@@ -87,6 +91,16 @@ type HTTPServer struct {
 	nodeRPC       *NodeRPCService
 	routers       []*mediasoup.Router
 	webRtcServers []*mediasoup.WebRtcServer
+
+	// Routing + media manager are used by WHIP standalone to plug new
+	// publishers into the node's FIB/RIB so other nodes can subscribe
+	// via /whep/{resourceId}. They may be nil in lightweight tests.
+	mediaMgr      *media.Manager
+	rib           *routing.RIB
+	fib           *routing.FIB
+	whipResources *whip.ResourceStore
+
+	whipSvc *whip.Service
 }
 
 type HTTPServerParams struct {
@@ -97,10 +111,16 @@ type HTTPServerParams struct {
 	NodeRPC       *NodeRPCService
 	Routers       []*mediasoup.Router
 	WebRtcServers []*mediasoup.WebRtcServer
+	MediaManager  *media.Manager
+	RIB           *routing.RIB
+	FIB           *routing.FIB
+	// WHIPKV is the shared KV bucket used to advertise standalone WHIP
+	// resources across nodes. May be nil in tests.
+	WHIPKV store.Store
 }
 
 func NewHTTPServer(params HTTPServerParams) *HTTPServer {
-	return &HTTPServer{
+	s := &HTTPServer{
 		cfg:           params.Config,
 		roomManager:   params.RoomManager,
 		verifier:      params.Verifier,
@@ -108,7 +128,19 @@ func NewHTTPServer(params HTTPServerParams) *HTTPServer {
 		nodeRPC:       params.NodeRPC,
 		routers:       params.Routers,
 		webRtcServers: params.WebRtcServers,
+		mediaMgr:      params.MediaManager,
+		rib:           params.RIB,
+		fib:           params.FIB,
 	}
+	if params.WHIPKV != nil {
+		s.whipResources = whip.NewResourceStore(params.WHIPKV)
+	}
+	s.whipSvc = whip.NewService(
+		&whipTransportFactory{routers: s.routers, webRtcServers: s.webRtcServers},
+		&whipProducerSource{server: s},
+		slog.Default().With("component", "whip.Service"),
+	)
+	return s
 }
 
 func (s *HTTPServer) RegisterRoutes(mux *http.ServeMux) {
@@ -116,6 +148,7 @@ func (s *HTTPServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /rtc/connect", s.handleConnect)
 	mux.HandleFunc("OPTIONS /rtc/join", func(w http.ResponseWriter, r *http.Request) {})
 	mux.HandleFunc("OPTIONS /rtc/connect", func(w http.ResponseWriter, r *http.Request) {})
+	s.registerWHIPRoutes(mux)
 }
 
 func readRequest(r *http.Request, v any) error {

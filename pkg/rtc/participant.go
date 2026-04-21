@@ -863,6 +863,55 @@ func (p *Participant) IsPublisher() bool {
 	return len(p.publishedTracks) > 0 || len(p.dataPublishedTracks) > 0
 }
 
+// LiveProducers returns the mediasoup Producer list for every currently
+// published track on this participant. Used by WHEP in-room to build a
+// consumer set scoped to a single participant without joining the room.
+func (p *Participant) LiveProducers() []*mediasoup.Producer {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]*mediasoup.Producer, 0, len(p.publishedTracks))
+	for _, t := range p.publishedTracks {
+		if t != nil && t.producer != nil {
+			out = append(out, t.producer)
+		}
+	}
+	return out
+}
+
+// LiveTrack is a thin view of one PublishedTrack exposing just the fields
+// external packages need (producer + source). It exists so callers like
+// the WHEP handler can apply source-priority selection (screen_share
+// beats camera) without taking a dependency on the unexported
+// PublishedTrack type.
+type LiveTrack struct {
+	Producer *mediasoup.Producer
+	Source   proto.TrackSource
+	Kind     mediasoup.MediaKind
+	Muted    bool
+}
+
+// LiveTracks returns a snapshot of every currently published track on this
+// participant together with its source metadata (camera, microphone,
+// screenShare, …). Used by WHEP in-room to pick one audio + one video
+// track per participant with a defined priority ordering.
+func (p *Participant) LiveTracks() []LiveTrack {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]LiveTrack, 0, len(p.publishedTracks))
+	for _, t := range p.publishedTracks {
+		if t == nil || t.producer == nil {
+			continue
+		}
+		out = append(out, LiveTrack{
+			Producer: t.producer,
+			Source:   t.source,
+			Kind:     t.kind,
+			Muted:    t.muted,
+		})
+	}
+	return out
+}
+
 func (p *Participant) IsReady() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -1319,6 +1368,55 @@ func (p *Participant) PublishTrack(req *proto.PublishTrackRequest) (*PublishedTr
 	}
 
 	return track, nil
+}
+
+// RegisterWHIPProducer attaches a mediasoup.Producer that was created
+// out-of-band (by a WHIP session) to this participant so that room-side
+// subscription, dynacast, and cleanup work the same as a datachannel-based
+// PublishTrack. The caller chooses the trackSid so that it can key future
+// references (mute/update/unpublish) to the same value.
+//
+// The participant is expected to already own sess.Transport via SetTransports,
+// but we do not re-validate that here so WHIP standalone participants (which
+// have a send transport but no recv transport) can still use this method.
+func (p *Participant) RegisterWHIPProducer(trackSid string, producer *mediasoup.Producer) error {
+	if producer == nil {
+		return fmt.Errorf("nil producer")
+	}
+	if !p.CanPublish() {
+		return fmt.Errorf("no publish permission")
+	}
+	if trackSid == "" {
+		trackSid = string(types.NewStreamID(p.router.Id(), producer.Id()))
+	}
+
+	track := &PublishedTrack{
+		sid:       trackSid,
+		name:      producer.Id(),
+		source:    proto.TrackSource_UNKNOWN,
+		kind:      producer.Kind(),
+		producer:  producer,
+		publisher: p,
+	}
+
+	p.mu.Lock()
+	p.publishedTracks[track.sid] = track
+	p.mu.Unlock()
+
+	producer.OnClose(func(ctx context.Context) {
+		track.stopDebounce()
+		p.mu.Lock()
+		delete(p.publishedTracks, track.sid)
+		p.mu.Unlock()
+	})
+
+	p.logger.Info("WHIP track registered",
+		"trackSid", track.sid, "kind", producer.Kind(), "producerId", producer.Id())
+
+	if p.room != nil {
+		p.room.OnTrackPublished(p, track)
+	}
+	return nil
 }
 
 // PublishBackupTrack creates a secondary producer for the backup codec
