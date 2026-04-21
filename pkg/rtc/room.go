@@ -1337,9 +1337,9 @@ func (r *Room) addAudioProducer(router *mediasoup.Router, producer *mediasoup.Pr
 	observer, exists := r.audioObservers[routerID]
 	if !exists {
 		obs, err := router.CreateAudioLevelObserver(&mediasoup.AudioLevelObserverOptions{
-			MaxEntries: 10,
-			Threshold:  -50,
-			Interval:   800,
+			MaxEntries: 9,
+			Threshold:  -80,
+			Interval:   1000,
 		})
 		if err != nil {
 			r.mu.Unlock()
@@ -1386,7 +1386,10 @@ func (r *Room) handleAudioVolumes(routerID string, volumes []mediasoup.AudioLeve
 	r.mu.Lock()
 	r.perRouterSpeakers[routerID] = volumes
 	newOrder := mergeRouterSpeakers(r.perRouterSpeakers)
-	changed := !slices.Equal(r.recentSpeakers, newOrder)
+	// Only treat the speaker set as changed when producer identities change;
+	// AudioLevelObserver ticks every Interval and reports fresh volume values
+	// for the same speakers, which should not trigger redundant broadcasts.
+	changed := !speakerProducersEqual(r.recentSpeakers, newOrder)
 	r.recentSpeakers = newOrder
 
 	r.mu.Unlock()
@@ -1395,10 +1398,6 @@ func (r *Room) handleAudioVolumes(routerID string, volumes []mediasoup.AudioLeve
 		return
 	}
 
-	volumeMap := make(map[string]float32, len(volumes))
-	for _, e := range volumes {
-		volumeMap[producerParticipantSid(e.Producer)] = float32(e.Volume)
-	}
 	speakers := make([]*proto.SpeakerInfo, 0, len(newOrder))
 	for _, speaker := range newOrder {
 		speakers = append(speakers, &proto.SpeakerInfo{
@@ -1429,7 +1428,7 @@ func (r *Room) handleAudioSilence(routerID string) {
 	r.perRouterSpeakers[routerID] = nil
 
 	newOrder := mergeRouterSpeakers(r.perRouterSpeakers)
-	changed := !slices.Equal(r.recentSpeakers, newOrder)
+	changed := !speakerProducersEqual(r.recentSpeakers, newOrder)
 	r.recentSpeakers = newOrder
 
 	r.mu.Unlock()
@@ -1437,6 +1436,17 @@ func (r *Room) handleAudioSilence(routerID string) {
 	if !changed {
 		return
 	}
+	speakers := make([]*proto.SpeakerInfo, 0, len(newOrder))
+	for _, speaker := range newOrder {
+		speakers = append(speakers, &proto.SpeakerInfo{
+			ParticipantSid: producerParticipantSid(speaker.Producer),
+			Volume:         speaker.Volume,
+			Active:         true,
+		})
+	}
+	r.BroadcastNotification(proto.MethodActiveSpeakersChanged, &proto.ActiveSpeakersNotification{
+		Speakers: speakers,
+	}, "")
 
 	r.updateLastNSubscriptions()
 }
@@ -1454,6 +1464,22 @@ func mergeRouterSpeakers(perRouter map[string][]mediasoup.AudioLevelObserverVolu
 	})
 
 	return volumes
+}
+
+// speakerProducersEqual reports whether two speaker lists describe the same
+// set of producers in the same order. Volume fluctuations between ticks are
+// intentionally ignored so that activeSpeakers.changed only fires when the
+// actual speaker set changes.
+func speakerProducersEqual(a, b []mediasoup.AudioLevelObserverVolume) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Producer.Id() != b[i].Producer.Id() {
+			return false
+		}
+	}
+	return true
 }
 
 // updateLastNSubscriptions re-evaluates which publishers are active for all
