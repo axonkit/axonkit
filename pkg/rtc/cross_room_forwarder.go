@@ -171,13 +171,6 @@ func (f *CrossRoomForwarder) Start(ctx context.Context) error {
 // suppresses late events that race with teardown and would otherwise
 // touch a shutting-down KV.
 func (f *CrossRoomForwarder) publishForwardedParticipant(src *proto.ParticipantInfo) {
-	f.mu.Lock()
-	if f.closed {
-		f.mu.Unlock()
-		return
-	}
-	f.mu.Unlock()
-
 	mirror := cloneParticipantInfo(src)
 	mirror.Tracks = nil
 	mirror.DataTracks = nil
@@ -190,6 +183,17 @@ func (f *CrossRoomForwarder) publishForwardedParticipant(src *proto.ParticipantI
 		mirror.Attributes = maps.Clone(mirror.Attributes)
 	}
 	mirror.Attributes[ForwardedFromRoomAttr] = f.srcRoom
+
+	// Hold the lock across the store write so Close cannot race in
+	// between the closed-check and PutParticipant. Once Close flips
+	// closed=true any in-flight writes drain first, and subsequent
+	// writes (from queued watcher events) observe closed and return
+	// early — preventing writes against a Close()'d backing store.
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return
+	}
 	f.dstStore.PutParticipant(mirror)
 }
 
@@ -198,25 +202,25 @@ func (f *CrossRoomForwarder) publishForwardedParticipant(src *proto.ParticipantI
 // participant (which we mirror under the same Sid in dstStore), no
 // rewriting is needed.
 func (f *CrossRoomForwarder) mirrorTrack(info *proto.TrackInfo) {
+	clone := cloneTrackInfo(info)
 	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.closed {
-		f.mu.Unlock()
 		return
 	}
 	f.mirroredTracks[info.Sid] = struct{}{}
-	f.mu.Unlock()
-	f.dstStore.PutTrack(cloneTrackInfo(info))
+	f.dstStore.PutTrack(clone)
 }
 
 func (f *CrossRoomForwarder) mirrorDataTrack(info *proto.DataTrackInfo) {
+	clone := cloneDataTrackInfo(info)
 	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.closed {
-		f.mu.Unlock()
 		return
 	}
 	f.mirroredData[info.Sid] = struct{}{}
-	f.mu.Unlock()
-	f.dstStore.PutDataTrack(cloneDataTrackInfo(info))
+	f.dstStore.PutDataTrack(clone)
 }
 
 // runSrc mirrors state from the source room into the destination room.
@@ -296,14 +300,14 @@ func (f *CrossRoomForwarder) handleTrackEvent(evt *RoomStoreEvent) {
 		f.mirrorTrack(evt.Track)
 	case store.OpDelete:
 		f.mu.Lock()
-		_, ok := f.mirroredTracks[trackSid]
-		if ok {
-			delete(f.mirroredTracks, trackSid)
-		}
-		f.mu.Unlock()
-		if !ok {
+		defer f.mu.Unlock()
+		if f.closed {
 			return
 		}
+		if _, ok := f.mirroredTracks[trackSid]; !ok {
+			return
+		}
+		delete(f.mirroredTracks, trackSid)
 		f.dstStore.DeleteTrack(trackSid)
 	}
 }
@@ -318,14 +322,14 @@ func (f *CrossRoomForwarder) handleDataTrackEvent(evt *RoomStoreEvent) {
 		f.mirrorDataTrack(evt.DataTrack)
 	case store.OpDelete:
 		f.mu.Lock()
-		_, ok := f.mirroredData[trackSid]
-		if ok {
-			delete(f.mirroredData, trackSid)
-		}
-		f.mu.Unlock()
-		if !ok {
+		defer f.mu.Unlock()
+		if f.closed {
 			return
 		}
+		if _, ok := f.mirroredData[trackSid]; !ok {
+			return
+		}
+		delete(f.mirroredData, trackSid)
 		f.dstStore.DeleteDataTrack(trackSid)
 	}
 }
