@@ -1,10 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
@@ -23,10 +25,15 @@ import (
 
 type logIdKey struct{}
 
+// errorBodyCaptureLimit caps the amount of body bytes kept for 5xx logging.
+// Large SDPs/JWTs can still be truncated; anything past the limit is elided.
+const errorBodyCaptureLimit = 8 * 1024
+
 type loggingResponseWriter struct {
 	http.ResponseWriter
 	status int
 	bytes  int
+	body   bytes.Buffer
 }
 
 func (w *loggingResponseWriter) WriteHeader(status int) {
@@ -37,6 +44,13 @@ func (w *loggingResponseWriter) WriteHeader(status int) {
 func (w *loggingResponseWriter) Write(data []byte) (int, error) {
 	if w.status == 0 {
 		w.status = http.StatusOK
+	}
+	if remaining := errorBodyCaptureLimit - w.body.Len(); remaining > 0 {
+		chunk := data
+		if len(chunk) > remaining {
+			chunk = chunk[:remaining]
+		}
+		w.body.Write(chunk)
 	}
 	n, err := w.ResponseWriter.Write(data)
 	w.bytes += n
@@ -50,14 +64,76 @@ func WithLogging(next http.Handler) http.Handler {
 			logId = xid.New().String()
 		}
 		start := time.Now()
+
+		// Mirror request body bytes into reqBodyBuf as the handler reads them,
+		// capped at errorBodyCaptureLimit so large payloads do not blow up
+		// memory. Only emitted when the handler returns 5xx.
+		var reqBodyBuf bytes.Buffer
+		if r.Body != nil && r.Body != http.NoBody {
+			r.Body = &teeReadCloser{
+				src: r.Body,
+				dst: &limitedBuffer{buf: &reqBodyBuf, limit: errorBodyCaptureLimit},
+			}
+		}
+
 		lrw := &loggingResponseWriter{ResponseWriter: w}
 		ctx := context.WithValue(r.Context(), logIdKey{}, logId)
 		next.ServeHTTP(lrw, r.WithContext(ctx))
-		slog.Info("HTTP request", "method", r.Method, "path", r.URL.Path,
+
+		attrs := []any{
+			"method", r.Method, "path", r.URL.Path,
 			"status", lrw.status, "bytes", lrw.bytes,
-			"logId", logId, "duration_ms", time.Since(start).Milliseconds())
+			"logId", logId, "duration_ms", time.Since(start).Milliseconds(),
+		}
+		if lrw.status >= 500 {
+			attrs = append(attrs,
+				"reqBody", reqBodyBuf.String(),
+				"respBody", lrw.body.String(),
+			)
+			slog.Error("HTTP request", attrs...)
+			return
+		}
+		slog.Info("HTTP request", attrs...)
 	})
 }
+
+// limitedBuffer appends to buf only until limit bytes have been stored.
+// Writes past the limit are silently dropped (but still report as consumed to
+// the caller, so the underlying stream is not blocked).
+type limitedBuffer struct {
+	buf   *bytes.Buffer
+	limit int
+}
+
+func (l *limitedBuffer) Write(p []byte) (int, error) {
+	remaining := l.limit - l.buf.Len()
+	if remaining <= 0 {
+		return len(p), nil
+	}
+	if len(p) > remaining {
+		l.buf.Write(p[:remaining])
+		return len(p), nil
+	}
+	l.buf.Write(p)
+	return len(p), nil
+}
+
+// teeReadCloser mirrors bytes read from src into dst, while forwarding the
+// full stream to the caller. Errors from the underlying src propagate as-is.
+type teeReadCloser struct {
+	src io.ReadCloser
+	dst io.Writer
+}
+
+func (t *teeReadCloser) Read(p []byte) (int, error) {
+	n, err := t.src.Read(p)
+	if n > 0 {
+		_, _ = t.dst.Write(p[:n])
+	}
+	return n, err
+}
+
+func (t *teeReadCloser) Close() error { return t.src.Close() }
 
 func WithCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

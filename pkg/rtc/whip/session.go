@@ -172,10 +172,8 @@ func (s *Session) supervise() {
 			s.mu.Unlock()
 
 			if !disconnected.IsZero() && now.Sub(disconnected) >= timeout {
-				if s.logger != nil {
 				s.logger.Warn("WHEP ICE watchdog expired; tearing down session",
 					"sessionId", s.ID, "timeout", timeout)
-				}
 				if s.onExpire != nil {
 					s.onExpire(s.ID)
 				} else {
