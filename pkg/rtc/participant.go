@@ -15,6 +15,7 @@ import (
 	"github.com/axonkit/axonkit/pkg/types"
 	"github.com/jiyeyuran/mediasoup-go/v2"
 	"github.com/rs/xid"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -735,6 +736,19 @@ type Participant struct {
 	recvTransport   *mediasoup.Transport
 	directTransport *mediasoup.Transport
 
+	// pipeSF de-duplicates concurrent PipeToRouter invocations originating
+	// from this (publisher) participant. When multiple subscribers on the
+	// same destination router race to subscribe to the same producer, only
+	// one underlying pipe is built; the rest share the result.
+	pipeSF singleflight.Group
+	// pipeCache memoizes successful PipeToRouter results keyed by
+	// "<p|d>:<srcProducerId>:<destRouterId>" → piped producer/data-producer
+	// id on the destination router. Entries are evicted when the piped
+	// producer closes (which happens if either the source producer or the
+	// destination router is closed), so stale IDs cannot linger.
+	pipeMu    sync.Mutex
+	pipeCache map[string]string
+
 	// Signal datachannel
 	signalOutProducer *mediasoup.DataProducer
 	signalOutConsumer *mediasoup.DataConsumer
@@ -852,6 +866,7 @@ func NewParticipant(params ParticipantParams) *Participant {
 		dataPublishedTracks:               make(map[string]*DataPublishedTrack),
 		subscriptions:                     make(map[string]*Subscription),
 		dataSubscriptions:                 make(map[string]*DataSubscription),
+		pipeCache:                         make(map[string]string),
 		pendingRPC:                        make(map[string]chan *proto.Message),
 		msgCh:                             make(chan *proto.Message, msgQueueSize),
 		done:                              make(chan struct{}),
@@ -1857,6 +1872,108 @@ func (p *Participant) GetDataPublishedTrack(sid string) *DataPublishedTrack {
 // Subscription Operations
 // ============================================================
 
+// pipeCacheGet returns a cached piped producer id for the given key, if any.
+func (p *Participant) pipeCacheGet(key string) (string, bool) {
+	p.pipeMu.Lock()
+	defer p.pipeMu.Unlock()
+	id, ok := p.pipeCache[key]
+	return id, ok
+}
+
+// pipeCachePut stores a piped producer id under the given key.
+func (p *Participant) pipeCachePut(key, id string) {
+	p.pipeMu.Lock()
+	defer p.pipeMu.Unlock()
+	p.pipeCache[key] = id
+}
+
+// pipeCacheDrop deletes the entry under the given key, but only if it still
+// points to the expected id. This prevents a stale OnClose from wiping a
+// freshly rebuilt pipe entry.
+func (p *Participant) pipeCacheDrop(key, expected string) {
+	p.pipeMu.Lock()
+	defer p.pipeMu.Unlock()
+	if cur, ok := p.pipeCache[key]; ok && cur == expected {
+		delete(p.pipeCache, key)
+	}
+}
+
+// pipeProducerTo pipes the given producer from this participant's router into
+// destRouter and returns the piped producer ID in destRouter.
+//
+// Results are memoized per (producerId, destRouterId), so repeat callers
+// (including subscribers on different subscriber participants sharing the
+// same destination router) short-circuit to the cached id without hitting
+// the worker. Concurrent cache misses are coalesced via singleflight. Cache
+// entries are invalidated when the piped producer closes (source producer
+// close or destination router teardown both trigger this).
+func (p *Participant) pipeProducerTo(producerId string, destRouter *mediasoup.Router) (string, error) {
+	key := "p:" + producerId + ":" + destRouter.Id()
+	if id, ok := p.pipeCacheGet(key); ok {
+		return id, nil
+	}
+	v, err, _ := p.pipeSF.Do(key, func() (any, error) {
+		if id, ok := p.pipeCacheGet(key); ok {
+			return id, nil
+		}
+		res, err := p.router.PipeToRouter(&mediasoup.PipeToRouterOptions{
+			ProducerId: producerId,
+			Router:     destRouter,
+			ListenInfo: mediasoup.TransportListenInfo{
+				Ip:       "127.0.0.1",
+				Protocol: mediasoup.TransportProtocolUDP,
+			},
+		})
+		if err != nil {
+			return "", err
+		}
+		pipedId := res.PipeProducer.Id()
+		p.pipeCachePut(key, pipedId)
+		res.PipeProducer.OnClose(func(ctx context.Context) {
+			p.pipeCacheDrop(key, pipedId)
+		})
+		return pipedId, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return v.(string), nil
+}
+
+// pipeDataProducerTo is the data-channel counterpart of pipeProducerTo.
+func (p *Participant) pipeDataProducerTo(dataProducerId string, destRouter *mediasoup.Router) (string, error) {
+	key := "d:" + dataProducerId + ":" + destRouter.Id()
+	if id, ok := p.pipeCacheGet(key); ok {
+		return id, nil
+	}
+	v, err, _ := p.pipeSF.Do(key, func() (any, error) {
+		if id, ok := p.pipeCacheGet(key); ok {
+			return id, nil
+		}
+		res, err := p.router.PipeToRouter(&mediasoup.PipeToRouterOptions{
+			DataProducerId: dataProducerId,
+			Router:         destRouter,
+			ListenInfo: mediasoup.TransportListenInfo{
+				Ip:       "127.0.0.1",
+				Protocol: mediasoup.TransportProtocolUDP,
+			},
+		})
+		if err != nil {
+			return "", err
+		}
+		pipedId := res.PipeDataProducer.Id()
+		p.pipeCachePut(key, pipedId)
+		res.PipeDataProducer.OnClose(func(ctx context.Context) {
+			p.pipeCacheDrop(key, pipedId)
+		})
+		return pipedId, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return v.(string), nil
+}
+
 // Subscribe creates a subscription for the given track on this participant's
 // receive transport. The subscription is created paused, the client is
 // notified via RPC, and only after acknowledgment is media resumed.
@@ -1878,18 +1995,11 @@ func (p *Participant) Subscribe(track *PublishedTrack, publisher *Participant) e
 
 	// Cross-router pipe within the same node
 	if publisher.router.Id() != p.router.Id() {
-		res, err := publisher.router.PipeToRouter(&mediasoup.PipeToRouterOptions{
-			ProducerId: producerId,
-			Router:     p.router,
-			ListenInfo: mediasoup.TransportListenInfo{
-				Ip:       "127.0.0.1",
-				Protocol: mediasoup.TransportProtocolUDP,
-			},
-		})
+		pipedId, err := publisher.pipeProducerTo(producerId, p.router)
 		if err != nil {
 			return fmt.Errorf("cross-router pipe failed: %w", err)
 		}
-		producerId = res.PipeProducer.Id()
+		producerId = pipedId
 	}
 
 	consumer, err := transport.Consume(&mediasoup.ConsumerOptions{
@@ -2063,18 +2173,11 @@ func (p *Participant) consumeFromBackup(
 	backupProducerId := prod.Id()
 
 	if publisher.router.Id() != p.router.Id() {
-		res, err := publisher.router.PipeToRouter(&mediasoup.PipeToRouterOptions{
-			ProducerId: backupProducerId,
-			Router:     p.router,
-			ListenInfo: mediasoup.TransportListenInfo{
-				Ip:       "127.0.0.1",
-				Protocol: mediasoup.TransportProtocolUDP,
-			},
-		})
+		pipedId, err := publisher.pipeProducerTo(backupProducerId, p.router)
 		if err != nil {
 			return fmt.Errorf("cross-router pipe (backup) failed: %w", err)
 		}
-		backupProducerId = res.PipeProducer.Id()
+		backupProducerId = pipedId
 	}
 
 	consumer, err := transport.Consume(&mediasoup.ConsumerOptions{
@@ -2194,19 +2297,11 @@ func (p *Participant) SubscribeData(track *DataPublishedTrack, publisher *Partic
 	dataProducerId := track.dataProducer.Id()
 
 	if publisher.router.Id() != p.router.Id() {
-		// For data tracks, pipe to same router
-		res, err := publisher.router.PipeToRouter(&mediasoup.PipeToRouterOptions{
-			DataProducerId: dataProducerId,
-			Router:         p.router,
-			ListenInfo: mediasoup.TransportListenInfo{
-				Ip:       "127.0.0.1",
-				Protocol: mediasoup.TransportProtocolUDP,
-			},
-		})
+		pipedId, err := publisher.pipeDataProducerTo(dataProducerId, p.router)
 		if err != nil {
 			return fmt.Errorf("cross-router data pipe failed: %w", err)
 		}
-		dataProducerId = res.PipeDataProducer.Id()
+		dataProducerId = pipedId
 	}
 
 	dataConsumer, err := transport.ConsumeData(&mediasoup.DataConsumerOptions{
