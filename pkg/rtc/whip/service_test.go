@@ -3,8 +3,8 @@ package whip
 import "testing"
 
 func TestRegistry_AddGetRemove(t *testing.T) {
-	reg := NewRegistry(ModeWHIP)
-	s := &Session{Mode: ModeWHIP}
+	reg := NewRegistry()
+	s := &Session{Mode: ModeWHEP}
 	id, err := reg.Add(s)
 	if err != nil {
 		t.Fatalf("Add: %v", err)
@@ -24,43 +24,36 @@ func TestRegistry_AddGetRemove(t *testing.T) {
 }
 
 func TestRegistry_AddDuplicate(t *testing.T) {
-	reg := NewRegistry(ModeWHIP)
-	s1 := &Session{ID: "alice", Mode: ModeWHIP}
+	reg := NewRegistry()
+	s1 := &Session{ID: "alice", Mode: ModeWHEP}
 	if _, err := reg.Add(s1); err != nil {
 		t.Fatalf("first Add: %v", err)
 	}
-	s2 := &Session{ID: "alice", Mode: ModeWHIP}
+	s2 := &Session{ID: "alice", Mode: ModeWHEP}
 	if _, err := reg.Add(s2); err != ErrResourceTaken {
 		t.Fatalf("expected ErrResourceTaken, got %v", err)
 	}
 }
 
-func TestRegistry_SeparateWHIPvsWHEP(t *testing.T) {
-	whipReg := NewRegistry(ModeWHIP)
-	whepReg := NewRegistry(ModeWHEP)
-	// Same ID allowed in each registry because WHIP/WHEP are independent.
-	if _, err := whipReg.Add(&Session{ID: "same", Mode: ModeWHIP}); err != nil {
-		t.Fatalf("whip add: %v", err)
+func TestRegistry_IndependentInstances(t *testing.T) {
+	a := NewRegistry()
+	b := NewRegistry()
+	// Same ID is allowed across independent registries; removal from one must
+	// not touch the other.
+	if _, err := a.Add(&Session{ID: "same"}); err != nil {
+		t.Fatalf("a.Add: %v", err)
 	}
-	if _, err := whepReg.Add(&Session{ID: "same", Mode: ModeWHEP}); err != nil {
-		t.Fatalf("whep add (different registry): %v", err)
+	if _, err := b.Add(&Session{ID: "same"}); err != nil {
+		t.Fatalf("b.Add: %v", err)
 	}
-	if whipReg.Len() != 1 || whepReg.Len() != 1 {
+	if a.Len() != 1 || b.Len() != 1 {
 		t.Fatalf("expected 1 session in each registry")
 	}
-	// Removing from WHIP must not affect WHEP.
-	if err := whipReg.Remove("same"); err != nil {
-		t.Fatalf("whip remove: %v", err)
+	if err := a.Remove("same"); err != nil {
+		t.Fatalf("a.Remove: %v", err)
 	}
-	if whepReg.Get("same") == nil {
-		t.Fatalf("WHEP session incorrectly removed when WHIP session was deleted")
-	}
-}
-
-func TestRegistry_ModeMismatchRejected(t *testing.T) {
-	reg := NewRegistry(ModeWHIP)
-	if _, err := reg.Add(&Session{Mode: ModeWHEP}); err == nil {
-		t.Fatalf("expected mode mismatch error")
+	if b.Get("same") == nil {
+		t.Fatalf("b session incorrectly removed when a session was deleted")
 	}
 }
 

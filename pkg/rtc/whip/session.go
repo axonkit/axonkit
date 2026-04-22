@@ -2,7 +2,6 @@ package whip
 
 import (
 	"errors"
-	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -131,18 +130,14 @@ func (s *Session) Start(onExpire func(id string)) {
 		case mediasoup.IceStateDisconnected:
 			if s.disconnectedAt.IsZero() {
 				s.disconnectedAt = time.Now()
-				if s.logger != nil {
-					s.logger.Warn("WHIP/WHEP ICE disconnected, supervisor armed",
-						"sessionId", s.ID, "mode", s.Mode)
-				}
+				s.logger.Warn("WHIP/WHEP ICE disconnected, supervisor armed",
+					"sessionId", s.ID, "mode", s.Mode)
 			}
 		case mediasoup.IceStateConnected, mediasoup.IceStateCompleted:
 			if !s.disconnectedAt.IsZero() {
 				s.disconnectedAt = time.Time{}
-				if s.logger != nil {
-					s.logger.Info("WHIP/WHEP ICE recovered",
-						"sessionId", s.ID, "mode", s.Mode)
-				}
+				s.logger.Info("WHIP/WHEP ICE recovered",
+					"sessionId", s.ID, "mode", s.Mode)
 			}
 		}
 	})
@@ -262,36 +257,32 @@ func (s *Session) Close() {
 }
 
 // Registry is a thread-safe map of resourceID -> Session. It is intentionally
-// in-memory only: a node restart drops all WHIP sessions (the same as
-// disconnecting a WebRTC client).
+// in-memory only: a node restart drops all sessions (the same as a WebRTC
+// client disconnecting).
 //
-// Separate registries exist for WHIP and WHEP (they have different URL
-// spaces and different lifecycle rules; mixing them in one map would let a
-// WHEP DELETE collide with a WHIP resourceId that reuses the same identity).
+// Registry is mode-agnostic: after WHIP sessions moved onto the
+// rtc.Participant lifecycle only WHEP uses it today, but the type itself
+// is a plain session map so callers may spin up additional instances
+// without coupling to a mode enum.
 type Registry struct {
 	mu       sync.RWMutex
 	sessions map[string]*Session
-	mode     Mode
 	logger   *slog.Logger
 }
 
-// NewRegistry constructs a Registry for the given mode.
-func NewRegistry(mode Mode) *Registry {
+// NewRegistry constructs an empty Registry.
+func NewRegistry() *Registry {
 	return &Registry{
 		sessions: make(map[string]*Session),
-		mode:     mode,
-		logger:   slog.Default().With("component", "whip.Registry", "mode", string(mode)),
+		logger:   slog.Default().With("component", "whip.Registry"),
 	}
 }
 
 // Add registers a new session and returns its id. If the session has no ID
 // one is generated; if the ID is already taken ErrResourceTaken is returned.
 // Callers that want "replace on conflict" semantics should first call
-// Remove and then Add (the Service layer does this for WHIP identity).
+// Remove and then Add.
 func (r *Registry) Add(s *Session) (string, error) {
-	if s.Mode != "" && r.mode != "" && s.Mode != r.mode {
-		return "", fmt.Errorf("session mode %q does not match registry mode %q", s.Mode, r.mode)
-	}
 	if s.ID == "" {
 		s.ID = xid.New().String()
 	}

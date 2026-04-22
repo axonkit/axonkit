@@ -61,7 +61,7 @@ func NewService(factory TransportFactory, sources ProducerSource, logger *slog.L
 	return &Service{
 		Factory: factory,
 		Sources: sources,
-		Whep:    NewRegistry(ModeWHEP),
+		Whep:    NewRegistry(),
 		Logger:  logger,
 	}
 }
@@ -71,12 +71,17 @@ type CreateWHIPOptions struct {
 	OfferSDP string
 }
 
-// CreateWHIPResult is the data needed to respond to a WHIP POST: the
-// resource id (becomes /whip/{id}), ETag value and the answer SDP.
+// CreateWHIPResult carries the raw artifacts a WHIP publish flow needs to
+// attach onto a rtc.Participant and respond to the POST. There is no
+// *Session here on purpose: for WHIP the Participant is the owner of the
+// transport lifecycle and of the ICE watchdog. A service-owned Session
+// would duplicate both and force cross-layer OnClose plumbing.
 type CreateWHIPResult struct {
-	Session *Session
-	Answer  string
-	ETag    string
+	Transport *mediasoup.Transport
+	Router    *mediasoup.Router
+	Producers []*mediasoup.Producer
+	Answer    string
+	ETag      string
 }
 
 // CreateWHIP creates a new publish session from an offer SDP.
@@ -97,12 +102,16 @@ func (s *Service) CreateWHIP(opts CreateWHIPOptions) (*CreateWHIPResult, error) 
 	if err != nil {
 		return nil, fmt.Errorf("factory: %w", err)
 	}
-	closeOnErr := transport
+
+	// closeOnErr is used to tear down partial setup before the caller has
+	// a chance to take ownership. Once we return success the caller owns
+	// transport and must Close it (via Participant.Close) on teardown.
+	closeOnErr := func() { transport.Close() }
 
 	caps := router.RtpCapabilities()
 	parsed, err := ParseOffer(opts.OfferSDP, caps)
 	if err != nil {
-		closeOnErr.Close()
+		closeOnErr()
 		return nil, fmt.Errorf("parse offer: %w", err)
 	}
 
@@ -112,18 +121,11 @@ func (s *Service) CreateWHIP(opts CreateWHIPOptions) (*CreateWHIPResult, error) 
 			Fingerprints: []mediasoup.DtlsFingerprint{parsed.DtlsFingerprint},
 		},
 	}); err != nil {
-		closeOnErr.Close()
+		closeOnErr()
 		return nil, fmt.Errorf("transport connect: %w", err)
 	}
 
-	sess := &Session{
-		Mode:                   ModeWHIP,
-		Transport:              transport,
-		Router:                 router,
-		ICEDisconnectedTimeout: s.ICEDisconnectedTimeout,
-		logger:                 s.Logger,
-	}
-
+	var producers []*mediasoup.Producer
 	// Produce one mediasoup Producer per publishable m-section.
 	for _, pm := range parsed.Medias {
 		if pm.Direction != mediasoup.MediaDirectionSendonly && pm.Direction != mediasoup.MediaDirectionSendrecv {
@@ -134,20 +136,20 @@ func (s *Service) CreateWHIP(opts CreateWHIPOptions) (*CreateWHIPResult, error) 
 			RtpParameters: pm.RtpParameters,
 		})
 		if err != nil {
-			sess.Close()
+			closeOnErr()
 			return nil, fmt.Errorf("produce %s mid=%q: %w", pm.Kind, pm.Mid, err)
 		}
-		sess.Producers = append(sess.Producers, producer)
+		producers = append(producers, producer)
 	}
-	if len(sess.Producers) == 0 {
-		sess.Close()
+	if len(producers) == 0 {
+		closeOnErr()
 		return nil, fmt.Errorf("offer has no publishable media")
 	}
 
 	// Build the answer.
 	td := transport.Data()
 	if td.WebRtcTransportData == nil {
-		sess.Close()
+		closeOnErr()
 		return nil, fmt.Errorf("transport has no webrtc data")
 	}
 	data := td.WebRtcTransportData
@@ -172,24 +174,19 @@ func (s *Service) CreateWHIP(opts CreateWHIPOptions) (*CreateWHIPResult, error) 
 		Medias:         medias,
 	})
 	if err != nil {
-		sess.Close()
+		closeOnErr()
 		return nil, fmt.Errorf("build answer: %w", err)
 	}
 
-	sess.ETag = data.IceParameters.UsernameFragment
-	sess.CreatedAt = time.Now()
+	s.Logger.Info("WHIP published", "producers", len(producers))
 
-	// The caller (HTTP layer) is responsible for wiring sess.OnClose to
-	// the participant it attaches. We start the supervisor with onExpire
-	// = nil so that an ICE-watchdog expiry calls sess.Close() directly,
-	// which fans out to OnClose once the caller has wired it. The ICE
-	// timeout is ~30s so there's no practical race with the caller's
-	// OnClose assignment.
-	sess.Start(nil)
-
-	s.Logger.Info("WHIP session created", "producers", len(sess.Producers))
-
-	return &CreateWHIPResult{Session: sess, Answer: answer, ETag: sess.ETag}, nil
+	return &CreateWHIPResult{
+		Transport: transport,
+		Router:    router,
+		Producers: producers,
+		Answer:    answer,
+		ETag:      data.IceParameters.UsernameFragment,
+	}, nil
 }
 
 // CreateWHEPOptions packages the inputs for a new WHEP subscribe session.

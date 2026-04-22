@@ -20,6 +20,17 @@ import (
 const (
 	dynacastDowngradeDelay = 5 * time.Second
 	preReadySignalQueueCap = 1024
+	// iceSuspendTimeout is how long the participant stays in SUSPENDED
+	// after ICE drops before we give up and close it. Mirrors the ICE
+	// watchdog baked into whip.Session so both flows reclaim resources
+	// on a similar timescale.
+	iceSuspendTimeout = 30 * time.Second
+	// setupTimeout bounds the initial JOINING window. A participant must
+	// either (a) receive an ICE Connected/Completed event and — for
+	// WS-signaling flows — a Ready request, or (b) be closed explicitly
+	// within this budget. Stuck-in-JOINING participants that never complete
+	// handshake would otherwise linger forever.
+	setupTimeout = 30 * time.Second
 )
 
 // PublishedTrack holds a published media track and its signaling metadata.
@@ -776,6 +787,30 @@ type Participant struct {
 	refreshTokenTTL time.Duration
 	refreshTimer    *time.Timer
 
+	// ICE watchdog. iceDisconnectedSet is keyed by transport pointer so
+	// duplicate Disconnected events from the same transport (e.g. flap)
+	// or aggregated events across send/recv transports are deduplicated.
+	// While the set is non-empty the participant is SUSPENDED and
+	// iceSuspendTimer counts down toward a forced close.
+	iceDisconnectedSet map[any]struct{}
+	iceSuspendTimer    *time.Timer
+
+	// setupTimer enforces the setupTimeout budget for completing the
+	// initial handshake (ICE Connected + Ready). Stopped by SetState once
+	// the participant reaches JOINED, and by Close on any teardown path.
+	setupTimer *time.Timer
+
+	// messageLoop is started lazily on the first SetSignal with a live
+	// inbound signal consumer. WHIP participants never receive signaling
+	// and therefore never need the goroutine.
+	messageLoopOnce sync.Once
+
+	// signalHeadless is set when SetSignal is called with all-nil handles
+	// (WHIP flow). It suppresses outbound notification attempts so broadcast
+	// fan-out to a headless participant doesn't log "signal channel not
+	// established" noise for every update.
+	signalHeadless bool
+
 	mu     sync.RWMutex
 	logger *slog.Logger
 	closed bool
@@ -834,7 +869,11 @@ func NewParticipant(params ParticipantParams) *Participant {
 			"identity", params.Identity, "sid", params.Sid),
 	}
 	p.permission = p.permissionFromGrants()
-	go p.messageLoop()
+	// Arm the setup watchdog: the participant must reach JOINED (via ICE
+	// Connected for headless flows, or via signal completeReady for WS)
+	// within setupTimeout, otherwise we close it out so the room map
+	// doesn't accumulate zombie JOINING entries.
+	p.setupTimer = time.AfterFunc(setupTimeout, p.onSetupTimeout)
 	return p
 }
 
@@ -1174,6 +1213,13 @@ func (p *Participant) SetState(state proto.ParticipantInfo_State) {
 		return
 	}
 	p.state = state
+	// Once the participant has made it to JOINED the setup watchdog is
+	// no longer needed. Disconnect handling takes over from here (ICE
+	// watchdog for WebRTC / heartbeat for Plain).
+	if state == proto.ParticipantInfo_JOINED && p.setupTimer != nil {
+		p.setupTimer.Stop()
+		p.setupTimer = nil
+	}
 	p.mu.Unlock()
 	if p.room != nil {
 		p.room.OnParticipantUpdated(p)
@@ -1227,11 +1273,19 @@ func (p *Participant) SetTransports(send, recv, direct *mediasoup.Transport) {
 	p.recvTransport = recv
 	p.directTransport = direct
 
+	// Each transport's ICE callback is bound to its own source key so the
+	// aggregator can tell a flapping send transport apart from recv going
+	// idle. Mediasoup fires callbacks from its event goroutine; the closures
+	// only forward to the aggregator, which takes p.mu itself.
 	if send != nil {
-		send.OnIceStateChange(p.handleIceStateChange)
+		send.OnIceStateChange(func(state mediasoup.IceState) {
+			p.handleTransportIceState(send, state)
+		})
 	}
 	if recv != nil {
-		recv.OnIceStateChange(p.handleIceStateChange)
+		recv.OnIceStateChange(func(state mediasoup.IceState) {
+			p.handleTransportIceState(recv, state)
+		})
 	}
 }
 
@@ -1249,34 +1303,165 @@ func (p *Participant) SetSignal(
 	p.signalOutConsumer = outConsumer
 	p.signalInProducer = inProducer
 	p.signalInConsumer = inConsumer
+	// Headless signaling: all four handles are nil on purpose (WHIP path).
+	// We latch a flag so sendMessage can short-circuit broadcast fan-out
+	// instead of logging a noisy error for every update.
+	p.signalHeadless = outProducer == nil && outConsumer == nil && inProducer == nil && inConsumer == nil
 	p.mu.Unlock()
 
 	if inConsumer != nil {
+		// Start the message pump exactly once, and only for participants
+		// that actually carry a signaling datachannel. Headless flows
+		// (e.g. WHIP) pass nil here and get no goroutine overhead.
+		p.messageLoopOnce.Do(func() {
+			go p.messageLoop()
+		})
 		inConsumer.OnMessage(func(payload []byte, ppid mediasoup.SctpPayloadType) {
 			p.handleIncomingMessage(payload)
 		})
 	}
 }
 
+// handleIceStateChange is the single-source entry point retained for tests
+// and call sites that don't carry a transport identity. It routes into the
+// per-transport aggregator under a sentinel key so the dedup/timer logic
+// behaves identically.
 func (p *Participant) handleIceStateChange(state mediasoup.IceState) {
+	p.handleTransportIceState(iceSourceDefault, state)
+}
+
+// iceSourceDefault is the sentinel key used for legacy/single-transport
+// flows (e.g. unit tests) where we don't have a real *mediasoup.Transport
+// pointer to identify the ICE source.
+var iceSourceDefault = struct{ name string }{name: "default"}
+
+// handleTransportIceState aggregates ICE state events from one or more
+// transports and drives the participant's SUSPEND → (recover | timeout close)
+// state machine. It is safe to call concurrently and idempotent w.r.t.
+// duplicate events from the same source.
+func (p *Participant) handleTransportIceState(src any, state mediasoup.IceState) {
 	switch state {
 	case mediasoup.IceStateConnected, mediasoup.IceStateCompleted:
-		p.logger.Info("ICE state changed", "state", state)
-		p.mu.Lock()
-		state := p.state
-		p.mu.Unlock()
-		if state == proto.ParticipantInfo_SUSPENDED {
-			p.SetState(proto.ParticipantInfo_JOINED)
-		}
-
+		p.onIceSourceUp(src, state)
 	case mediasoup.IceStateDisconnected:
-		p.logger.Warn("ICE disconnected, suspending participant")
-		p.SetState(proto.ParticipantInfo_SUSPENDED)
-
+		p.onIceSourceDown(src)
 	case mediasoup.IceStateClosed:
 		p.logger.Warn("ICE closed, closing participant")
 		p.Close(proto.DisconnectReason_SIGNAL_CLOSE)
 	}
+}
+
+func (p *Participant) onIceSourceDown(src any) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	if p.iceDisconnectedSet == nil {
+		p.iceDisconnectedSet = make(map[any]struct{}, 2)
+	}
+	if _, already := p.iceDisconnectedSet[src]; already {
+		// Same transport re-reporting disconnected: nothing new to do.
+		p.mu.Unlock()
+		return
+	}
+	firstDown := len(p.iceDisconnectedSet) == 0
+	p.iceDisconnectedSet[src] = struct{}{}
+	if firstDown && p.iceSuspendTimer == nil {
+		p.iceSuspendTimer = time.AfterFunc(iceSuspendTimeout, p.onIceSuspendTimeout)
+	}
+	p.mu.Unlock()
+
+	if firstDown {
+		p.logger.Warn("ICE disconnected, suspending participant", "timeout", iceSuspendTimeout)
+		p.SetState(proto.ParticipantInfo_SUSPENDED)
+	}
+}
+
+func (p *Participant) onIceSourceUp(src any, state mediasoup.IceState) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	wasDown := false
+	if _, ok := p.iceDisconnectedSet[src]; ok {
+		delete(p.iceDisconnectedSet, src)
+		wasDown = true
+	}
+	allRecovered := len(p.iceDisconnectedSet) == 0
+	if wasDown && allRecovered && p.iceSuspendTimer != nil {
+		p.iceSuspendTimer.Stop()
+		p.iceSuspendTimer = nil
+	}
+	curState := p.state
+	headless := p.signalHeadless
+	p.mu.Unlock()
+
+	switch {
+	case wasDown && !allRecovered:
+		// Another transport is still down; keep the suspend in effect.
+		p.logger.Info("ICE source recovered, other transports still disconnected", "state", state)
+
+	case wasDown && allRecovered:
+		p.logger.Info("ICE recovered on all transports", "state", state)
+		if curState == proto.ParticipantInfo_SUSPENDED {
+			p.SetState(proto.ParticipantInfo_JOINED)
+		}
+
+	default:
+		// First-ever Connected/Completed event (no prior suspend). For
+		// headless flows (WHIP) this is our only trigger to leave JOINING
+		// — there's no Ready request to drive the transition. WS-signaling
+		// flows stay in JOINING until completeReady flips them.
+		p.logger.Info("ICE state changed", "state", state)
+		if headless && curState == proto.ParticipantInfo_JOINING {
+			p.SetState(proto.ParticipantInfo_JOINED)
+		}
+	}
+}
+
+// onIceSuspendTimeout fires from the watchdog timer. It must guard against
+// racing with a concurrent recovery that already stopped the timer, and
+// must not close a participant that has since been closed via another
+// path (RemoveParticipant, SIGNAL_CLOSE, …).
+func (p *Participant) onIceSuspendTimeout() {
+	p.mu.Lock()
+	if p.closed || len(p.iceDisconnectedSet) == 0 {
+		p.mu.Unlock()
+		return
+	}
+	p.iceSuspendTimer = nil
+	p.mu.Unlock()
+
+	p.logger.Warn("ICE suspend timeout elapsed, closing participant", "timeout", iceSuspendTimeout)
+	p.Close(proto.DisconnectReason_CONNECTION_TIMEOUT)
+}
+
+// onSetupTimeout is the setup-watchdog callback. It fires if the participant
+// is still in its initial JOINING state after setupTimeout — i.e. ICE never
+// reached Connected/Completed and/or no Ready request arrived in time.
+// SetState(JOINED) already stops the timer on the happy path, so reaching
+// this function means we genuinely need to close out a stalled handshake.
+func (p *Participant) onSetupTimeout() {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	p.setupTimer = nil
+	state := p.state
+	p.mu.Unlock()
+	// Guard against races: SetState(JOINED) runs Stop() but a concurrent
+	// fire may have already been scheduled. Double-check state before
+	// closing.
+	if state != proto.ParticipantInfo_JOINING {
+		return
+	}
+
+	p.logger.Warn("Setup timeout elapsed in JOINING, closing participant",
+		"timeout", setupTimeout)
+	p.Close(proto.DisconnectReason_JOIN_FAILURE)
 }
 
 func (p *Participant) SetRtpCapabilities(caps *mediasoup.RtpCapabilities) {
@@ -2259,8 +2444,17 @@ func (p *Participant) sendMessage(msg *proto.Message) error {
 	p.mu.Lock()
 	producer := p.signalOutProducer
 	state := p.state
+	headless := p.signalHeadless
 	if producer == nil {
 		p.mu.Unlock()
+		if headless {
+			// WHIP-style participant: no signaling datachannel was ever
+			// provisioned. Callers (e.g. room broadcasts) treat send as
+			// best-effort, so drop without surfacing an error.
+			p.logger.Debug("Dropping outbound signal for headless participant",
+				"method", msg.Method, "logId", msg.LogId)
+			return nil
+		}
 		p.logger.Error("Signal channel not established", "method", msg.Method, "logId", msg.LogId)
 		return fmt.Errorf("signal channel not established")
 	}
@@ -2355,11 +2549,37 @@ func (p *Participant) HandlePing(req *proto.PingRequest) {
 	p.resetPingTimer()
 }
 
+// StartHeartbeat arms the application-level ping watchdog. Production flows
+// should gate the call with HasOnlyPlainTransports: WebRTC transports already
+// drive the ICE watchdog in handleTransportIceState, so a second timer just
+// duplicates work and can prematurely close a live participant mid-ICE-flap.
+// This entry point stays unconditional so unit tests can exercise the timer
+// mechanism directly.
 func (p *Participant) StartHeartbeat() {
 	p.mu.Lock()
 	p.lastPing = time.Now()
 	p.mu.Unlock()
 	p.resetPingTimer()
+}
+
+// HasOnlyPlainTransports reports whether every set transport is a mediasoup
+// PlainTransport (i.e. not WebRTC and not Pipe). Plain transports have no
+// ICE state callbacks, so the ping heartbeat is the only way to detect a
+// stalled peer for those flows.
+func (p *Participant) HasOnlyPlainTransports() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.sendTransport == nil && p.recvTransport == nil {
+		return false
+	}
+	isPlain := func(t *mediasoup.Transport) bool {
+		if t == nil {
+			return true
+		}
+		td := t.Data()
+		return td.PlainTransportData != nil && td.WebRtcTransportData == nil && td.PipeTransportData == nil
+	}
+	return isPlain(p.sendTransport) && isPlain(p.recvTransport)
 }
 
 func (p *Participant) resetPingTimer() {
@@ -2535,6 +2755,15 @@ func (p *Participant) Close(reason proto.DisconnectReason) {
 	if p.refreshTimer != nil {
 		p.refreshTimer.Stop()
 	}
+	if p.iceSuspendTimer != nil {
+		p.iceSuspendTimer.Stop()
+		p.iceSuspendTimer = nil
+	}
+	if p.setupTimer != nil {
+		p.setupTimer.Stop()
+		p.setupTimer = nil
+	}
+	p.iceDisconnectedSet = nil
 
 	for _, ch := range p.pendingRPC {
 		close(ch)

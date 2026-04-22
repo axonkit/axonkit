@@ -395,9 +395,12 @@ func (s *HTTPServer) createWHIPParticipant(roomName string, claims *auth.Claims,
 	if err != nil {
 		return nil, "", "", err
 	}
-	participant, err := s.attachPublishSession(result.Session, claims, roomName)
+	participant, err := s.attachPublishSession(result, claims, roomName)
 	if err != nil {
-		result.Session.Close()
+		// Tear down the transport the Service handed us; closing the
+		// transport cascades into producer close. No Session/OnClose to
+		// untangle — the Participant is the sole owner once attached.
+		result.Transport.Close()
 		return nil, "", "", fmt.Errorf("attach to room: %w", err)
 	}
 	return participant, result.Answer, result.ETag, nil
@@ -678,7 +681,7 @@ func (s *HTTPServer) findParticipantByIdentity(roomName, participantID string) (
 	return nil, nil, fmt.Errorf("participant %q not found in room %q", participantID, roomName)
 }
 
-func (s *HTTPServer) attachPublishSession(sess *whip.Session, claims *auth.Claims, roomName string) (*rtc.Participant, error) {
+func (s *HTTPServer) attachPublishSession(result *whip.CreateWHIPResult, claims *auth.Claims, roomName string) (*rtc.Participant, error) {
 	if s.roomManager == nil {
 		return nil, fmt.Errorf("room manager not configured")
 	}
@@ -701,25 +704,32 @@ func (s *HTTPServer) attachPublishSession(sess *whip.Session, claims *auth.Claim
 	}
 
 	participant := rtc.NewParticipant(rtc.ParticipantParams{
-		Sid:           identity,
+		Sid:           "whip_" + xid.New().String(),
 		Identity:      identity,
 		Name:          name,
 		Grants:        claims.Grants,
-		Router:        sess.Router,
+		Router:        result.Router,
 		TokenVerifier: s.verifier,
 		NodeId:        string(s.node.ID),
 	})
-	participant.SetTransports(sess.Transport, nil, nil)
+	participant.SetTransports(result.Transport, nil, nil)
+	// Headless signaling: WHIP has no datachannel. SetSignal with all nils
+	// latches signalHeadless so broadcast fan-out silently drops messages
+	// instead of logging "signal channel not established" per update, and
+	// messageLoop is never started for this participant.
 	participant.SetSignal(nil, nil, nil, nil)
 
-	if existing := room.GetParticipant(participant.Sid()); existing != nil {
-		existing.Close(proto.DisconnectReason_CLIENT_INITIATED)
-	}
 	if err := room.AddParticipant(participant); err != nil {
 		return nil, fmt.Errorf("add participant: %w", err)
 	}
 
-	for _, producer := range sess.Producers {
+	// Do NOT flip state to JOINED here. WHIP has no Ready request, but
+	// media is not actually flowing until the client receives this answer
+	// and ICE completes. The participant's ICE watchdog will promote the
+	// state to JOINED on the first IceStateConnected/Completed event (see
+	// onIceSourceUp), and the setup watchdog will close out the
+	// participant if ICE never reaches that state within setupTimeout.
+	for _, producer := range result.Producers {
 		trackSid := fmt.Sprintf("TR_%d", time.Now().UnixNano())
 		if err := participant.RegisterWHIPProducer(trackSid, producer); err != nil {
 			slog.Warn("WHIP register producer failed", "err", err, "trackSid", trackSid)
@@ -727,9 +737,10 @@ func (s *HTTPServer) attachPublishSession(sess *whip.Session, claims *auth.Claim
 		}
 	}
 
-	sess.OnClose = func() {
-		room.RemoveParticipant(participant.Sid(), proto.DisconnectReason_CLIENT_INITIATED)
-	}
+	// Participant is now the sole owner of transport and producers. ICE
+	// disconnect is handled by the participant's own ICE watchdog, which
+	// closes the participant (and thus the transport) on timeout — no
+	// Session / OnClose plumbing needed.
 	return participant, nil
 }
 

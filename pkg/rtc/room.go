@@ -834,15 +834,28 @@ func (r *Room) AddParticipant(p *Participant) error {
 	}
 
 	effectiveCount := r.totalParticipantCountLocked()
-	if existing != nil {
-		effectiveCount--
-	}
-	// Kick remote duplicate: write DISCONNECTED to the store so the remote
-	// node's store-watch closes it. We then proceed to add the new participant.
+
+	// If a local duplicate is already being kicked we're done; otherwise
+	// scan the store cache for a remote duplicate of this identity and
+	// mark it DISCONNECTED so the owning node's store-watch closes it.
+	// We skip:
+	//   * already DISCONNECTED entries (no effect, and would clobber the
+	//     existing DisconnectReason);
+	//   * entries whose sid is also present in r.participants — a local
+	//     participant shares the sid, its own lifecycle will reconcile the
+	//     store entry and kicking here would race with that path. This
+	//     guards against the short window where storeParticipants lags
+	//     behind r.participants.
 	var remoteKicks []*proto.ParticipantInfo
 	if existing == nil {
-		for _, info := range r.storeParticipants {
-			if info.Identity != p.identity || info.Sid == p.sid || r.participants[info.Sid] != nil {
+		for sid, info := range r.storeParticipants {
+			if info.Identity != p.identity {
+				continue
+			}
+			if info.State == proto.ParticipantInfo_DISCONNECTED {
+				continue
+			}
+			if _, localOwned := r.participants[sid]; localOwned {
 				continue
 			}
 			kicked := cloneParticipantInfo(info)
@@ -851,6 +864,8 @@ func (r *Room) AddParticipant(p *Participant) error {
 			remoteKicks = append(remoteKicks, kicked)
 			effectiveCount--
 		}
+	} else {
+		effectiveCount--
 	}
 	if r.config.MaxParticipants > 0 && effectiveCount >= r.config.MaxParticipants {
 		r.mu.RUnlock()

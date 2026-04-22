@@ -194,7 +194,13 @@ func (p *Participant) handleReady(msg *proto.Message) (any, int, string, func())
 
 func (p *Participant) completeReady(syncState *proto.SyncState, otherInfos []*proto.ParticipantInfo) {
 	p.SetState(proto.ParticipantInfo_JOINED)
-	p.StartHeartbeat()
+	// Ping-based heartbeat is only meaningful when there is no ICE watchdog
+	// (Plain transport flows, e.g. SIP/ingress). WebRTC transports surface
+	// IceStateDisconnected, which handleTransportIceState already supervises
+	// with its own timeout.
+	if p.HasOnlyPlainTransports() {
+		p.StartHeartbeat()
+	}
 	p.flushQueuedSignalNotifications()
 
 	if syncState != nil {
