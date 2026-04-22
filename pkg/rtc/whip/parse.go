@@ -39,14 +39,14 @@ type ParsedMedia struct {
 // ParsedOffer holds everything needed to wire a WebRtcTransport + Producers
 // from an incoming WHIP offer.
 type ParsedOffer struct {
-	Session        *sdp.SessionDescription
-	IceUfrag       string
-	IcePwd         string
-	DtlsSetup      string
+	Session         *sdp.SessionDescription
+	IceUfrag        string
+	IcePwd          string
+	DtlsSetup       string
 	DtlsFingerprint mediasoup.DtlsFingerprint
-	Medias         []*ParsedMedia
-	BundleMids     []string
-	TrickleICE     bool
+	Medias          []*ParsedMedia
+	BundleMids      []string
+	TrickleICE      bool
 	EndOfCandidates bool
 }
 
@@ -183,12 +183,12 @@ func extractDirection(md *sdp.MediaDescription) mediasoup.MediaDirection {
 func buildRtpParameters(md *sdp.MediaDescription, mid string, kind mediasoup.MediaKind, caps *mediasoup.RtpCapabilities) (*mediasoup.RtpParameters, []string, error) {
 	// 1. Parse rtpmap / fmtp / rtcp-fb tables keyed by PT.
 	type ptInfo struct {
-		mime       string
-		clockRate  uint32
-		channels   uint8
-		fmtp       map[string]string
-		rawFmtp    string
-		feedback   []*mediasoup.RtcpFeedback
+		mime      string
+		clockRate uint32
+		channels  uint8
+		fmtp      map[string]string
+		rawFmtp   string
+		feedback  []*mediasoup.RtcpFeedback
 	}
 	tab := map[uint8]*ptInfo{}
 	getPT := func(pt uint8) *ptInfo {

@@ -87,7 +87,7 @@ func BuildAnswer(p *AnswerParams) (string, error) {
 			AddressType:    "IP4",
 			UnicastAddress: "0.0.0.0",
 		},
-		SessionName: "-",
+		SessionName:      "-",
 		TimeDescriptions: []sdp.TimeDescription{{Timing: sdp.Timing{}}},
 		Attributes: []sdp.Attribute{
 			{Key: "group", Value: "BUNDLE " + strings.Join(mids, " ")},

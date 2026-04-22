@@ -139,9 +139,48 @@ func NewHTTPServer(params HTTPServerParams) *HTTPServer {
 func (s *HTTPServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /rtc/join", s.handleJoin)
 	mux.HandleFunc("POST /rtc/connect", s.handleConnect)
+	mux.HandleFunc("POST /rtc/forward-participant", s.handleForwardParticipant)
+	mux.HandleFunc("POST /rtc/remove-participant", s.handleRemoveParticipant)
 	mux.HandleFunc("OPTIONS /rtc/join", func(w http.ResponseWriter, r *http.Request) {})
 	mux.HandleFunc("OPTIONS /rtc/connect", func(w http.ResponseWriter, r *http.Request) {})
+	mux.HandleFunc("OPTIONS /rtc/forward-participant", func(w http.ResponseWriter, r *http.Request) {})
+	mux.HandleFunc("OPTIONS /rtc/remove-participant", func(w http.ResponseWriter, r *http.Request) {})
 	s.registerWHIPRoutes(mux)
+}
+
+// authorizeAdmin verifies the Bearer token and checks that the caller
+// holds a RoomGrant.Admin. When AllowAnonymous is set and no token is
+// presented, the request is accepted (useful for local dev and tests).
+// Otherwise:
+//
+//   - the token must verify;
+//   - RoomGrant.Admin must be true; and
+//   - when roomName != "", the grant must be unscoped (Name == "") OR
+//     match roomName so a tenant cannot act on other tenants' rooms.
+//
+// roomName may be empty when the operation does not target a specific
+// room (for example, "find-by-identity" style APIs that accept the room
+// name in the body and want to authorize strictly on Admin).
+func (s *HTTPServer) authorizeAdmin(r *http.Request, roomName string) (*auth.Claims, *whipErr) {
+	token := extractBearerToken(r)
+	if token == "" && s.cfg.Auth.AllowAnonymous {
+		return anonymousClaims(roomName, true), nil
+	}
+	if token == "" {
+		return nil, &whipErr{status: http.StatusUnauthorized, body: "missing Authorization: Bearer <token>"}
+	}
+	claims, err := s.verifier.Verify(token)
+	if err != nil {
+		return nil, &whipErr{status: http.StatusUnauthorized, body: err.Error()}
+	}
+	if claims.Grants == nil || claims.Grants.Room == nil || !claims.Grants.Room.Admin {
+		return nil, &whipErr{status: http.StatusForbidden, body: "room admin grant required"}
+	}
+	rg := claims.Grants.Room
+	if roomName != "" && rg.Name != "" && rg.Name != roomName {
+		return nil, &whipErr{status: http.StatusForbidden, body: "token is scoped to a different room"}
+	}
+	return claims, nil
 }
 
 func readRequest(r *http.Request, v any) error {

@@ -37,6 +37,9 @@ type RoomManager struct {
 	backupCodecFwdMu sync.RWMutex
 	backupCodecFwd   func(publisherSid, trackSid, publisherNodeId string) error
 
+	forwardersMu sync.Mutex
+	forwarders   map[string]*CrossRoomForwarder
+
 	logger *slog.Logger
 }
 
@@ -59,6 +62,7 @@ func NewRoomManager(params RoomManagerParams) *RoomManager {
 		leaseKV:      params.LeaseKV,
 		nodeID:       params.NodeID,
 		sharedRouter: params.SharedRouter,
+		forwarders:   make(map[string]*CrossRoomForwarder),
 		logger:       slog.Default().With("component", "RoomManager"),
 	}
 }
@@ -388,6 +392,17 @@ func (rm *RoomManager) routerIndexForRoom(roomName string) int {
 }
 
 func (rm *RoomManager) Close() {
+	rm.forwardersMu.Lock()
+	fwds := make([]*CrossRoomForwarder, 0, len(rm.forwarders))
+	for _, f := range rm.forwarders {
+		fwds = append(fwds, f)
+	}
+	rm.forwarders = make(map[string]*CrossRoomForwarder)
+	rm.forwardersMu.Unlock()
+	for _, f := range fwds {
+		f.Close()
+	}
+
 	rm.mu.Lock()
 	rooms := make([]*Room, 0, len(rm.rooms))
 	for _, r := range rm.rooms {
@@ -398,4 +413,165 @@ func (rm *RoomManager) Close() {
 	for _, r := range rooms {
 		r.Close(proto.DisconnectReason_SERVER_SHUTDOWN)
 	}
+}
+
+// ============================================================
+// Cross-room participant forwarding (co-host support)
+// ============================================================
+
+// ForwardParticipant mirrors a participant from srcRoom into dstRoom using
+// the shared RoomStore KV and returns the ParticipantInfo written into the
+// destination room. The returned Participant keeps the source Identity (and
+// Name / Metadata / Attributes), so subscribers in dstRoom see the guest as
+// an ordinary participant. Use RemoveParticipantFromRoom(dstRoom, identity)
+// to tear the forward down.
+//
+// The synthetic participant uses a deterministic SID derived from
+// (srcParticipantSid, dstRoom) so repeated invocations converge on the
+// same entry (idempotent).
+//
+// Media is not re-encoded: subscribers in dstRoom pick up the forwarded
+// tracks via the normal auto-subscribe path and pipe the original producers
+// through FIB + media.Manager. Neither srcRoom nor dstRoom needs to be
+// locally hosted on this node; the shared KV is the source of truth.
+func (rm *RoomManager) ForwardParticipant(srcRoom, srcIdentity, dstRoom string) (*proto.ParticipantInfo, error) {
+	if err := ValidateRoomName(srcRoom); err != nil {
+		return nil, fmt.Errorf("invalid srcRoom: %w", err)
+	}
+	if err := ValidateRoomName(dstRoom); err != nil {
+		return nil, fmt.Errorf("invalid dstRoom: %w", err)
+	}
+	if srcRoom == dstRoom {
+		return nil, fmt.Errorf("srcRoom and dstRoom must differ")
+	}
+	if srcIdentity == "" {
+		return nil, fmt.Errorf("srcIdentity is required")
+	}
+
+	srcStore := NewRoomStore(rm.kv, srcRoom, rm.nodeID)
+	dstStore := NewRoomStore(rm.kv, dstRoom, rm.nodeID)
+
+	var srcInfo *proto.ParticipantInfo
+	for _, p := range srcStore.GetAllParticipants() {
+		if p.Identity != srcIdentity || p.State == proto.ParticipantInfo_DISCONNECTED {
+			continue
+		}
+		srcInfo = p
+		break
+	}
+	if srcInfo == nil {
+		return nil, fmt.Errorf("participant %q not found or disconnected in %q", srcIdentity, srcRoom)
+	}
+
+	key := forwarderKey(dstRoom, srcInfo.Sid)
+
+	rm.forwardersMu.Lock()
+	if _, exists := rm.forwarders[key]; exists {
+		rm.forwardersMu.Unlock()
+		existing := dstStore.GetParticipant(srcInfo.Sid)
+		if existing == nil {
+			return nil, fmt.Errorf("forwarder already registered but participant missing in dstStore")
+		}
+		return existing, nil
+	}
+	rm.forwardersMu.Unlock()
+
+	fwd := NewCrossRoomForwarder(CrossRoomForwarderParams{
+		SrcStore:       srcStore,
+		DstStore:       dstStore,
+		SrcRoom:        srcRoom,
+		DstRoom:        dstRoom,
+		SrcParticipant: srcInfo,
+		OnClose: func(k string) {
+			rm.forwardersMu.Lock()
+			delete(rm.forwarders, k)
+			rm.forwardersMu.Unlock()
+		},
+	})
+	if err := fwd.Start(context.Background()); err != nil {
+		return nil, err
+	}
+
+	rm.forwardersMu.Lock()
+	rm.forwarders[key] = fwd
+	rm.forwardersMu.Unlock()
+
+	info := dstStore.GetParticipant(srcInfo.Sid)
+	if info == nil {
+		info = &proto.ParticipantInfo{
+			Sid:      srcInfo.Sid,
+			Identity: srcInfo.Identity,
+			Name:     srcInfo.Name,
+		}
+	}
+	return info, nil
+}
+
+// RemoveParticipantFromRoom removes a participant from a room by identity.
+// A single KV write uniformly handles both real and forwarded participants:
+//
+//   - Real (locally joined) participant: the hosting node's RoomStore watch
+//     reacts to DISCONNECTED and closes the local session (see
+//     Room.handleStoreParticipantEvent).
+//   - Forwarded participant (mirror created by ForwardParticipant): the
+//     forwarder's destination-room watcher reacts and tears itself down
+//     (see CrossRoomForwarder.runDstWatcher). The source participant in
+//     the origin room is untouched.
+//
+// This avoids any explicit NodeRPC: the shared KV is the source of truth
+// and every owning node reacts to the change. The call is idempotent —
+// unknown / already-disconnected identities return nil.
+func (rm *RoomManager) RemoveParticipantFromRoom(roomName, identity string) error {
+	if err := ValidateRoomName(roomName); err != nil {
+		return fmt.Errorf("invalid room: %w", err)
+	}
+	if identity == "" {
+		return fmt.Errorf("identity is required")
+	}
+
+	roomStore := NewRoomStore(rm.kv, roomName, rm.nodeID)
+
+	var target *proto.ParticipantInfo
+	for _, p := range roomStore.GetAllParticipants() {
+		if p.Identity != identity || p.State == proto.ParticipantInfo_DISCONNECTED {
+			continue
+		}
+		target = p
+		break
+	}
+	if target == nil {
+		return nil
+	}
+
+	kicked := cloneParticipantInfo(target)
+	kicked.State = proto.ParticipantInfo_DISCONNECTED
+	kicked.DisconnectReason = proto.DisconnectReason_PARTICIPANT_REMOVED
+	roomStore.PutParticipant(kicked)
+	rm.logger.Info("Participant kick requested via store",
+		"room", roomName, "identity", identity, "sid", target.Sid, "nodeId", target.NodeId,
+		"forwarded", isForwardedParticipant(target))
+	return nil
+}
+
+// isForwardedParticipant reports whether the given ParticipantInfo was
+// produced by ForwardParticipant (as opposed to an ordinary local join).
+func isForwardedParticipant(p *proto.ParticipantInfo) bool {
+	if p == nil || p.Attributes == nil {
+		return false
+	}
+	_, ok := p.Attributes[ForwardedFromRoomAttr]
+	return ok
+}
+
+// ActiveForwarders returns the process-local forwarder keys of every
+// forwarder hosted by this node. The values are opaque bookkeeping keys
+// (see forwarderKey); primarily used for diagnostics and tests.
+func (rm *RoomManager) ActiveForwarders() []string {
+	rm.forwardersMu.Lock()
+	defer rm.forwardersMu.Unlock()
+	out := make([]string, 0, len(rm.forwarders))
+	for k := range rm.forwarders {
+		out = append(out, k)
+	}
+	return out
 }
