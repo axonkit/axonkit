@@ -1573,10 +1573,22 @@ func (p *Participant) RegisterWHIPProducer(trackSid string, producer *mediasoup.
 		trackSid = string(types.NewStreamID(p.router.Id(), producer.Id()))
 	}
 
+	// WHIP itself does not carry a track-source hint, but downstream SDKs
+	// commonly pivot on `source` (camera/mic) to pick which <video>/<audio>
+	// element to attach to. Default to the obvious value per kind so demos
+	// and dashboards render WHIP ingest out of the box.
+	source := proto.TrackSource_UNKNOWN
+	switch producer.Kind() {
+	case mediasoup.MediaKindAudio:
+		source = proto.TrackSource_MICROPHONE
+	case mediasoup.MediaKindVideo:
+		source = proto.TrackSource_CAMERA
+	}
+
 	track := &PublishedTrack{
 		sid:       trackSid,
 		name:      producer.Id(),
-		source:    proto.TrackSource_UNKNOWN,
+		source:    source,
 		kind:      producer.Kind(),
 		producer:  producer,
 		publisher: p,
