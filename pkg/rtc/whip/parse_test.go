@@ -354,3 +354,88 @@ func TestParseOffer_MissingFingerprint(t *testing.T) {
 		t.Fatalf("expected error for missing fingerprint")
 	}
 }
+
+// ffmpegOffer mirrors what `ffmpeg -f whip` emits for an MP4 source: video
+// only (AAC audio is silently dropped by the WHIP muxer) with a Constrained
+// Baseline H.264 profile-level-id whose *level* (Level 2.2 → 0x16) differs
+// from the one we advertise in caps (Level 3.1 → 0x1f). We still have to
+// negotiate successfully because the profiles are identical.
+const ffmpegOffer = `v=0
+o=FFmpeg 4489045141692799359 2 IN IP4 127.0.0.1
+s=FFmpegPublishSession
+t=0 0
+a=group:BUNDLE 1
+a=extmap-allow-mixed
+a=msid-semantic: WMS
+m=video 9 UDP/TLS/RTP/SAVPF 106 105
+c=IN IP4 0.0.0.0
+a=ice-ufrag:f6b0c82c
+a=ice-pwd:cf12d2f7cdf9745ce6bb53c24da87975
+a=fingerprint:sha-256 AC:BA:B7:A4:92:84:43:FC:D0:F2:C8:33:AC:03:7D:FC:CC:AD:F9:4F:F7:9C:1B:20:90:42:ED:45:33:2A:87:25
+a=setup:passive
+a=mid:1
+a=sendonly
+a=msid:FFmpeg video
+a=rtcp-mux
+a=rtcp-rsize
+a=rtpmap:106 H264/90000
+a=fmtp:106 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=424016
+a=rtcp-fb:106 nack
+a=rtpmap:105 rtx/90000
+a=fmtp:105 apt=106
+a=ssrc-group:FID 2872498389 2872498390
+a=ssrc:2872498389 cname:FFmpeg
+a=ssrc:2872498389 msid:FFmpeg video
+`
+
+func TestParseOffer_FFmpegH264LevelMismatch(t *testing.T) {
+	po, err := ParseOffer(ffmpegOffer, mockCaps())
+	if err != nil {
+		t.Fatalf("ParseOffer: %v", err)
+	}
+	if len(po.Medias) != 1 {
+		t.Fatalf("expected 1 m-line, got %d", len(po.Medias))
+	}
+	v := po.Medias[0]
+	if v.Kind != mediasoup.MediaKindVideo {
+		t.Fatalf("kind: %v", v.Kind)
+	}
+	// Both H.264 (PT=106) and its rtx (PT=105) should survive negotiation.
+	var haveH264, haveRtx bool
+	for _, c := range v.RtpParameters.Codecs {
+		switch strings.ToLower(c.MimeType) {
+		case "video/h264":
+			haveH264 = true
+			if c.Parameters.ProfileLevelId != "424016" {
+				t.Fatalf("expected offer PLI to survive, got %q", c.Parameters.ProfileLevelId)
+			}
+		case "video/rtx":
+			haveRtx = true
+		}
+	}
+	if !haveH264 || !haveRtx {
+		t.Fatalf("codec set incomplete: %+v", v.RtpParameters.Codecs)
+	}
+}
+
+func TestH264ProfileCompatible(t *testing.T) {
+	cases := []struct {
+		name  string
+		a, b  string
+		match bool
+	}{
+		{"same-pli", "42e01f", "42e01f", true},
+		{"cb-different-level", "424016", "42e01f", true}, // offer L2.2 vs cap L3.1, both Constrained Baseline.
+		{"cb-vs-baseline", "42001f", "42e01f", false},    // plain Baseline vs Constrained Baseline.
+		{"main-vs-cb", "4d001f", "42e01f", false},        // Main vs Constrained Baseline.
+		{"constrained-high-vs-high", "640c1f", "64001f", false},
+		{"empty-offer", "", "42e01f", true},
+		{"empty-cap", "42e01f", "", true},
+		{"malformed", "zz", "42e01f", false}, // falls back to literal compare.
+	}
+	for _, tc := range cases {
+		if got := h264ProfileCompatible(tc.a, tc.b); got != tc.match {
+			t.Errorf("%s: h264ProfileCompatible(%q,%q) = %v, want %v", tc.name, tc.a, tc.b, got, tc.match)
+		}
+	}
+}

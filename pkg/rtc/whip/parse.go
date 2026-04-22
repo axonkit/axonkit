@@ -12,6 +12,7 @@
 package whip
 
 import (
+	"encoding/hex"
 	"fmt"
 	"strconv"
 	"strings"
@@ -586,7 +587,7 @@ func findRtxFor(md *sdp.MediaDescription, primary uint32) (uint32, bool) {
 			if err1 != nil || err2 != nil {
 				continue
 			}
-			if uint32(p) == primary {
+			if uint32(p) == primary { //nolint:gocritic
 				return uint32(r), true
 			}
 		}
@@ -640,8 +641,15 @@ func codecParamsCompatible(codec *mediasoup.RtpCodecParameters, cap *mediasoup.R
 		if codec.Parameters.PacketizationMode != cap.Parameters.PacketizationMode {
 			return false
 		}
-		if cap.Parameters.ProfileLevelId != "" && codec.Parameters.ProfileLevelId != "" &&
-			!strings.EqualFold(cap.Parameters.ProfileLevelId, codec.Parameters.ProfileLevelId) {
+		// RFC 6184 §8.2.2: profile-level-id identifies a profile *and* a level,
+		// but negotiation only requires the profile to match — the level is
+		// taken to be the min of the two sides. Doing a literal string compare
+		// (as we did before) rejects perfectly valid offers like ffmpeg's
+		// `profile-level-id=424016` (Constrained Baseline, Level 2.2) against
+		// our caps' `42e01f` (Constrained Baseline, Level 3.1), which are the
+		// same profile. Fall back to the strict compare only when we cannot
+		// decode either side.
+		if !h264ProfileCompatible(codec.Parameters.ProfileLevelId, cap.Parameters.ProfileLevelId) {
 			return false
 		}
 	case strings.HasSuffix(mime, "/vp9"):
@@ -651,6 +659,71 @@ func codecParamsCompatible(codec *mediasoup.RtpCodecParameters, cap *mediasoup.R
 		}
 	}
 	return true
+}
+
+// h264ProfileCompatible reports whether two H.264 `profile-level-id` strings
+// describe the same profile (independent of level). Empty strings on either
+// side are treated as "unknown ⇒ compatible", matching the prior behavior.
+func h264ProfileCompatible(a, b string) bool {
+	if a == "" || b == "" {
+		return true
+	}
+	pa, ioa, ok1 := parseH264ProfileIdc(a)
+	pb, iob, ok2 := parseH264ProfileIdc(b)
+	if !ok1 || !ok2 {
+		// Undecodable — be conservative and fall back to the literal compare.
+		return strings.EqualFold(a, b)
+	}
+	return h264ProfileName(pa, ioa) == h264ProfileName(pb, iob)
+}
+
+// parseH264ProfileIdc decodes the first two bytes (profile_idc, profile_iop)
+// of a 6-hex-digit profile-level-id. Returns ok=false on any malformed input.
+func parseH264ProfileIdc(pli string) (idc, iop byte, ok bool) {
+	if len(pli) != 6 {
+		return 0, 0, false
+	}
+	b, err := hex.DecodeString(pli)
+	if err != nil || len(b) != 3 {
+		return 0, 0, false
+	}
+	return b[0], b[1], true
+}
+
+// h264ProfileName maps (profile_idc, profile_iop) to a canonical profile
+// identifier per RFC 6184 Annex A, matching libwebrtc's `H264Profile` enum for
+// the profiles WebRTC actually negotiates. Unknown profile_idc values collapse
+// to a distinct bucket so they only match themselves.
+func h264ProfileName(idc, iop byte) string {
+	// Bit layout of profile_iop (MSB first):
+	//   cs0 cs1 cs2 cs3 cs4 cs5 0 0
+	cs1 := iop&0x40 != 0
+	cs4 := iop&0x08 != 0
+	cs5 := iop&0x04 != 0
+	switch idc {
+	case 0x42, 0x4d: // Baseline / Main — constraint_set1_flag promotes to Constrained Baseline.
+		if cs1 {
+			return "ConstrainedBaseline"
+		}
+		if idc == 0x42 {
+			return "Baseline"
+		}
+		return "Main"
+	case 0x58:
+		return "Extended"
+	case 0x64: // High — cs4 && cs5 promote to Constrained High.
+		if cs4 && cs5 {
+			return "ConstrainedHigh"
+		}
+		return "High"
+	case 0x6e:
+		return "High10"
+	case 0x7a:
+		return "High422"
+	case 0xf4:
+		return "High444Predictive"
+	}
+	return fmt.Sprintf("idc=0x%02x", idc)
 }
 
 func mergeFeedback(existing, extra []*mediasoup.RtcpFeedback) []*mediasoup.RtcpFeedback {

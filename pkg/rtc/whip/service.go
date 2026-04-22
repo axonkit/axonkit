@@ -115,9 +115,17 @@ func (s *Service) CreateWHIP(opts CreateWHIPOptions) (*CreateWHIPResult, error) 
 		return nil, fmt.Errorf("parse offer: %w", err)
 	}
 
+	answerSetup, remoteDtlsRole := negotiateDtlsRole(parsed.DtlsSetup)
 	if err := transport.Connect(&mediasoup.TransportConnectOptions{
 		DtlsParameters: &mediasoup.DtlsParameters{
-			Role:         mediasoup.DtlsRoleClient, // client side of DTLS
+			// Role here is the *remote* peer's DTLS role; mediasoup takes the
+			// opposite. Must stay consistent with the `a=setup` we answer
+			// with, otherwise both sides wait for a ClientHello (→ timeout)
+			// or both send one (→ handshake failure). The `a=setup:passive`
+			// + `Role=Client` default works for browsers/OBS (they offer
+			// actpass) but breaks ffmpeg, which offers `setup:passive` and
+			// expects *us* to initiate.
+			Role:         remoteDtlsRole,
 			Fingerprints: []mediasoup.DtlsFingerprint{parsed.DtlsFingerprint},
 		},
 	}); err != nil {
@@ -170,7 +178,7 @@ func (s *Service) CreateWHIP(opts CreateWHIPOptions) (*CreateWHIPResult, error) 
 		IceParameters:  &data.IceParameters,
 		IceCandidates:  data.IceCandidates,
 		DtlsParameters: &data.DtlsParameters,
-		DtlsSetup:      "passive", // server is DTLS server in WHIP
+		DtlsSetup:      answerSetup,
 		Medias:         medias,
 	})
 	if err != nil {
@@ -178,7 +186,7 @@ func (s *Service) CreateWHIP(opts CreateWHIPOptions) (*CreateWHIPResult, error) 
 		return nil, fmt.Errorf("build answer: %w", err)
 	}
 
-	s.Logger.Info("WHIP published", "producers", len(producers))
+	s.Logger.Info("WHIP published", "producers", len(producers), "dtlsSetup", answerSetup)
 
 	return &CreateWHIPResult{
 		Transport: transport,
@@ -234,9 +242,10 @@ func (s *Service) CreateWHEP(opts CreateWHEPOptions) (*CreateWHEPResult, error) 
 		transport.Close()
 		return nil, fmt.Errorf("parse offer: %w", err)
 	}
+	answerSetup, remoteDtlsRole := negotiateDtlsRole(parsed.DtlsSetup)
 	if err := transport.Connect(&mediasoup.TransportConnectOptions{
 		DtlsParameters: &mediasoup.DtlsParameters{
-			Role:         mediasoup.DtlsRoleClient,
+			Role:         remoteDtlsRole,
 			Fingerprints: []mediasoup.DtlsFingerprint{parsed.DtlsFingerprint},
 		},
 	}); err != nil {
@@ -315,7 +324,7 @@ func (s *Service) CreateWHEP(opts CreateWHEPOptions) (*CreateWHEPResult, error) 
 		IceParameters:  &data.IceParameters,
 		IceCandidates:  data.IceCandidates,
 		DtlsParameters: &data.DtlsParameters,
-		DtlsSetup:      "passive",
+		DtlsSetup:      answerSetup,
 		Medias:         medias,
 	})
 	if err != nil {
@@ -447,4 +456,32 @@ func indexByte(s string, b byte) int {
 		}
 	}
 	return -1
+}
+
+// negotiateDtlsRole derives the local DTLS setup (for the `a=setup:` line in
+// the answer) and the remote peer's DTLS role (for mediasoup's
+// TransportConnectOptions) from the offer's `a=setup` attribute.
+//
+// RFC 5763 §5: only one side can be the DTLS client. The offerer proposes a
+// role, the answerer picks the complement:
+//
+//	offer=active   → remote is DTLS client → answer setup:passive, role=client
+//	offer=passive  → remote is DTLS server → answer setup:active,  role=server
+//	offer=actpass  → we choose; prefer passive for parity with historical
+//	                 behaviour (works with all browsers, OBS, GStreamer).
+//	offer=""       → treated as actpass; some minimal WHIP clients omit setup.
+//
+// Keeping the answer's `a=setup` and mediasoup's `DtlsRole` in lockstep is
+// critical: a mismatch makes mediasoup silently act opposite to what the peer
+// expects, manifesting as a 5s DTLS handshake timeout (typical ffmpeg
+// symptom: `DTLS handshake timeout=5000ms ... state=6`).
+func negotiateDtlsRole(offerSetup string) (answerSetup string, remoteRole mediasoup.DtlsRole) {
+	switch offerSetup {
+	case "active":
+		return "passive", mediasoup.DtlsRoleClient
+	case "passive":
+		return "active", mediasoup.DtlsRoleServer
+	default: // "actpass" or unspecified
+		return "passive", mediasoup.DtlsRoleClient
+	}
 }

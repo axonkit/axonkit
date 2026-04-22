@@ -1,6 +1,31 @@
 package whip
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/jiyeyuran/mediasoup-go/v2"
+)
+
+func TestNegotiateDtlsRole(t *testing.T) {
+	cases := []struct {
+		offer    string
+		wantAns  string
+		wantRole mediasoup.DtlsRole
+	}{
+		{"actpass", "passive", mediasoup.DtlsRoleClient},
+		{"active", "passive", mediasoup.DtlsRoleClient},
+		{"passive", "active", mediasoup.DtlsRoleServer},
+		{"", "passive", mediasoup.DtlsRoleClient}, // missing attribute → treat as actpass.
+		{"garbage", "passive", mediasoup.DtlsRoleClient},
+	}
+	for _, tc := range cases {
+		ans, role := negotiateDtlsRole(tc.offer)
+		if ans != tc.wantAns || role != tc.wantRole {
+			t.Errorf("negotiateDtlsRole(%q) = (%q, %v), want (%q, %v)",
+				tc.offer, ans, role, tc.wantAns, tc.wantRole)
+		}
+	}
+}
 
 func TestRegistry_AddGetRemove(t *testing.T) {
 	reg := NewRegistry()
