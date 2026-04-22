@@ -16,7 +16,7 @@ import (
 )
 
 // RoomStateBucketTTL is the JetStream KV max age for the ROOM_STATE bucket.
-const RoomStateBucketTTL = 7 * 24 * time.Hour
+const RoomStateBucketTTL = 3 * 24 * time.Hour
 
 // RoomLeaseBucketName is the JetStream KV bucket dedicated to room liveness rows.
 const RoomLeaseBucketName = "ROOM_LEASE"
@@ -554,8 +554,17 @@ func (s *RoomStore) Watch(ctx context.Context) (*RoomStoreWatchResult, error) {
 	ch := make(chan *RoomStoreEvent, 64)
 	go func() {
 		defer close(ch)
+		// Track the NATS KV history replay phase. The bucket has a week-long
+		// MaxAge (RoomStateBucketTTL), so a fresh watcher can receive dozens
+		// of tombstones from long-departed sessions before the live tail
+		// kicks in. We have no local state to reconcile against during the
+		// snapshot, so those deletes are pure noise — silence them (both in
+		// the log and on the channel). Live deletes after the snapshot are
+		// still forwarded normally.
+		inSnapshot := true
 		for entry := range watcher.Updates() {
 			if entry == nil {
+				inSnapshot = false
 				// nil sentinel from store → pass through
 				select {
 				case ch <- nil:
@@ -563,6 +572,9 @@ func (s *RoomStore) Watch(ctx context.Context) (*RoomStoreWatchResult, error) {
 					watcher.Stop()
 					return
 				}
+				continue
+			}
+			if inSnapshot && entry.Operation() == store.OpDelete {
 				continue
 			}
 			evt := s.parseEvent(entry)
