@@ -246,9 +246,7 @@ func (s *Service) CreateWHEP(opts CreateWHEPOptions) (*CreateWHEPResult, error) 
 
 	sess := &Session{
 		ID:                     opts.ResourceID,
-		Mode:                   ModeWHEP,
 		Transport:              transport,
-		Router:                 router,
 		ICEDisconnectedTimeout: s.ICEDisconnectedTimeout,
 		Keepalive:              opts.Keepalive,
 		logger:                 s.Logger,
@@ -281,6 +279,10 @@ func (s *Service) CreateWHEP(opts CreateWHEPOptions) (*CreateWHEPResult, error) 
 			return nil, fmt.Errorf("consume producer=%q mid=%q: %w", producer.Id(), pm.Mid, err)
 		}
 		sess.Consumers = append(sess.Consumers, consumer)
+		// Proactively close the session once every consumer has seen its
+		// upstream producer go away, so we don't keep a dead WHEP resource
+		// alive for the full ICE watchdog window.
+		consumer.OnProducerClose(sess.HandleConsumerProducerClosed)
 
 		ma := &MediaAnswer{
 			Mid:        pm.Mid,

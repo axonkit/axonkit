@@ -15,7 +15,6 @@ func TestSession_SupervisorFiresAfterDisconnect(t *testing.T) {
 	var called atomic.Int32
 	sess := &Session{
 		ID:                     "test-session",
-		Mode:                   ModeWHIP,
 		ICEDisconnectedTimeout: 60 * time.Millisecond,
 		KeepaliveInterval:      20 * time.Millisecond,
 	}
@@ -42,7 +41,6 @@ func TestSession_SupervisorICERecoveredDisarms(t *testing.T) {
 	var called atomic.Int32
 	sess := &Session{
 		ID:                     "test-session",
-		Mode:                   ModeWHIP,
 		ICEDisconnectedTimeout: 80 * time.Millisecond,
 		KeepaliveInterval:      20 * time.Millisecond,
 	}
@@ -64,7 +62,6 @@ func TestSession_KeepaliveTicks(t *testing.T) {
 	var count atomic.Int32
 	sess := &Session{
 		ID:                "ka-session",
-		Mode:              ModeWHIP,
 		KeepaliveInterval: 20 * time.Millisecond,
 		Keepalive: func() {
 			count.Add(1)
@@ -85,7 +82,6 @@ func TestSession_CloseStopsSupervisor(t *testing.T) {
 	var called atomic.Int32
 	sess := &Session{
 		ID:                     "close-session",
-		Mode:                   ModeWHIP,
 		ICEDisconnectedTimeout: 30 * time.Millisecond,
 		KeepaliveInterval:      10 * time.Millisecond,
 	}
@@ -100,7 +96,7 @@ func TestSession_CloseStopsSupervisor(t *testing.T) {
 }
 
 func TestSession_CloseIdempotent(t *testing.T) {
-	sess := &Session{ID: "idem", Mode: ModeWHIP, KeepaliveInterval: 50 * time.Millisecond}
+	sess := &Session{ID: "idem", KeepaliveInterval: 50 * time.Millisecond}
 	sess.Start(nil)
 	sess.Close()
 	sess.Close() // must not panic (close of closed channel would)

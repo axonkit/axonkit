@@ -4,7 +4,7 @@ import "testing"
 
 func TestRegistry_AddGetRemove(t *testing.T) {
 	reg := NewRegistry()
-	s := &Session{Mode: ModeWHEP}
+	s := &Session{}
 	id, err := reg.Add(s)
 	if err != nil {
 		t.Fatalf("Add: %v", err)
@@ -25,11 +25,11 @@ func TestRegistry_AddGetRemove(t *testing.T) {
 
 func TestRegistry_AddDuplicate(t *testing.T) {
 	reg := NewRegistry()
-	s1 := &Session{ID: "alice", Mode: ModeWHEP}
+	s1 := &Session{ID: "alice"}
 	if _, err := reg.Add(s1); err != nil {
 		t.Fatalf("first Add: %v", err)
 	}
-	s2 := &Session{ID: "alice", Mode: ModeWHEP}
+	s2 := &Session{ID: "alice"}
 	if _, err := reg.Add(s2); err != ErrResourceTaken {
 		t.Fatalf("expected ErrResourceTaken, got %v", err)
 	}

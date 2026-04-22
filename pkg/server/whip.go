@@ -235,8 +235,6 @@ func (s *HTTPServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result.Session.RoomName = roomName
-	result.Session.ParticipantID = participantID
-	result.Session.NodeID = nodeID
 	// On session close we must drop the discovery entry so a re-created
 	// session at a new node doesn't hit a stale record first. For "prefix"
 	// scheme this is a no-op.

@@ -1,6 +1,7 @@
 package whip
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"sync"
@@ -37,28 +38,14 @@ const DefaultKeepaliveInterval = 10 * time.Second
 // disconnected for longer than ICEDisconnectedTimeout.
 type Session struct {
 	ID        string
-	Mode      Mode
 	Transport *mediasoup.Transport
-	Router    *mediasoup.Router
-	Producers []*mediasoup.Producer
 	Consumers []*mediasoup.Consumer
 
 	// RoomName identifies the room-scoped HTTP resource path.
 	RoomName string
 
-	// ParticipantID tracks the target participant identity for WHEP sessions.
-	ParticipantID string
-
-	// NodeID identifies the node currently owning the resource.
-	NodeID string
-
-	// Published/subscribed track sids, stable across PATCH calls.
-	TrackSids []string
-
 	// ETag = IceUfrag of the current ICE session; rotated on ICE restart.
 	ETag string
-
-	CreatedAt time.Time
 
 	// OnClose is invoked (from Close) after Transport is torn down. Used by
 	// the server glue to clean up a linked Participant / Room and any KV
@@ -130,14 +117,13 @@ func (s *Session) Start(onExpire func(id string)) {
 		case mediasoup.IceStateDisconnected:
 			if s.disconnectedAt.IsZero() {
 				s.disconnectedAt = time.Now()
-				s.logger.Warn("WHIP/WHEP ICE disconnected, supervisor armed",
-					"sessionId", s.ID, "mode", s.Mode)
+				s.logger.Warn("WHEP ICE disconnected, supervisor armed",
+					"sessionId", s.ID)
 			}
 		case mediasoup.IceStateConnected, mediasoup.IceStateCompleted:
 			if !s.disconnectedAt.IsZero() {
 				s.disconnectedAt = time.Time{}
-				s.logger.Info("WHIP/WHEP ICE recovered",
-					"sessionId", s.ID, "mode", s.Mode)
+				s.logger.Info("WHEP ICE recovered", "sessionId", s.ID)
 			}
 		}
 	})
@@ -187,8 +173,8 @@ func (s *Session) supervise() {
 
 			if !disconnected.IsZero() && now.Sub(disconnected) >= timeout {
 				if s.logger != nil {
-					s.logger.Warn("WHIP/WHEP ICE watchdog expired; tearing down session",
-						"sessionId", s.ID, "mode", s.Mode, "timeout", timeout)
+				s.logger.Warn("WHEP ICE watchdog expired; tearing down session",
+					"sessionId", s.ID, "timeout", timeout)
 				}
 				if s.onExpire != nil {
 					s.onExpire(s.ID)
@@ -225,6 +211,39 @@ func (s *Session) ICERecovered() {
 	s.mu.Lock()
 	s.disconnectedAt = time.Time{}
 	s.mu.Unlock()
+}
+
+// HandleConsumerProducerClosed is wired into every Consumer's
+// OnProducerClose listener by CreateWHEP. Once every consumer attached to
+// this WHEP session has lost its upstream producer there's nothing left to
+// deliver, so we tear the session down proactively instead of waiting for
+// the ICE watchdog to fire.
+//
+// We prefer onExpire over Close() so the Registry entry is cleaned up too
+// — Close() on its own would leave a dangling id in the map.
+func (s *Session) HandleConsumerProducerClosed(_ context.Context) {
+	s.mu.Lock()
+	consumers := s.Consumers
+	onExpire := s.onExpire
+	id := s.ID
+	logger := s.logger
+	s.mu.Unlock()
+
+	for _, c := range consumers {
+		if c != nil && !c.Closed() {
+			return
+		}
+	}
+
+	if logger != nil {
+		logger.Info("All WHEP consumers lost upstream producers; closing session",
+			"sessionId", id)
+	}
+	if onExpire != nil {
+		onExpire(id)
+	} else {
+		s.Close()
+	}
 }
 
 // Close tears down all mediasoup resources held by the session and stops
@@ -285,9 +304,6 @@ func NewRegistry() *Registry {
 func (r *Registry) Add(s *Session) (string, error) {
 	if s.ID == "" {
 		s.ID = xid.New().String()
-	}
-	if s.CreatedAt.IsZero() {
-		s.CreatedAt = time.Now()
 	}
 	r.mu.Lock()
 	if _, exists := r.sessions[s.ID]; exists {
