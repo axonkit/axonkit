@@ -141,6 +141,21 @@ func selectWHEPTracks(tracks []rtc.LiveTrack) []*mediasoup.Producer {
 	return out
 }
 
+// whepPipeResolver returns a whip.CreateWHEPOptions.ResolveProducerID hook
+// that routes each producer through the publisher's RouterPipe cache when
+// the destination router differs. When publisher is nil (e.g. the track
+// is only visible via the cross-node store) the resolver is a no-op; the
+// WHEP service then falls back to producer.Id() verbatim, which matches
+// pre-pipe behavior for single-worker deployments.
+func whepPipeResolver(publisher *rtc.Participant) func(*mediasoup.Router, *mediasoup.Producer) (string, error) {
+	if publisher == nil {
+		return nil
+	}
+	return func(dest *mediasoup.Router, p *mediasoup.Producer) (string, error) {
+		return publisher.PipeProducerTo(p.Id(), dest)
+	}
+}
+
 func (s *HTTPServer) registerWHIPRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /whip/{room}", s.handleWHIPPost)
 	mux.HandleFunc("PATCH /whip/{room}/{resourceId}", s.handleWHIPPatch)
@@ -199,7 +214,7 @@ func (s *HTTPServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, _, err = s.findParticipantByIdentity(roomName, participantID)
+	publisher, _, err := s.findParticipantByIdentity(roomName, participantID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
@@ -224,11 +239,20 @@ func (s *HTTPServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
 	// overhead.
 	keepalive := s.whepKeepaliveFunc(resourceID, nodeID)
 
+	// Producers are Router-scoped: each mediasoup worker runs its own
+	// Router, and Transport.Consume(producerId) only resolves ids from the
+	// same Router. When the WHEP factory happens to pick a different
+	// worker than the one hosting the publisher, bridge the two via
+	// PipeToRouter so the consumer transport sees a local copy of the
+	// producer. The same cache that powers SFU cross-router subscribe
+	// (rtc.Participant.PipeProducerTo) is reused here so a single pipe
+	// is shared across both signalling protocols.
 	result, err := s.whipSvc.CreateWHEP(whip.CreateWHEPOptions{
-		OfferSDP:   offerSDP,
-		Producers:  producers,
-		ResourceID: resourceID,
-		Keepalive:  keepalive,
+		OfferSDP:          offerSDP,
+		Producers:         producers,
+		ResourceID:        resourceID,
+		Keepalive:         keepalive,
+		ResolveProducerID: whepPipeResolver(publisher),
 	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, proto.ErrorResponse{Code: proto.ErrCodeInternal, Error: err.Error()})

@@ -210,6 +210,18 @@ type CreateWHEPOptions struct {
 	// HTTP layer can refresh external state (e.g. a "WHEP_LOC" KV entry
 	// used for cross-node PATCH/DELETE routing).
 	Keepalive func()
+	// ResolveProducerID, when non-nil, is called once per consumed
+	// producer just before Transport.Consume, with the destination router
+	// chosen by the factory. Implementations return the producer id that
+	// is reachable from dest — typically by invoking PipeToRouter when
+	// the source router differs. When nil the service falls back to
+	// producer.Id() verbatim (which only works when all producers are
+	// co-located with the destination router — true of single-worker
+	// deployments but not of the default multi-worker setup).
+	//
+	// Kind() matching against the SDP offer continues to use the original
+	// producer handle, because kind is invariant across PipeToRouter.
+	ResolveProducerID func(dest *mediasoup.Router, producer *mediasoup.Producer) (string, error)
 }
 
 // CreateWHEPResult is the data needed to respond to a WHEP POST.
@@ -277,15 +289,30 @@ func (s *Service) CreateWHEP(opts CreateWHEPOptions) (*CreateWHEPResult, error) 
 		producer := remaining[idx]
 		remaining = append(remaining[:idx], remaining[idx+1:]...)
 
+		// Producers are Router-scoped: if the factory handed us a
+		// transport on a router other than the producer's, the raw
+		// producer.Id() won't resolve inside Transport.Consume. The
+		// caller (typically the HTTP layer, which owns cross-router
+		// piping via rtc.RouterPipe) translates the id up-front.
+		producerID := producer.Id()
+		if opts.ResolveProducerID != nil {
+			resolved, err := opts.ResolveProducerID(router, producer)
+			if err != nil {
+				sess.Close()
+				return nil, fmt.Errorf("resolve producer=%q mid=%q: %w", producer.Id(), pm.Mid, err)
+			}
+			producerID = resolved
+		}
+
 		consumer, err := transport.Consume(&mediasoup.ConsumerOptions{
-			ProducerId:      producer.Id(),
+			ProducerId:      producerID,
 			RtpCapabilities: chooseConsumerCaps(pm.RtpParameters, caps),
 			Paused:          false,
 			Mid:             pm.Mid,
 		})
 		if err != nil {
 			sess.Close()
-			return nil, fmt.Errorf("consume producer=%q mid=%q: %w", producer.Id(), pm.Mid, err)
+			return nil, fmt.Errorf("consume producer=%q mid=%q: %w", producerID, pm.Mid, err)
 		}
 		sess.Consumers = append(sess.Consumers, consumer)
 		// Proactively close the session once every consumer has seen its

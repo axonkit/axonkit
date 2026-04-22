@@ -84,12 +84,10 @@ func WithLogging(next http.Handler) http.Handler {
 			"method", r.Method, "path", r.URL.Path,
 			"status", lrw.status, "bytes", lrw.bytes,
 			"logId", logId, "duration_ms", time.Since(start).Milliseconds(),
+			"reqBody", reqBodyBuf.String(),
+			"respBody", lrw.body.String(),
 		}
 		if lrw.status >= 500 {
-			attrs = append(attrs,
-				"reqBody", reqBodyBuf.String(),
-				"respBody", lrw.body.String(),
-			)
 			slog.Error("HTTP request", attrs...)
 			return
 		}
@@ -138,9 +136,16 @@ func (t *teeReadCloser) Close() error { return t.src.Close() }
 func WithCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, PATCH, DELETE")
 		w.Header().Set("Access-Control-Allow-Headers", "*")
-		// w.Header().Set("Access-Control-Max-Age", "86400")
+		// Expose headers the WHIP/WHEP RFC 9725 resource-oriented flow
+		// depends on: browsers would otherwise strip them from
+		// fetch().headers, which causes clients to bail out with
+		// "Response missing location header" (for POST→201) and lose
+		// ETag/Link on subsequent PATCH/DELETE round-trips. X-Node-Id is
+		// our own telemetry header and harmless to include.
+		w.Header().Set("Access-Control-Expose-Headers", "Location, ETag, Link, Content-Type, X-Node-Id")
+		w.Header().Set("Access-Control-Max-Age", "86400")
 
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
