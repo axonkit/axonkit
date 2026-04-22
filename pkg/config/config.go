@@ -14,6 +14,29 @@ type Config struct {
 	Media MediaConfig `json:"media"`
 	Auth  AuthConfig  `json:"auth"`
 	Nats  NatsConfig  `json:"nats"`
+	Whip  WhipConfig  `json:"whip"`
+}
+
+// WHEP resource-id routing schemes. The scheme decides how a node that
+// receives a PATCH/DELETE locates the node currently owning the session.
+const (
+	// WhepRoutingPrefix encodes the owner NodeID directly in the resource
+	// id as "{nodeID}.{xid}". Any node can parse and forward without
+	// touching KV. A node restart invalidates its WHEP sessions anyway,
+	// so the "nodeID might be renamed" caveat is moot in practice.
+	WhepRoutingPrefix = "prefix"
+	// WhepRoutingKV maintains a NATS KV bucket (resourceID → nodeID)
+	// refreshed by the session's keepalive. Survives node renames; costs
+	// one KV lookup per cross-node request.
+	WhepRoutingKV = "kv"
+)
+
+// WhipConfig tunes WHIP/WHEP specific behaviour.
+type WhipConfig struct {
+	// WhepRouting selects the distributed-lookup scheme for WHEP
+	// PATCH/DELETE. See the WhepRouting* constants. Defaults to
+	// WhepRoutingPrefix.
+	WhepRouting string `json:"whepRouting"`
 }
 
 type NodeConfig struct {
@@ -106,6 +129,9 @@ func DefaultConfig() *Config {
 		Auth: AuthConfig{
 			TokenTTL:        6 * time.Hour,
 			RefreshTokenTTL: 7 * 24 * time.Hour,
+		},
+		Whip: WhipConfig{
+			WhepRouting: WhepRoutingPrefix,
 		},
 	}
 }

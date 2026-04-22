@@ -842,13 +842,14 @@ func (r *Room) AddParticipant(p *Participant) error {
 	var remoteKicks []*proto.ParticipantInfo
 	if existing == nil {
 		for _, info := range r.storeParticipants {
-			if info.Identity == p.identity && info.Sid != p.sid && r.participants[info.Sid] == nil {
-				kicked := cloneParticipantInfo(info)
-				kicked.State = proto.ParticipantInfo_DISCONNECTED
-				kicked.DisconnectReason = proto.DisconnectReason_DUPLICATE_IDENTITY
-				remoteKicks = append(remoteKicks, kicked)
-				effectiveCount--
+			if info.Identity != p.identity || info.Sid == p.sid || r.participants[info.Sid] != nil {
+				continue
 			}
+			kicked := cloneParticipantInfo(info)
+			kicked.State = proto.ParticipantInfo_DISCONNECTED
+			kicked.DisconnectReason = proto.DisconnectReason_DUPLICATE_IDENTITY
+			remoteKicks = append(remoteKicks, kicked)
+			effectiveCount--
 		}
 	}
 	if r.config.MaxParticipants > 0 && effectiveCount >= r.config.MaxParticipants {
@@ -925,6 +926,25 @@ func (r *Room) GetParticipant(sid string) *Participant {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.participants[sid]
+}
+
+// LookupParticipantInfo returns the ParticipantInfo for a given sid from
+// either the local runtime or the distributed store cache. It returns nil
+// when no such participant exists anywhere the room has synced.
+//
+// This is used by distributed endpoints (e.g. WHIP PATCH/DELETE) to decide
+// whether to handle the request locally or forward it to the owning node
+// identified by ParticipantInfo.NodeId.
+func (r *Room) LookupParticipantInfo(sid string) *proto.ParticipantInfo {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if p := r.participants[sid]; p != nil {
+		return p.ToProto()
+	}
+	if info := r.storeParticipants[sid]; info != nil {
+		return cloneParticipantInfo(info)
+	}
+	return nil
 }
 
 // FindPublishedTrack looks up a published track by its SID across all participants.

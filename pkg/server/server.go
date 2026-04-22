@@ -13,7 +13,6 @@ import (
 	"github.com/axonkit/axonkit/pkg/media"
 	"github.com/axonkit/axonkit/pkg/routing"
 	"github.com/axonkit/axonkit/pkg/rtc"
-	"github.com/axonkit/axonkit/pkg/rtc/whip"
 	"github.com/axonkit/axonkit/pkg/store"
 	"github.com/axonkit/axonkit/pkg/types"
 
@@ -151,12 +150,6 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		return nil, fmt.Errorf("room lease store: %w", err)
 	}
 
-	whipKV, err := store.NewNatsStore(context.Background(), js, whip.ResourceBucketName, whip.ResourceBucketTTL)
-	if err != nil {
-		n.closeDeps()
-		return nil, fmt.Errorf("whip resource store: %w", err)
-	}
-
 	roomManager := rtc.NewRoomManager(rtc.RoomManagerParams{
 		Config:       cfg.Room,
 		MediaManager: mediaMgr,
@@ -170,6 +163,18 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	nodeRPC := NewNodeRPCService(nc, myNode.ID)
 	n.nodeRPC = nodeRPC
 
+	// Provision the WHEP routing KV only if the operator opted into the
+	// "kv" scheme. The "prefix" scheme is KV-free and costs nothing at
+	// startup.
+	var whepLocKV store.Store
+	if cfg.Whip.WhepRouting == config.WhepRoutingKV {
+		whepLocKV, err = store.NewNatsStore(context.Background(), js, whepLocBucket, whepLocTTL)
+		if err != nil {
+			n.closeDeps()
+			return nil, fmt.Errorf("whep location store: %w", err)
+		}
+	}
+
 	verifier := auth.NewTokenVerifier(cfg.Auth.APIKey, cfg.Auth.APISecret)
 	httpAPI := NewHTTPServer(HTTPServerParams{
 		Config:        cfg,
@@ -179,8 +184,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		NodeRPC:       nodeRPC,
 		Routers:       mediaMgr.Routers(),
 		WebRtcServers: mediaMgr.WebRtcServers(),
-		MediaManager:  mediaMgr,
-		WHIPKV:        whipKV,
+		WhepLocKV:     whepLocKV,
 	})
 	n.httpAPI = httpAPI
 	registerDefaultNodeRPCHandlers(nodeRPC, httpAPI, roomManager)

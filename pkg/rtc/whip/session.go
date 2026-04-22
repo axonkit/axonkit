@@ -44,10 +44,14 @@ type Session struct {
 	Producers []*mediasoup.Producer
 	Consumers []*mediasoup.Consumer
 
-	// RoomName is set when the session is also attached to a room participant.
-	// The higher-level server code owns the participant lifecycle — see
-	// OnClose below to hook into session teardown.
+	// RoomName identifies the room-scoped HTTP resource path.
 	RoomName string
+
+	// ParticipantID tracks the target participant identity for WHEP sessions.
+	ParticipantID string
+
+	// NodeID identifies the node currently owning the resource.
+	NodeID string
 
 	// Published/subscribed track sids, stable across PATCH calls.
 	TrackSids []string

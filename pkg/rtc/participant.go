@@ -851,11 +851,12 @@ func (p *Participant) RequestBackupCodecForTrack(trackSid string) error {
 	return nil
 }
 
-func (p *Participant) Sid() string               { return p.sid }
-func (p *Participant) Identity() string          { return p.identity }
-func (p *Participant) Name() string              { return p.name }
-func (p *Participant) Room() *Room               { return p.room }
-func (p *Participant) Router() *mediasoup.Router { return p.router }
+func (p *Participant) Sid() string                         { return p.sid }
+func (p *Participant) Identity() string                    { return p.identity }
+func (p *Participant) Name() string                        { return p.name }
+func (p *Participant) Room() *Room                         { return p.room }
+func (p *Participant) Router() *mediasoup.Router           { return p.router }
+func (p *Participant) SendTransport() *mediasoup.Transport { return p.sendTransport }
 
 func (p *Participant) IsPublisher() bool {
 	p.mu.RLock()
@@ -1226,14 +1227,11 @@ func (p *Participant) SetTransports(send, recv, direct *mediasoup.Transport) {
 	p.recvTransport = recv
 	p.directTransport = direct
 
-	iceHandler := func(state mediasoup.IceState) {
-		p.handleIceStateChange(state)
-	}
 	if send != nil {
-		send.OnIceStateChange(iceHandler)
+		send.OnIceStateChange(p.handleIceStateChange)
 	}
 	if recv != nil {
-		recv.OnIceStateChange(iceHandler)
+		recv.OnIceStateChange(p.handleIceStateChange)
 	}
 }
 

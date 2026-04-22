@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/axonkit/axonkit/pkg/proto"
 	"github.com/axonkit/axonkit/pkg/rtc"
+	"github.com/axonkit/axonkit/pkg/rtc/whip"
 	"github.com/axonkit/axonkit/pkg/types"
 	"github.com/nats-io/nats.go"
 )
@@ -23,6 +25,10 @@ const (
 	NodeRPCActionReconnect          = "reconnect"
 	NodeRPCActionConnect            = "connect"
 	NodeRPCActionRequestBackupCodec = "request_backup_codec"
+	NodeRPCActionWHIPPatch          = "whip_patch"
+	NodeRPCActionWHIPDelete         = "whip_delete"
+	NodeRPCActionWHEPPatch          = "whep_patch"
+	NodeRPCActionWHEPDelete         = "whep_delete"
 )
 
 // NodeRPCHandler handles one action for the local node. Returns HTTP-style status and JSON body.
@@ -216,6 +222,69 @@ func registerDefaultNodeRPCHandlers(svc *NodeRPCService, api *HTTPServer, rm *rt
 		return rec.statusAndBody()
 	})
 
+	svc.Register(NodeRPCActionWHIPPatch, func(p json.RawMessage) (int, json.RawMessage) {
+		var req whipRPCRequest
+		if err := json.Unmarshal(p, &req); err != nil {
+			return http.StatusBadRequest, rpcErrPayload(proto.ErrCodeInvalidRequest, err.Error())
+		}
+		etag, err := api.patchWHIPParticipantLocal(req.RoomName, req.ResourceID, req.IfMatch, req.Body)
+		if err != nil {
+			if errors.Is(err, whip.ErrSessionNotFound) {
+				return http.StatusNotFound, rpcErrPayload(proto.ErrCodeNotFound, err.Error())
+			}
+			return http.StatusInternalServerError, rpcErrPayload(proto.ErrCodeInternal, err.Error())
+		}
+		body, _ := json.Marshal(struct {
+			ETag string `json:"etag,omitempty"`
+		}{ETag: etag})
+		return http.StatusNoContent, body
+	})
+
+	svc.Register(NodeRPCActionWHIPDelete, func(p json.RawMessage) (int, json.RawMessage) {
+		var req whipRPCRequest
+		if err := json.Unmarshal(p, &req); err != nil {
+			return http.StatusBadRequest, rpcErrPayload(proto.ErrCodeInvalidRequest, err.Error())
+		}
+		if err := api.deleteWHIPParticipantLocal(req.RoomName, req.ResourceID); err != nil {
+			if errors.Is(err, whip.ErrSessionNotFound) {
+				return http.StatusNotFound, rpcErrPayload(proto.ErrCodeNotFound, err.Error())
+			}
+			return http.StatusInternalServerError, rpcErrPayload(proto.ErrCodeInternal, err.Error())
+		}
+		return http.StatusOK, json.RawMessage("{}")
+	})
+
+	svc.Register(NodeRPCActionWHEPPatch, func(p json.RawMessage) (int, json.RawMessage) {
+		var req whipRPCRequest
+		if err := json.Unmarshal(p, &req); err != nil {
+			return http.StatusBadRequest, rpcErrPayload(proto.ErrCodeInvalidRequest, err.Error())
+		}
+		etag, err := api.patchWHEPSessionLocal(req.RoomName, req.ResourceID, req.IfMatch, req.Body)
+		if err != nil {
+			if errors.Is(err, whip.ErrSessionNotFound) {
+				return http.StatusNotFound, rpcErrPayload(proto.ErrCodeNotFound, err.Error())
+			}
+			return http.StatusInternalServerError, rpcErrPayload(proto.ErrCodeInternal, err.Error())
+		}
+		body, _ := json.Marshal(struct {
+			ETag string `json:"etag,omitempty"`
+		}{ETag: etag})
+		return http.StatusNoContent, body
+	})
+
+	svc.Register(NodeRPCActionWHEPDelete, func(p json.RawMessage) (int, json.RawMessage) {
+		var req whipRPCRequest
+		if err := json.Unmarshal(p, &req); err != nil {
+			return http.StatusBadRequest, rpcErrPayload(proto.ErrCodeInvalidRequest, err.Error())
+		}
+		if err := api.deleteWHEPSessionLocal(req.RoomName, req.ResourceID); err != nil {
+			if errors.Is(err, whip.ErrSessionNotFound) {
+				return http.StatusNotFound, rpcErrPayload(proto.ErrCodeNotFound, err.Error())
+			}
+			return http.StatusInternalServerError, rpcErrPayload(proto.ErrCodeInternal, err.Error())
+		}
+		return http.StatusOK, json.RawMessage("{}")
+	})
 	svc.Register(NodeRPCActionRequestBackupCodec, func(p json.RawMessage) (int, json.RawMessage) {
 		var bcReq proto.RequestBackupCodecRPCRequest
 		if err := json.Unmarshal(p, &bcReq); err != nil {

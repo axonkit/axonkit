@@ -20,15 +20,8 @@ type TransportFactory interface {
 }
 
 // ProducerSource supplies the mediasoup Producer IDs that should be consumed
-// during a WHEP session. Implementations are expected to cover both
-// "producers from a WHIP resourceId" (standalone subscribe) and "producers
-// from a given participant in a room" (in-room subscribe without joining).
+// during a WHEP session for a specific participant in a room.
 type ProducerSource interface {
-	// ProducersForResource returns the Producers published by a WHIP
-	// standalone session identified by resourceID. An empty slice means
-	// "not found / no media"; the caller will then answer with inactive
-	// m-sections (or reject the request at the HTTP layer).
-	ProducersForResource(resourceID string) []*mediasoup.Producer
 	// ProducersForParticipant returns the Producers of a specific
 	// participant (by identity) inside a named room. At most one audio
 	// and one video Producer are returned — the caller is expected to
@@ -38,18 +31,19 @@ type ProducerSource interface {
 }
 
 // Service is the stateful orchestrator for WHIP/WHEP sessions. It holds the
-// transport factory, maintains separate session registries for WHIP and
-// WHEP, and exposes high-level Create / Patch / Delete entry points the
-// HTTP layer calls.
+// transport factory, maintains the WHEP session registry, and exposes
+// high-level Create / Patch / Delete entry points the HTTP layer calls.
+//
+// WHIP does not use a service-owned registry: the WHIP session is bound to
+// a rtc.Participant, and the participant is the source of truth (it lives
+// in the room, is published to the distributed room store with a NodeId,
+// and is cleaned up via room.RemoveParticipant). Having an extra in-memory
+// map for WHIP would duplicate that lifecycle and diverge on eviction.
 type Service struct {
 	Factory TransportFactory
 	Sources ProducerSource
-	// Whip and Whep are intentionally separate registries: a WHIP
-	// resourceId derived from the publisher's identity must not collide
-	// with a WHEP resourceId (which is arbitrary), and tearing down a
-	// WHEP session must never accidentally close its underlying WHIP
-	// publish session.
-	Whip   *Registry
+	// Whep tracks subscribe-side sessions — they have no participant
+	// backing, so the service owns their lifecycle directly.
 	Whep   *Registry
 	Logger *slog.Logger
 
@@ -67,7 +61,6 @@ func NewService(factory TransportFactory, sources ProducerSource, logger *slog.L
 	return &Service{
 		Factory: factory,
 		Sources: sources,
-		Whip:    NewRegistry(ModeWHIP),
 		Whep:    NewRegistry(ModeWHEP),
 		Logger:  logger,
 	}
@@ -76,22 +69,6 @@ func NewService(factory TransportFactory, sources ProducerSource, logger *slog.L
 // CreateWHIPOptions holds the inputs for a new WHIP publish session.
 type CreateWHIPOptions struct {
 	OfferSDP string
-	// ResourceID is the desired resource id for this WHIP session — the
-	// HTTP layer typically sets it to the JWT Identity so that a given
-	// publisher only holds one standalone WHIP resource at a time.
-	// If empty, a random id is generated.
-	ResourceID string
-
-	// ReplaceExisting, if true, forces eviction of any session already
-	// holding the same ResourceID before installing the new one. Used for
-	// "same identity publishes again" — the old session is closed and the
-	// new one takes its place instead of returning an error.
-	ReplaceExisting bool
-
-	// Keepalive, if set, is stored on the Session and invoked by the
-	// supervisor on every tick (including immediately after start). Use
-	// this to refresh KV TTLs for distributed discovery.
-	Keepalive func()
 }
 
 // CreateWHIPResult is the data needed to respond to a WHIP POST: the
@@ -140,12 +117,10 @@ func (s *Service) CreateWHIP(opts CreateWHIPOptions) (*CreateWHIPResult, error) 
 	}
 
 	sess := &Session{
-		ID:                     opts.ResourceID,
 		Mode:                   ModeWHIP,
 		Transport:              transport,
 		Router:                 router,
 		ICEDisconnectedTimeout: s.ICEDisconnectedTimeout,
-		Keepalive:              opts.Keepalive,
 		logger:                 s.Logger,
 	}
 
@@ -202,41 +177,34 @@ func (s *Service) CreateWHIP(opts CreateWHIPOptions) (*CreateWHIPResult, error) 
 	}
 
 	sess.ETag = data.IceParameters.UsernameFragment
+	sess.CreatedAt = time.Now()
 
-	// If the client requested "replace existing", evict any prior session
-	// under the same resource id before inserting. This is the preferred
-	// behaviour for WHIP when the resource id is derived from the
-	// publisher's JWT identity: a reconnecting client that forgot to
-	// DELETE the old resource (crash, network loss, …) would otherwise be
-	// permanently blocked by an already-expired-but-not-yet-reaped
-	// session.
-	if opts.ReplaceExisting && sess.ID != "" {
-		if old := s.Whip.Get(sess.ID); old != nil {
-			_ = s.Whip.Remove(sess.ID)
-			s.Logger.Info("WHIP resource replaced (same identity reconnected)",
-				"sessionId", sess.ID, "oldCreatedAt", old.CreatedAt)
-		}
-	}
+	// The caller (HTTP layer) is responsible for wiring sess.OnClose to
+	// the participant it attaches. We start the supervisor with onExpire
+	// = nil so that an ICE-watchdog expiry calls sess.Close() directly,
+	// which fans out to OnClose once the caller has wired it. The ICE
+	// timeout is ~30s so there's no practical race with the caller's
+	// OnClose assignment.
+	sess.Start(nil)
 
-	id, err := s.Whip.Add(sess)
-	if err != nil {
-		sess.Close()
-		return nil, err
-	}
-
-	// Start the supervisor: single goroutine that drives (a) ICE disconnect
-	// watchdog + (b) external keepalive (KV TTL refresh). onExpire closes
-	// through the registry so the map stays consistent.
-	sess.Start(func(sessionID string) {
-		if err := s.Whip.Remove(sessionID); err != nil && err != ErrSessionNotFound {
-			s.Logger.Warn("supervisor remove failed", "sessionId", sessionID, "err", err)
-		}
-	})
-
-	s.Logger.Info("WHIP session created",
-		"sessionId", id, "producers", len(sess.Producers))
+	s.Logger.Info("WHIP session created", "producers", len(sess.Producers))
 
 	return &CreateWHIPResult{Session: sess, Answer: answer, ETag: sess.ETag}, nil
+}
+
+// CreateWHEPOptions packages the inputs for a new WHEP subscribe session.
+type CreateWHEPOptions struct {
+	OfferSDP  string
+	Producers []*mediasoup.Producer
+	// ResourceID, when non-empty, is used verbatim as the session id.
+	// This lets the HTTP layer encode routing info (e.g. owner NodeID)
+	// into the id for distributed discovery. If empty, a random xid is
+	// generated by the registry.
+	ResourceID string
+	// Keepalive, if non-nil, is invoked on every supervisor tick so the
+	// HTTP layer can refresh external state (e.g. a "WHEP_LOC" KV entry
+	// used for cross-node PATCH/DELETE routing).
+	Keepalive func()
 }
 
 // CreateWHEPResult is the data needed to respond to a WHEP POST.
@@ -249,10 +217,11 @@ type CreateWHEPResult struct {
 // CreateWHEP creates a new subscribe session. The caller supplies one or
 // more Producers to consume; if the offer's m-section count doesn't match,
 // the extra producers are ignored and extra m-sections become inactive.
-func (s *Service) CreateWHEP(offerSDP string, producers []*mediasoup.Producer) (*CreateWHEPResult, error) {
+func (s *Service) CreateWHEP(opts CreateWHEPOptions) (*CreateWHEPResult, error) {
 	if s.Factory == nil {
 		return nil, fmt.Errorf("no transport factory configured")
 	}
+	producers := opts.Producers
 	if len(producers) == 0 {
 		return nil, fmt.Errorf("no producers to consume")
 	}
@@ -263,7 +232,7 @@ func (s *Service) CreateWHEP(offerSDP string, producers []*mediasoup.Producer) (
 	}
 
 	caps := router.RtpCapabilities()
-	parsed, err := ParseOffer(offerSDP, caps)
+	parsed, err := ParseOffer(opts.OfferSDP, caps)
 	if err != nil {
 		transport.Close()
 		return nil, fmt.Errorf("parse offer: %w", err)
@@ -279,10 +248,12 @@ func (s *Service) CreateWHEP(offerSDP string, producers []*mediasoup.Producer) (
 	}
 
 	sess := &Session{
+		ID:                     opts.ResourceID,
 		Mode:                   ModeWHEP,
 		Transport:              transport,
 		Router:                 router,
 		ICEDisconnectedTimeout: s.ICEDisconnectedTimeout,
+		Keepalive:              opts.Keepalive,
 		logger:                 s.Logger,
 	}
 
@@ -372,12 +343,15 @@ func (s *Service) CreateWHEP(offerSDP string, producers []*mediasoup.Producer) (
 	return &CreateWHEPResult{Session: sess, Answer: answer, ETag: sess.ETag}, nil
 }
 
-// Patch performs an ICE restart (if the client sent `If-Match: *`) or a
-// trickle ICE update. Returns the new ETag (IceUfrag) when restart happened.
-// mode selects which registry to consult — WHIP and WHEP resource IDs do
-// not overlap.
-func (s *Service) Patch(mode Mode, sessionID, ifMatch, sdpFragment string) (string, error) {
-	sess := s.lookup(mode, sessionID)
+// PatchWHEP performs an ICE restart (if the client sent `If-Match: *`) or a
+// trickle ICE update on a WHEP session. Returns the new ETag (IceUfrag)
+// when an ICE restart happened.
+//
+// WHIP PATCH is intentionally not handled here — it operates on the
+// publisher's participant transport (owned by rtc.Participant), so the
+// HTTP layer drives it directly.
+func (s *Service) PatchWHEP(sessionID, ifMatch, sdpFragment string) (string, error) {
+	sess := s.Whep.Get(sessionID)
 	if sess == nil {
 		return "", ErrSessionNotFound
 	}
@@ -405,26 +379,10 @@ func (s *Service) Patch(mode Mode, sessionID, ifMatch, sdpFragment string) (stri
 	return sess.ETag, nil
 }
 
-// Delete closes a session and removes it from the registry.
-func (s *Service) Delete(mode Mode, sessionID string) error {
-	switch mode {
-	case ModeWHIP:
-		return s.Whip.Remove(sessionID)
-	case ModeWHEP:
-		return s.Whep.Remove(sessionID)
-	}
-	return fmt.Errorf("unknown mode %q", mode)
-}
-
-// lookup resolves a session in the registry for the given mode.
-func (s *Service) lookup(mode Mode, sessionID string) *Session {
-	switch mode {
-	case ModeWHIP:
-		return s.Whip.Get(sessionID)
-	case ModeWHEP:
-		return s.Whep.Get(sessionID)
-	}
-	return nil
+// DeleteWHEP closes a WHEP session and removes it from the registry.
+// WHIP DELETE goes through the participant lifecycle (see server layer).
+func (s *Service) DeleteWHEP(sessionID string) error {
+	return s.Whep.Remove(sessionID)
 }
 
 // blankInactive builds an inactive placeholder m-section, reusing the offer's

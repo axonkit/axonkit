@@ -11,7 +11,6 @@ import (
 
 	"github.com/axonkit/axonkit/pkg/auth"
 	"github.com/axonkit/axonkit/pkg/config"
-	"github.com/axonkit/axonkit/pkg/media"
 	"github.com/axonkit/axonkit/pkg/proto"
 	"github.com/axonkit/axonkit/pkg/rtc"
 	"github.com/axonkit/axonkit/pkg/rtc/whip"
@@ -91,13 +90,12 @@ type HTTPServer struct {
 	routers       []*mediasoup.Router
 	webRtcServers []*mediasoup.WebRtcServer
 
-	// Media manager is used by WHIP standalone to register new publishers
-	// (which auto-advertises via RIB) so other nodes can subscribe via
-	// /whep/{resourceId}. May be nil in lightweight tests.
-	mediaMgr      *media.Manager
-	whipResources *whip.ResourceStore
-
 	whipSvc *whip.Service
+	// whepLocKV is the optional KV store used when WhepRouting == "kv" to
+	// map resourceID → owning NodeID. nil when running the "prefix" scheme
+	// or when KV provisioning failed at startup (we still serve WHIP+WHEP,
+	// just without the discovery table).
+	whepLocKV store.Store
 }
 
 type HTTPServerParams struct {
@@ -108,10 +106,7 @@ type HTTPServerParams struct {
 	NodeRPC       *NodeRPCService
 	Routers       []*mediasoup.Router
 	WebRtcServers []*mediasoup.WebRtcServer
-	MediaManager  *media.Manager
-	// WHIPKV is the shared KV bucket used to advertise standalone WHIP
-	// resources across nodes. May be nil in tests.
-	WHIPKV store.Store
+	WhepLocKV     store.Store
 }
 
 func NewHTTPServer(params HTTPServerParams) *HTTPServer {
@@ -123,10 +118,7 @@ func NewHTTPServer(params HTTPServerParams) *HTTPServer {
 		nodeRPC:       params.NodeRPC,
 		routers:       params.Routers,
 		webRtcServers: params.WebRtcServers,
-		mediaMgr:      params.MediaManager,
-	}
-	if params.WHIPKV != nil {
-		s.whipResources = whip.NewResourceStore(params.WHIPKV)
+		whepLocKV:     params.WhepLocKV,
 	}
 	s.whipSvc = whip.NewService(
 		&whipTransportFactory{routers: s.routers, webRtcServers: s.webRtcServers},
