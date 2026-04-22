@@ -301,11 +301,23 @@ func buildRtpParameters(md *sdp.MediaDescription, mid string, kind mediasoup.Med
 	params.Encodings = encodings
 
 	if cname, ok := firstCNAME(md); ok {
-		reduced := true
-		params.Rtcp = &mediasoup.RtcpParameters{
-			Cname:       cname,
-			ReducedSize: &reduced,
+		// ReducedSize MUST NOT be enabled unless the peer opted in via
+		// a=rtcp-rsize (RFC 5506 §5). Earlier this flag was set
+		// unconditionally, which caused mediasoup to emit reduced-size
+		// compound RTCP packets (including PLI/FIR feedback) to peers
+		// like OBS/libdatachannel that don't parse them — the RTCP was
+		// silently dropped and the subscriber waited for the next
+		// natural IDR (often >15s) before the first frame decoded.
+		_, hasRsize := md.Attribute("rtcp-rsize")
+		rcp := &mediasoup.RtcpParameters{Cname: cname}
+		if hasRsize {
+			reduced := true
+			rcp.ReducedSize = &reduced
+		} else {
+			disabled := false
+			rcp.ReducedSize = &disabled
 		}
+		params.Rtcp = rcp
 	}
 
 	return params, rids, nil

@@ -163,7 +163,14 @@ func buildMediaSection(m *MediaAnswer, p *AnswerParams, fp mediasoup.DtlsFingerp
 
 	md.Attributes = append(md.Attributes, sdp.Attribute{Key: string(answerDirection(m.Direction))})
 	md.Attributes = append(md.Attributes, sdp.Attribute{Key: "rtcp-mux"})
-	md.Attributes = append(md.Attributes, sdp.Attribute{Key: "rtcp-rsize"})
+	// a=rtcp-rsize is only legal in an answer if the offer declared it
+	// (RFC 5506 §5). Emitting it unconditionally broke RTCP interop with
+	// peers that don't support reduced-size RTCP (notably OBS and other
+	// libdatachannel-based stacks), because we'd then send reduced-size
+	// compound RTCP (PLI/FIR/NACK) that the peer silently discards.
+	if rtcpReducedSizeEnabled(m.RtpParams) {
+		md.Attributes = append(md.Attributes, sdp.Attribute{Key: "rtcp-rsize"})
+	}
 
 	// Header extensions.
 	for _, ext := range m.RtpParams.HeaderExtensions {
@@ -230,6 +237,17 @@ func buildMediaSection(m *MediaAnswer, p *AnswerParams, fp mediasoup.DtlsFingerp
 	}
 
 	return md, nil
+}
+
+// rtcpReducedSizeEnabled reports whether this m-section's RTCP parameters
+// opt into reduced-size RTCP. A nil Rtcp or nil ReducedSize is treated as
+// disabled, matching the safe default for peers that never advertised
+// a=rtcp-rsize.
+func rtcpReducedSizeEnabled(rp *mediasoup.RtpParameters) bool {
+	if rp == nil || rp.Rtcp == nil || rp.Rtcp.ReducedSize == nil {
+		return false
+	}
+	return *rp.Rtcp.ReducedSize
 }
 
 // answerDirection flips the offer direction for the answer.
