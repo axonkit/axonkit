@@ -271,17 +271,18 @@ func (n *Server) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop shuts down HTTP, subscriptions, rooms, media, routing, and NATS.
+// Stop shuts down HTTP first (so no new joins arrive), then subscriptions,
+// rooms (sending SERVER_SHUTDOWN disconnect to each participant and
+// unpublishing their tracks), media workers, routing, and NATS.
 func (n *Server) Stop(ctx context.Context) error {
-	n.closeDeps()
 	if n.probeCancel != nil {
 		n.probeCancel()
 		n.probeCancel = nil
 	}
+	var httpErr error
 	if n.httpServer != nil {
-		if err := n.httpServer.Shutdown(ctx); err != nil {
-			return err
-		}
+		httpErr = n.httpServer.Shutdown(ctx)
 	}
-	return nil
+	n.closeDeps()
+	return httpErr
 }
