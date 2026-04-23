@@ -304,11 +304,28 @@ func (s *Service) CreateWHEP(opts CreateWHEPOptions) (*CreateWHEPResult, error) 
 			producerID = resolved
 		}
 
+		// For WHEP we feed the Consumer the subscriber's own rtpParameters
+		// (as parsed from the offer m-section) instead of RtpCapabilities.
+		// mediasoup-go's override branch will:
+		//   * match each offer codec 1:1 against the producer's consumable
+		//     codecs (strict MIME / clock rate / H264 profile+pkt-mode / VP9
+		//     profile-id), drop unmatched entries, and stamp the caller's
+		//     PT + fmtp verbatim onto the Consumer's codecs;
+		//   * keep every offer-declared header extension whose URI exists in
+		//     the producer's consumable set, preserving the caller's ext-id;
+		//   * ignore caller-supplied encodings (SSRCs are server-generated);
+		//   * fall back to the producer's Rtcp / Msid when the caller omits
+		//     them (RtcpParameters.Cname must come from mediasoup, not the
+		//     offer).
+		// Crucially the worker is also given a ConsumerRtpMapping derived
+		// from consumable→consumer, so it rewrites outgoing RTP PT + ext-id
+		// on the wire. Wire and answer SDP therefore share the offer's
+		// values — no post-hoc SDP remapping needed.
 		consumer, err := transport.Consume(&mediasoup.ConsumerOptions{
-			ProducerId:      producerID,
-			RtpCapabilities: chooseConsumerCaps(pm.RtpParameters, caps),
-			Paused:          false,
-			Mid:             pm.Mid,
+			ProducerId:    producerID,
+			RtpParameters: pm.RtpParameters,
+			Paused:        false,
+			Mid:           pm.Mid,
 		})
 		if err != nil {
 			sess.Close()
@@ -438,47 +455,6 @@ func blankInactive(pm *ParsedMedia) *MediaAnswer {
 func pickProducer(producers []*mediasoup.Producer, kind mediasoup.MediaKind) int {
 	for i, p := range producers {
 		if p.Kind() == kind {
-			return i
-		}
-	}
-	return -1
-}
-
-// chooseConsumerCaps constructs the minimum RtpCapabilities we need to pass
-// to Consume so mediasoup does codec matching for us. We reuse the offer's
-// codecs because that represents the client's capabilities. Missing fields
-// fall back to the router's full capabilities.
-func chooseConsumerCaps(offerParams *mediasoup.RtpParameters, routerCaps *mediasoup.RtpCapabilities) *mediasoup.RtpCapabilities {
-	if offerParams == nil || len(offerParams.Codecs) == 0 {
-		return routerCaps
-	}
-	caps := &mediasoup.RtpCapabilities{
-		HeaderExtensions: routerCaps.HeaderExtensions,
-	}
-	for _, c := range offerParams.Codecs {
-		caps.Codecs = append(caps.Codecs, &mediasoup.RtpCodecCapability{
-			Kind:                 mediasoup.MediaKind(splitKindFromMime(c.MimeType)),
-			MimeType:             c.MimeType,
-			PreferredPayloadType: c.PayloadType,
-			ClockRate:            c.ClockRate,
-			Channels:             c.Channels,
-			Parameters:           c.Parameters,
-			RtcpFeedback:         c.RtcpFeedback,
-		})
-	}
-	return caps
-}
-
-func splitKindFromMime(mime string) string {
-	if i := indexByte(mime, '/'); i > 0 {
-		return mime[:i]
-	}
-	return ""
-}
-
-func indexByte(s string, b byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == b {
 			return i
 		}
 	}

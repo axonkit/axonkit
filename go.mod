@@ -4,12 +4,12 @@ go 1.25.6
 
 require (
 	github.com/axonkit/protocol v0.1.0
-	github.com/jiyeyuran/mediasoup-go/v2 v2.3.1
+	github.com/jiyeyuran/mediasoup-go/v2 v2.4.1
 	github.com/nats-io/nats-server/v2 v2.12.4
 	github.com/nats-io/nats.go v1.48.0
 	github.com/pion/sdp/v3 v3.0.18
 	github.com/rs/xid v1.6.0
-	golang.org/x/sync v0.19.0
+	golang.org/x/sync v0.20.0
 )
 
 require (

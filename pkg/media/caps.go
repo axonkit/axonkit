@@ -36,7 +36,7 @@ var rtpCodecCapabilities = []*mediasoup.RtpCodecCapability{
 	},
 	{
 		Kind:      mediasoup.MediaKindVideo,
-		MimeType:  "video/h264",
+		MimeType:  "video/H264",
 		ClockRate: 90000,
 		Parameters: mediasoup.RtpCodecSpecificParameters{
 			PacketizationMode:     1,
@@ -47,7 +47,7 @@ var rtpCodecCapabilities = []*mediasoup.RtpCodecCapability{
 	},
 	{
 		Kind:      mediasoup.MediaKindVideo,
-		MimeType:  "video/h264",
+		MimeType:  "video/H264",
 		ClockRate: 90000,
 		Parameters: mediasoup.RtpCodecSpecificParameters{
 			PacketizationMode:     1,
