@@ -273,6 +273,28 @@ func buildRtpParameters(md *sdp.MediaDescription, mid string, kind mediasoup.Med
 
 		params.Codecs = append(params.Codecs, codec)
 	}
+
+	// Drop orphaned RTX codecs whose `apt` points to a media codec that got
+	// filtered out above (e.g. browser offered H264 profile=42001f + rtx, but
+	// our caps only list 42e01f; the media PT is dropped while rtx survives
+	// because RTX is not listed in caps and we deliberately keep it). Passing
+	// such a dangling RTX into mediasoup.Produce triggers
+	// `missing media codec found for RTX PT <n>`, so filter here instead.
+	mediaPTs := map[uint8]bool{}
+	for _, c := range params.Codecs {
+		if !isRtxMime(c.MimeType) {
+			mediaPTs[c.PayloadType] = true
+		}
+	}
+	filtered := params.Codecs[:0]
+	for _, c := range params.Codecs {
+		if isRtxMime(c.MimeType) && !mediaPTs[c.Parameters.Apt] {
+			continue
+		}
+		filtered = append(filtered, c)
+	}
+	params.Codecs = filtered
+
 	if len(params.Codecs) == 0 {
 		return nil, nil, fmt.Errorf("no negotiable codecs for %s", kind)
 	}
@@ -665,8 +687,7 @@ func codecParamsCompatible(codec *mediasoup.RtpCodecParameters, cap *mediasoup.R
 			return false
 		}
 	case strings.HasSuffix(mime, "/vp9"):
-		if cap.Parameters.ProfileId != 0 && codec.Parameters.ProfileId != 0 &&
-			cap.Parameters.ProfileId != codec.Parameters.ProfileId {
+		if cap.Parameters.ProfileId != codec.Parameters.ProfileId {
 			return false
 		}
 	}
