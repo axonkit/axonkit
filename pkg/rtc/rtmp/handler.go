@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/url"
 	"strings"
+	"time"
 
 	gortmp "github.com/yutopp/go-rtmp"
 	gortmpmsg "github.com/yutopp/go-rtmp/message"
@@ -42,6 +43,14 @@ type PublishHooks struct {
 
 	// Logger receives connection-level logs. When nil, slog.Default is used.
 	Logger *slog.Logger
+
+	// IdleTimeout bounds the silence Session tolerates between two
+	// consecutive audio/video tags. Zero disables the application-
+	// level watchdog; kernel TCP keep-alive then becomes the sole
+	// detector of half-open publisher sockets. The Service injects a
+	// non-zero default so callers only override when they explicitly
+	// want the watchdog off.
+	IdleTimeout time.Duration
 }
 
 // PublishInfo carries authenticated publisher metadata surfaced to the
@@ -164,8 +173,9 @@ func (h *handler) OnPublish(ctx *gortmp.StreamContext, _ uint32, cmd *gortmpmsg.
 	info := PublishInfo{RoomName: room, Claims: claims, StreamName: streamName}
 
 	session := NewSession(SessionParams{
-		Router: router,
-		Logger: h.connLogger,
+		Router:      router,
+		Logger:      h.connLogger,
+		IdleTimeout: h.cfg.IdleTimeout,
 	})
 	if h.conn != nil {
 		conn := h.conn

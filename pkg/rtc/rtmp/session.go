@@ -54,6 +54,16 @@ type SessionParams struct {
 	// (e.g. audio after video) so the server can attach the new track to
 	// the existing Participant.
 	OnAdditionalProducer func(leg *MediaLeg, kind mediasoup.MediaKind)
+
+	// IdleTimeout bounds the silence we tolerate between two consecutive
+	// audio or video tags. When positive, Session arms a watchdog that
+	// fires the registered closeConn if no tag arrives within the window
+	// — this catches half-open TCP sockets (publisher process killed,
+	// Wi-Fi dropped, NAT binding expired) that otherwise leave the
+	// participant stuck in the room until kernel TCP keep-alive notices,
+	// which can take hours on stock Linux defaults. 0 disables the
+	// watchdog (preserved so tests can opt out deterministically).
+	IdleTimeout time.Duration
 }
 
 // Session owns the per-publisher state for one active RTMP connection.
@@ -96,6 +106,20 @@ type Session struct {
 	// without flooding stdout.
 	videoEmptyPacketize uint64
 
+	// idleTimeout is the maximum silence we tolerate between consecutive
+	// media tags before the watchdog fires closeConn. 0 disables the
+	// watchdog entirely.
+	idleTimeout time.Duration
+	// idleTimer is armed when SetConnCloser is invoked (the handler has a
+	// way to tear down the TCP socket) and reset on every successful
+	// IngestAudio/IngestVideo. Close stops it so the goroutine doesn't
+	// outlive the session.
+	idleTimer *time.Timer
+	// idleFired guards against the AfterFunc goroutine calling closeConn
+	// more than once when both it and Close race. The timer is stopped
+	// under s.mu so Close can atomically win or not.
+	idleFired bool
+
 	closed bool
 }
 
@@ -111,6 +135,7 @@ func NewSession(p SessionParams) *Session {
 		logger:       logger,
 		onFirst:      p.OnFirstProducer,
 		onAdditional: p.OnAdditionalProducer,
+		idleTimeout:  p.IdleTimeout,
 	}
 }
 
@@ -131,10 +156,17 @@ func (s *Session) SetCallbacks(first, additional func(leg *MediaLeg, kind medias
 // tear down the RTMP TCP connection. Called by the handler once the
 // go-rtmp connection is known; the server then uses CloseConn to force
 // the publisher to disconnect when the participant is evicted.
+//
+// This is also the point where we arm the idle watchdog: before the
+// closer is known, firing the timer would be a no-op, so there is no
+// value in starting it earlier. Callers set IdleTimeout at construction
+// time and the watchdog reschedules itself on every incoming audio /
+// video tag via bumpIdleWatchdogLocked.
 func (s *Session) SetConnCloser(closer func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closeConn = closer
+	s.startIdleWatchdogLocked()
 }
 
 // CloseConn closes the underlying TCP connection if a closer has been
@@ -159,6 +191,10 @@ func (s *Session) Close() {
 		return
 	}
 	s.closed = true
+	if s.idleTimer != nil {
+		s.idleTimer.Stop()
+		s.idleTimer = nil
+	}
 	if s.video.Producer != nil {
 		_ = s.video.Producer.Close()
 	}
@@ -170,6 +206,58 @@ func (s *Session) Close() {
 	}
 	if s.audio.Transport != nil {
 		s.audio.Transport.Close()
+	}
+}
+
+// startIdleWatchdogLocked arms the idle timer when a closer has been
+// registered. Caller must hold s.mu. No-op if IdleTimeout is zero, the
+// closer is nil, or the session is already closed — in each case there
+// is nothing for the watchdog to do if it fires.
+func (s *Session) startIdleWatchdogLocked() {
+	if s.idleTimeout <= 0 || s.closeConn == nil || s.closed {
+		return
+	}
+	if s.idleTimer != nil {
+		s.idleTimer.Reset(s.idleTimeout)
+		return
+	}
+	s.idleTimer = time.AfterFunc(s.idleTimeout, s.onIdleTimeout)
+}
+
+// bumpIdleWatchdogLocked pushes the idle deadline out by IdleTimeout.
+// Caller must hold s.mu. Called from every IngestAudio/IngestVideo
+// that successfully parsed a tag so a live publisher is never
+// disconnected by the watchdog.
+func (s *Session) bumpIdleWatchdogLocked() {
+	if s.idleTimer == nil || s.closed {
+		return
+	}
+	s.idleTimer.Reset(s.idleTimeout)
+}
+
+// onIdleTimeout runs when the idle timer fires. It closes the RTMP TCP
+// connection which in turn triggers go-rtmp's OnClose, the
+// handler.OnSessionClosed hook, and participant.Close — i.e. the same
+// teardown path as a peer-initiated disconnect.
+//
+// idleFired prevents a second firing from racing with Close: once the
+// watchdog has called closeConn we never call it again even if Reset
+// happens to succeed on a goroutine that loaded a stale timer pointer.
+func (s *Session) onIdleTimeout() {
+	s.mu.Lock()
+	if s.closed || s.idleFired {
+		s.mu.Unlock()
+		return
+	}
+	s.idleFired = true
+	closer := s.closeConn
+	timeout := s.idleTimeout
+	s.mu.Unlock()
+
+	s.logger.Warn("rtmp idle timeout, closing connection",
+		"timeout", timeout)
+	if closer != nil {
+		closer()
 	}
 }
 
@@ -203,6 +291,7 @@ func (s *Session) IngestVideo(ctx context.Context, timestampMs uint32, tag *Vide
 	if s.closed {
 		return fmt.Errorf("session closed")
 	}
+	s.bumpIdleWatchdogLocked()
 
 	switch tag.PacketType {
 	case VideoPacketSeqHeader:
@@ -264,6 +353,7 @@ func (s *Session) IngestAudio(ctx context.Context, timestampMs uint32, tag *Audi
 	if s.closed {
 		return fmt.Errorf("session closed")
 	}
+	s.bumpIdleWatchdogLocked()
 
 	switch tag.PacketType {
 	case AudioPacketOpusHeader:
