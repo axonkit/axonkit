@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/axonkit/axonkit/pkg/auth"
+	"github.com/axonkit/axonkit/pkg/broadcast"
 	"github.com/axonkit/axonkit/pkg/config"
 	"github.com/axonkit/axonkit/pkg/proto"
 	"github.com/axonkit/axonkit/pkg/rtc"
@@ -177,6 +178,11 @@ type HTTPServer struct {
 	// or when KV provisioning failed at startup (we still serve WHIP+WHEP,
 	// just without the discovery table).
 	whepLocKV store.Store
+
+	// broadcastMgr owns all live "push room user to RTMP/WHIP" tasks
+	// (see pkg/broadcast). Populated in NewHTTPServer; closed on
+	// HTTPServer shutdown so external sinks see a clean disconnect.
+	broadcastMgr *broadcast.Manager
 }
 
 type HTTPServerParams struct {
@@ -206,7 +212,21 @@ func NewHTTPServer(params HTTPServerParams) *HTTPServer {
 		&whipProducerSource{server: s},
 		slog.Default().With("component", "whip.Service"),
 	)
+	s.broadcastMgr = broadcast.NewManager(broadcast.ManagerParams{
+		Rooms:       s.roomManager,
+		WhipService: s.whipSvc,
+		Logger:      slog.Default().With("component", "broadcast.Manager"),
+	})
 	return s
+}
+
+// Close releases the runtime resources the HTTPServer owns on top of
+// plain HTTP (currently: every live broadcast). Safe to call multiple
+// times; broadcast.Manager.Close is itself idempotent.
+func (s *HTTPServer) Close() {
+	if s.broadcastMgr != nil {
+		s.broadcastMgr.Close()
+	}
 }
 
 func (s *HTTPServer) RegisterRoutes(mux *http.ServeMux) {
@@ -219,6 +239,7 @@ func (s *HTTPServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("OPTIONS /rtc/forward-participant", func(w http.ResponseWriter, r *http.Request) {})
 	mux.HandleFunc("OPTIONS /rtc/remove-participant", func(w http.ResponseWriter, r *http.Request) {})
 	s.registerWHIPRoutes(mux)
+	s.registerBroadcastRoutes(mux)
 }
 
 // authorizeAdmin verifies the Bearer token and checks that the caller

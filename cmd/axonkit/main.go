@@ -13,17 +13,21 @@ import (
 )
 
 var (
-	cfg            = config.DefaultConfig()
-	nodeID         = flag.String("node", cfg.Node.ID, "Node ID")
-	regionID       = flag.String("region", cfg.Node.Region, "Region ID")
-	clusterID      = flag.String("cluster", cfg.Node.Cluster, "Cluster ID")
-	natsURL        = flag.String("nats", cfg.Nats.URL, "NATS URL")
-	httpPort       = flag.Int("port", cfg.Node.Port, "HTTP Port")
-	workerBin      = flag.String("worker", cfg.Media.WorkerBin, "Path to mediasoup-worker binary")
-	apiKey         = flag.String("api-key", cfg.Auth.APIKey, "API key for token verification")
-	apiSecret      = flag.String("api-secret", cfg.Auth.APISecret, "API secret for token signing")
-	allowAnonymous = flag.Bool("allow-anonymous", cfg.Auth.AllowAnonymous, "Allow joining without a token (auto-generate identity)")
-	rtmpListen     = flag.String("rtmp-listen", cfg.Rtmp.Listen, "RTMP TCP bind address (e.g. ':1935'); empty disables RTMP ingest")
+	cfg               = config.DefaultConfig()
+	nodeID            = flag.String("node", cfg.Node.ID, "Node ID")
+	regionID          = flag.String("region", cfg.Node.Region, "Region ID")
+	clusterID         = flag.String("cluster", cfg.Node.Cluster, "Cluster ID")
+	natsURL           = flag.String("nats", cfg.Nats.URL, "NATS URL")
+	httpPort          = flag.Int("port", cfg.Node.Port, "HTTP Port")
+	workerBin         = flag.String("worker", cfg.Media.WorkerBin, "Path to mediasoup-worker binary")
+	apiKey            = flag.String("api-key", cfg.Auth.APIKey, "API key for token verification")
+	apiSecret         = flag.String("api-secret", cfg.Auth.APISecret, "API secret for token signing")
+	allowAnonymous    = flag.Bool("allow-anonymous", cfg.Auth.AllowAnonymous, "Allow joining without a token (auto-generate identity)")
+	rtmpListen        = flag.String("rtmp-listen", cfg.Rtmp.Listen, "RTMP TCP bind address (e.g. ':1935'); empty disables RTMP ingest")
+	webrtcListenIP    = flag.String("webrtc-listen-ip", cfg.Media.WebRtc.ListenIP, "WebRTC listen IP for ICE candidates")
+	webrtcAnnouncedIP = flag.String("webrtc-announced-ip", cfg.Media.WebRtc.AnnouncedIP, "WebRTC announced IP advertised to peers (override for local testing)")
+	webrtcMinPort     = flag.Int("webrtc-min-port", int(cfg.Media.WebRtc.MinPort), "WebRTC ICE UDP port range minimum")
+	webrtcMaxPort     = flag.Int("webrtc-max-port", int(cfg.Media.WebRtc.MaxPort), "WebRTC ICE UDP port range maximum")
 )
 
 func main() {
@@ -43,6 +47,10 @@ func main() {
 	cfg.Auth.APISecret = *apiSecret
 	cfg.Auth.AllowAnonymous = *allowAnonymous
 	cfg.Rtmp.Listen = *rtmpListen
+	cfg.Media.WebRtc.ListenIP = *webrtcListenIP
+	cfg.Media.WebRtc.AnnouncedIP = *webrtcAnnouncedIP
+	cfg.Media.WebRtc.MinPort = uint16(*webrtcMinPort)
+	cfg.Media.WebRtc.MaxPort = uint16(*webrtcMaxPort)
 
 	slog.Info("Starting axonkit Node",
 		"id", cfg.Node.ID, "region", cfg.Node.Region, "cluster", cfg.Node.Cluster,
