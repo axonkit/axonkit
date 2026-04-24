@@ -46,18 +46,18 @@ type rtmpFrame struct {
 // + Stop, which can be called from the RTP hot path concurrently with
 // the background goroutine (the internal channel does the hand-off).
 type rtmpPusher struct {
-	url     string
-	parsed  *rtmpURL
-	logger  *slog.Logger
+	url    string
+	parsed *rtmpURL
+	logger *slog.Logger
 
 	// queue carries ready-to-send FLV frames from the hot path to the
 	// background send goroutine. Bounded to rtmpPusherQueueDepth to
 	// keep memory usage sane under back-pressure; drops are logged and
 	// counted so operators see stream stalls.
-	queue    chan *rtmpFrame
-	dropped  atomic.Uint64
-	bytesOut atomic.Uint64
-	started  atomic.Bool
+	queue     chan *rtmpFrame
+	dropped   atomic.Uint64
+	bytesOut  atomic.Uint64
+	started   atomic.Bool
 	connected atomic.Bool
 	lastErrMu sync.Mutex
 	lastErr   string
@@ -75,12 +75,22 @@ type rtmpPusher struct {
 	videoHdrSent atomic.Bool
 	audioHdrSent atomic.Bool
 
+	// videoSeq* caches the payload of the most recently emitted video
+	// seq header so EnsureVideoSeqHeader / EnsureExVideoSeqHeader can
+	// skip re-emitting an identical tag after ResetVideoHeader is
+	// called on a live↔mix flip. Most RTMP demuxers (notably ffmpeg)
+	// treat a mid-stream SeqHeader tag as a codec change and drop the
+	// TCP connection; keeping the tag out when the codec config has
+	// not actually changed preserves the single-connection recording.
+	videoSeqMu     sync.Mutex
+	videoSeqBody   []byte
+	videoSeqFourCC string // "" for classic AVC, fourCC (e.g. "vp09") for E-RTMP
+
 	done chan struct{}
 }
 
 const (
 	rtmpPusherQueueDepth = 512
-	rtmpConnectTimeout   = 10 * time.Second
 	rtmpRetryInterval    = 1 * time.Second
 	rtmpMaxRetries       = 5
 )
@@ -150,8 +160,11 @@ func (p *rtmpPusher) LastError() string {
 
 // EnsureVideoSeqHeader enqueues the AVC seq header tag the first time
 // it is called and returns true; subsequent calls are no-ops that
-// return false. Callers that want a one-shot emission should check
-// the return value.
+// return false. After ResetVideoHeader the next call also skips the
+// enqueue if the AVCC bytes are byte-identical to the previously
+// emitted header — preventing a mid-stream SeqHeader tag that would
+// otherwise cause ffmpeg (and similar RTMP demuxers) to drop the TCP
+// connection even though the codec config hasn't changed.
 func (p *rtmpPusher) EnsureVideoSeqHeader(avcc []byte) bool {
 	if len(avcc) == 0 {
 		return false
@@ -159,6 +172,14 @@ func (p *rtmpPusher) EnsureVideoSeqHeader(avcc []byte) bool {
 	if !p.videoHdrSent.CompareAndSwap(false, true) {
 		return false
 	}
+	p.videoSeqMu.Lock()
+	if p.videoSeqFourCC == "" && bytes.Equal(p.videoSeqBody, avcc) {
+		p.videoSeqMu.Unlock()
+		return false
+	}
+	p.videoSeqBody = append(p.videoSeqBody[:0], avcc...)
+	p.videoSeqFourCC = ""
+	p.videoSeqMu.Unlock()
 	p.enqueue(&rtmpFrame{
 		kind:        SampleKindVideo,
 		timestampMs: 0,
@@ -172,7 +193,8 @@ func (p *rtmpPusher) EnsureVideoSeqHeader(avcc []byte) bool {
 // video tag layout (VP9 + AV1 today). The caller supplies a FourCC
 // plus the codec configuration record (VPCodecConfigurationRecord /
 // AV1CodecConfigurationRecord); this method only guards the "send
-// once per source" contract.
+// once per source" contract and skips the enqueue when both the
+// FourCC and config bytes match the previously emitted header.
 func (p *rtmpPusher) EnsureExVideoSeqHeader(fourCC string, config []byte) bool {
 	if len(fourCC) != 4 || len(config) == 0 {
 		return false
@@ -180,6 +202,14 @@ func (p *rtmpPusher) EnsureExVideoSeqHeader(fourCC string, config []byte) bool {
 	if !p.videoHdrSent.CompareAndSwap(false, true) {
 		return false
 	}
+	p.videoSeqMu.Lock()
+	if p.videoSeqFourCC == fourCC && bytes.Equal(p.videoSeqBody, config) {
+		p.videoSeqMu.Unlock()
+		return false
+	}
+	p.videoSeqBody = append(p.videoSeqBody[:0], config...)
+	p.videoSeqFourCC = fourCC
+	p.videoSeqMu.Unlock()
 	p.enqueue(&rtmpFrame{
 		kind:        SampleKindVideo,
 		timestampMs: 0,
@@ -201,10 +231,14 @@ func (p *rtmpPusher) EnsureAudioSeqHeader(channels uint8) bool {
 	return true
 }
 
-// ResetVideoHeader forces the next EnsureVideoSeqHeader call to
-// actually enqueue a fresh AVC seq header. Used by the switcher when
-// flipping sources so the new source's SPS/PPS reach the receiver
-// before the first keyframe is written out.
+// ResetVideoHeader arms the next EnsureVideoSeqHeader call to
+// re-evaluate whether a fresh seq header tag needs to go out. Used by
+// the switcher when flipping sources: the new source's first keyframe
+// brings a codec config record, which is compared byte-wise against
+// the previously emitted one. Identical bytes → no tag is enqueued,
+// so the RTMP receiver never sees a mid-stream SeqHeader and keeps
+// the TCP connection open. Differing bytes → a fresh SeqHeader tag
+// is enqueued before the next keyframe.
 func (p *rtmpPusher) ResetVideoHeader() { p.videoHdrSent.Store(false) }
 
 // WriteSample encodes one MediaSample into an FLV tag and enqueues it
@@ -277,7 +311,7 @@ func (p *rtmpPusher) timestampMs(s MediaSample) uint32 {
 
 // runLoop is the background goroutine: connect → publish → drain queue
 // → retry on error. Exits once the queue is closed or the context is
-// cancelled.
+// canceled.
 func (p *rtmpPusher) runLoop(ctx context.Context) {
 	defer close(p.done)
 
