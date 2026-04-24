@@ -27,10 +27,13 @@ const DefaultOpusMTU = 1200
 // Construction: NewH264Packetizer(ssrc, payloadType). Callers then:
 //
 //  1. Call SetParameterSets(sps, pps) exactly once on AVC seq header.
-//  2. For every NALU access unit, call PacketizeAVCC(pts90k, isKey, data).
+//  2. For every NALU access unit, call Packetize(pts90k, isKey, data).
 //
-// PacketizeAVCC returns fully marshaled RTP packets; callers hand them
-// to DirectTransport.Producer.Send verbatim.
+// Packetize returns fully marshaled RTP packets; callers hand them to
+// DirectTransport.Producer.Send verbatim.
+//
+// H264Packetizer satisfies the package's VideoPacketizer interface so
+// the RTMP session can dispatch uniformly across AVC/VP9/AV1 legs.
 type H264Packetizer struct {
 	ssrc        uint32
 	payloadType uint8
@@ -53,6 +56,11 @@ func NewH264Packetizer(ssrc uint32, payloadType uint8) *H264Packetizer {
 	}
 }
 
+// Compile-time assertion: every codec packetizer in this package must
+// satisfy the common VideoPacketizer contract so the session can treat
+// them uniformly.
+var _ VideoPacketizer = (*H264Packetizer)(nil)
+
 // SetMTU overrides the payload size the fragmenter targets. Useful for
 // tests that want deterministic fragment counts.
 func (p *H264Packetizer) SetMTU(mtu uint16) {
@@ -68,7 +76,7 @@ func (p *H264Packetizer) SetParameterSets(sps, pps []byte) {
 	p.hasSPSPPS = len(sps) > 0 && len(pps) > 0
 }
 
-// PacketizeAVCC fragments an AVCC access unit (4-byte length prefixed
+// Packetize fragments an AVCC access unit (4-byte length prefixed
 // NALUs) into RTP packets. pts90k is the 90 kHz RTP timestamp (derived
 // by the session from FLV milliseconds). When isKey is true the payloader
 // injects SPS+PPS so receivers can start decoding from this packet alone.
@@ -77,7 +85,7 @@ func (p *H264Packetizer) SetParameterSets(sps, pps []byte) {
 // to mediasoup (which also copies internally before sending). The caller
 // must marshal each packet via Packet.Marshal() before handing to
 // Producer.Send — we do that here so the session only deals with bytes.
-func (p *H264Packetizer) PacketizeAVCC(pts90k uint32, isKey bool, avcc []byte) ([][]byte, error) {
+func (p *H264Packetizer) Packetize(pts90k uint32, isKey bool, avcc []byte) ([][]byte, error) {
 	annexB := convertAVCCToAnnexB(avcc, isKey && p.hasSPSPPS, p.sps, p.pps)
 	fragments := p.payloader.Payload(p.mtu, annexB)
 	if len(fragments) == 0 {

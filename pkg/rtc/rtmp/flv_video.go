@@ -1,22 +1,35 @@
 // Package rtmp implements RTMP push ingest for axonkit. It supports both
 // classic RTMP and the Enhanced RTMP (ExAudio / ExVideo) container
-// extensions so publishers can push H.264 video plus Opus audio without
-// any transcoding.
+// extensions so publishers can push H.264 / VP9 / AV1 video plus Opus
+// audio without any transcoding.
 //
 // This file defines the minimal FLV video-tag parser. It understands two
-// framings only:
+// framings:
 //
 //   - Classic AVC (CodecID=7): one byte "frame type | codec id", then
 //     AVCPacketType, 3-byte composition time, then either an
 //     AVCDecoderConfigurationRecord (seq header) or AVCC NALUs.
-//   - Enhanced RTMP (ExVideoData): first byte high bit set, PacketType in
-//     the low nibble, FourCC ("hvc1", "av01", "vp09", "avc1"), and then
-//     codec-specific payload. We only forward FourCC "avc1" to stay aligned
-//     with the project's v1 codec scope; anything else is dropped.
+//
+//   - Enhanced RTMP (ExVideoTagHeader, veovera E-RTMP v1/v2): first byte
+//     has bit7=1 (IsExHeader), bits4-6 carry FrameType, bits0-3 carry
+//     PacketType; then a 4-byte FourCC identifies the codec. Supported
+//     FourCCs are "avc1" (H.264), "vp09" (VP9) and "av01" (AV1); anything
+//     else (notably "hvc1" HEVC) is soft-dropped because mediasoup-go's
+//     supported_rtp_capabilities table does not cover those codecs yet.
+//
+//     PacketType numbering follows the Enhanced RTMP spec exactly:
+//     0 SequenceStart        — body is a codec config record
+//     1 CodedFrames          — body is [CTS SI24 BE][codec payload]
+//     2 SequenceEnd          — empty body
+//     3 CodedFramesX         — body is the raw codec payload (no CTS)
+//     4 Metadata             — ignored
+//     5 MPEG2TSSequenceStart — ignored
+//     6 Multitrack (v2)      — ignored
+//     7 ModEx (v2)           — ignored
 //
 // The parser never allocates more than the input slice length + a small
-// header; callers (the RTMP handler) are responsible for holding onto the
-// returned NALU bytes across RTP dispatch.
+// header; callers (the RTMP handler) are responsible for holding onto
+// the returned payload bytes across RTP dispatch.
 package rtmp
 
 import (
@@ -57,15 +70,21 @@ const (
 
 // VideoTag is the parsed form of an FLV VIDEODATA tag body.
 //
-// Data is AVCC-format (4-byte big-endian length + NALU bytes) for AVC
-// NALU packets, or the raw AVCDecoderConfigurationRecord bytes when
-// PacketType == VideoPacketSeqHeader / VideoPacketExSeqStart.
+// Data is the codec-specific payload:
+//   - H.264: AVCC-formatted NALUs (4-byte BE length + NALU bytes) for
+//     NALU packets, or the raw AVCDecoderConfigurationRecord when
+//     PacketType == VideoPacketSeqHeader.
+//   - VP9: raw VP9 elementary bitstream frame bytes, or the vpcC
+//     configuration record bytes on SequenceStart.
+//   - AV1: low-overhead OBU bitstream for frames, or the av1C
+//     configuration record bytes on SequenceStart.
 //
-// CompositionTimeMs is the signed 24-bit DTS→PTS offset (AVC only). The
-// SFU does not re-order frames, so the value is carried through only
-// when the caller wants to compute PTS for downstream consumers that
-// care about B-frames.
+// CompositionTimeMs is the signed 24-bit DTS→PTS offset, non-zero only
+// on classic AVC and Enhanced CodedFrames (PacketType=1) tags. The SFU
+// does not re-order frames, so the value is surfaced mostly for
+// downstream consumers that care about B-frames.
 type VideoTag struct {
+	Codec             VideoCodec
 	FrameType         VideoFrameType
 	PacketType        VideoPacketType
 	IsKeyFrame        bool
@@ -134,6 +153,7 @@ func parseClassicVideoTag(body []byte) (*VideoTag, error) {
 	payload := body[5:]
 
 	return &VideoTag{
+		Codec:             VideoCodecH264,
 		FrameType:         frameType,
 		PacketType:        pktType,
 		IsKeyFrame:        frameType == VideoFrameKey,
@@ -142,10 +162,19 @@ func parseClassicVideoTag(body []byte) (*VideoTag, error) {
 	}, nil
 }
 
-// ExVideoFourCC* are the Enhanced RTMP 4-byte codec identifiers we care
-// about. The spec reserves several more but we only decode AVC for v1.
+// Enhanced RTMP raw packet types as defined by veovera's E-RTMP v1-2023-12
+// §8.1 (video). These are the wire values carried in the low nibble of
+// the ExVideoTagHeader's first byte; parseEnhancedVideoTag normalizes
+// them into the classic VideoPacket* enum for downstream dispatch.
 const (
-	ExVideoFourCCAVC = "avc1"
+	exVideoPacketSequenceStart        uint8 = 0
+	exVideoPacketCodedFrames          uint8 = 1 // body starts with 24-bit signed CTS
+	exVideoPacketSequenceEnd          uint8 = 2
+	exVideoPacketCodedFramesX         uint8 = 3 // same as CodedFrames but no CTS
+	exVideoPacketMetadata             uint8 = 4
+	exVideoPacketMPEG2TSSequenceStart uint8 = 5
+	exVideoPacketMultitrack           uint8 = 6 // E-RTMP v2
+	exVideoPacketModEx                uint8 = 7 // E-RTMP v2
 )
 
 func parseEnhancedVideoTag(body []byte) (*VideoTag, error) {
@@ -155,50 +184,63 @@ func parseEnhancedVideoTag(body []byte) (*VideoTag, error) {
 	head := body[0]
 	// Enhanced RTMP v1-2023-12 §8.1: bit7=1 (ex), bits4-6=FrameType,
 	// bits0-3=PacketType.
-	rawPacketType := VideoPacketType(head & 0x0F)
+	rawPacketType := head & 0x0F
 	frameType := VideoFrameType((head >> 4) & 0x07)
 	fourCC := string(body[1:5])
 
-	if fourCC != ExVideoFourCCAVC {
-		return nil, &UnsupportedVideoError{Reason: "ex-video FourCC " + fourCC + " not AVC"}
+	codec := videoCodecFromFourCC(fourCC)
+	if codec == VideoCodecUnknown {
+		return nil, &UnsupportedVideoError{Reason: "ex-video FourCC " + fourCC + " not in v1 scope"}
 	}
 
-	// Normalise to the classic enum so downstream RTP code can branch on
-	// one value regardless of which FLV dialect delivered the tag. Unknown
-	// ex packet types (e.g. metadata) become soft drops.
+	// Normalize to the classic enum so downstream dispatch only has to
+	// branch on one value. PacketTypes we cannot act on (Metadata,
+	// MPEG2TSSequenceStart, Multitrack, ModEx) are surfaced as soft
+	// drops so the handler logs the reason without closing the session.
 	var normalized VideoPacketType
 	switch rawPacketType {
-	case VideoPacketType(0): // CodedFrames w/ composition time
-		normalized = VideoPacketNALU
-	case VideoPacketType(1): // SequenceStart
+	case exVideoPacketSequenceStart:
 		normalized = VideoPacketSeqHeader
-	case VideoPacketType(2): // CodedFramesX (no composition time)
+	case exVideoPacketCodedFrames:
 		normalized = VideoPacketNALU
-	case VideoPacketType(3): // MPEG2TSSequenceStart — ignored
-		return nil, &UnsupportedVideoError{Reason: "ex-video MPEG2TSSequenceStart"}
-	case VideoPacketType(4): // Multitrack — ignored
-		return nil, &UnsupportedVideoError{Reason: "ex-video Multitrack"}
-	case VideoPacketType(5): // ModEx
-		return nil, &UnsupportedVideoError{Reason: "ex-video ModEx"}
-	case VideoPacketType(6): // MetaData — ignored
-		return nil, &UnsupportedVideoError{Reason: "ex-video MetaData"}
-	case VideoPacketType(7): // SequenceEnd
+	case exVideoPacketSequenceEnd:
 		normalized = VideoPacketEndOfSeq
+	case exVideoPacketCodedFramesX:
+		normalized = VideoPacketNALU
+	case exVideoPacketMetadata:
+		return nil, &UnsupportedVideoError{Reason: "ex-video Metadata"}
+	case exVideoPacketMPEG2TSSequenceStart:
+		return nil, &UnsupportedVideoError{Reason: "ex-video MPEG2TSSequenceStart"}
+	case exVideoPacketMultitrack:
+		return nil, &UnsupportedVideoError{Reason: "ex-video Multitrack"}
+	case exVideoPacketModEx:
+		return nil, &UnsupportedVideoError{Reason: "ex-video ModEx"}
 	default:
 		return nil, &UnsupportedVideoError{Reason: fmt.Sprintf("ex-video packet type %d", rawPacketType)}
 	}
 
 	offset := 5
 	var cts int32
-	// PacketTypeCodedFrames (0) carries a 24-bit composition time offset
-	// in big-endian form right after the FourCC. PacketTypeCodedFramesX
-	// (2) omits it entirely for lower overhead when B-frames are absent.
-	if rawPacketType == VideoPacketType(0) && len(body) >= offset+3 {
+	// Enhanced RTMP v2 §ExVideoTagBody: the 24-bit composition time
+	// offset is only present on PacketType=CodedFrames AND only for the
+	// B-frame-capable codecs (AVC / HEVC / VVC). AV1 and VP9 have no
+	// B-frames, so the spec deliberately omits the CTS field for them —
+	// reading 3 bytes here would consume the first OBU / frame header
+	// and leave pion's packetizer with mangled bitstream (which is
+	// exactly the symptom we hit: half of the AV1 tags coming out of
+	// ffmpeg are only 3 bytes of OBU after the FourCC, so the parser
+	// was eating the entire payload).
+	//
+	// PacketType=CodedFramesX (3) never carries CTS for any codec, so it
+	// is handled by the "no branch" path below.
+	if rawPacketType == exVideoPacketCodedFrames && codecCarriesCTS(codec) &&
+		len(body) >= offset+3 {
 		cts = decodeSignedInt24BE(body[offset : offset+3])
 		offset += 3
 	}
 
 	return &VideoTag{
+		Codec:             codec,
 		FrameType:         frameType,
 		PacketType:        normalized,
 		IsKeyFrame:        frameType == VideoFrameKey,

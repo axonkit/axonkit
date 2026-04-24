@@ -8,7 +8,7 @@ import (
 )
 
 // writeAVCC builds a fake AVCC NALU with the given NALU bytes so tests can
-// drive H264Packetizer.PacketizeAVCC without pulling in a real encoder.
+// drive H264Packetizer.Packetize without pulling in a real encoder.
 func writeAVCC(nalus ...[]byte) []byte {
 	var out []byte
 	for _, n := range nalus {
@@ -29,7 +29,7 @@ func TestH264Packetizer_KeyframeEmitsSTAPA(t *testing.T) {
 	pk.SetParameterSets(sps, pps)
 	pk.SetMTU(1200)
 
-	pkts, err := pk.PacketizeAVCC(90_000, true, writeAVCC(idr))
+	pkts, err := pk.Packetize(90_000, true, writeAVCC(idr))
 	if err != nil {
 		t.Fatalf("packetize: %v", err)
 	}
@@ -67,12 +67,12 @@ func TestH264Packetizer_SequenceNumbersMonotonic(t *testing.T) {
 	pk := NewH264Packetizer(1, 100)
 	pk.SetParameterSets([]byte{0x67, 0x42, 0x00, 0x1F}, []byte{0x68, 0xCE})
 	// Same tiny frame twice → at least two packets with two distinct seq#s.
-	_, err := pk.PacketizeAVCC(0, true, writeAVCC([]byte{0x65, 0x88}))
+	_, err := pk.Packetize(0, true, writeAVCC([]byte{0x65, 0x88}))
 	if err != nil {
 		t.Fatalf("packetize #1: %v", err)
 	}
 	startSeq := pk.SequenceNumber()
-	pkts, err := pk.PacketizeAVCC(90_000, false, writeAVCC([]byte{0x41, 0xE1}))
+	pkts, err := pk.Packetize(90_000, false, writeAVCC([]byte{0x41, 0xE1}))
 	if err != nil {
 		t.Fatalf("packetize #2: %v", err)
 	}
