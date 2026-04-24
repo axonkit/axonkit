@@ -414,6 +414,7 @@ func (m *Manager) buildWebRtcServerListenInfos() []*mediasoup.TransportListenInf
 	base := mediasoup.TransportListenInfo{
 		Ip:               ip,
 		AnnouncedAddress: cfg.AnnouncedIP,
+		ExposeInternalIp: true,
 	}
 	if cfg.MinPort > 0 && cfg.MaxPort > 0 {
 		base.PortRange = mediasoup.TransportPortRange{Min: cfg.MinPort, Max: cfg.MaxPort}
