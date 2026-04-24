@@ -311,7 +311,8 @@ func (s *HTTPServer) handleJoinLocal(w http.ResponseWriter, req *proto.JoinReque
 	var claims *auth.Claims
 	participantSid := "pa_" + xid.New().String()
 
-	if req.Token != "" {
+	switch {
+	case req.Token != "":
 		var err error
 		claims, err = s.verifier.Verify(req.Token)
 		if err != nil {
@@ -319,7 +320,7 @@ func (s *HTTPServer) handleJoinLocal(w http.ResponseWriter, req *proto.JoinReque
 				Code: proto.ErrCodeInvalidToken, Error: err.Error()})
 			return
 		}
-	} else if s.cfg.Auth.AllowAnonymous {
+	case s.cfg.Auth.AllowAnonymous:
 		roomName := ""
 		if req.Room != nil {
 			roomName = req.Room.Name
@@ -341,7 +342,7 @@ func (s *HTTPServer) handleJoinLocal(w http.ResponseWriter, req *proto.JoinReque
 				},
 			},
 		}
-	} else {
+	default:
 		writeJSON(w, http.StatusUnauthorized, proto.ErrorResponse{
 			Code: proto.ErrCodeInvalidToken, Error: "token required"})
 		return

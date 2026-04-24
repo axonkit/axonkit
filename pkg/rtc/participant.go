@@ -1560,16 +1560,21 @@ func (p *Participant) PublishTrack(req *proto.PublishTrackRequest) (*PublishedTr
 	return track, nil
 }
 
-// RegisterWHIPProducer attaches a mediasoup.Producer that was created
-// out-of-band (by a WHIP session) to this participant so that room-side
-// subscription, dynacast, and cleanup work the same as a datachannel-based
-// PublishTrack. The caller chooses the trackSid so that it can key future
-// references (mute/update/unpublish) to the same value.
+// RegisterIngestProducer attaches a mediasoup.Producer that was created
+// out-of-band (by a WHIP/E-RTMP/SIP/etc. ingest session) to this
+// participant so that room-side subscription, dynacast, and cleanup work
+// the same as a datachannel-based PublishTrack.
 //
-// The participant is expected to already own sess.Transport via SetTransports,
-// but we do not re-validate that here so WHIP standalone participants (which
-// have a send transport but no recv transport) can still use this method.
-func (p *Participant) RegisterWHIPProducer(trackSid string, producer *mediasoup.Producer) error {
+// trackSid: the caller-chosen track id. When empty a router-scoped id is
+// derived from the producer. source hints the downstream SDK which HTML
+// element to attach the track to (TrackSource_CAMERA /
+// TrackSource_MICROPHONE is the typical default for passive ingest).
+//
+// The participant is expected to already own sess.Transport via
+// SetTransports, but this method does not re-validate that so WHIP/E-RTMP
+// standalone participants (which may only have a send/direct transport)
+// can still publish.
+func (p *Participant) RegisterIngestProducer(trackSid string, source proto.TrackSource, producer *mediasoup.Producer) error {
 	if producer == nil {
 		return fmt.Errorf("nil producer")
 	}
@@ -1578,18 +1583,6 @@ func (p *Participant) RegisterWHIPProducer(trackSid string, producer *mediasoup.
 	}
 	if trackSid == "" {
 		trackSid = string(types.NewStreamID(p.router.Id(), producer.Id()))
-	}
-
-	// WHIP itself does not carry a track-source hint, but downstream SDKs
-	// commonly pivot on `source` (camera/mic) to pick which <video>/<audio>
-	// element to attach to. Default to the obvious value per kind so demos
-	// and dashboards render WHIP ingest out of the box.
-	source := proto.TrackSource_UNKNOWN
-	switch producer.Kind() {
-	case mediasoup.MediaKindAudio:
-		source = proto.TrackSource_MICROPHONE
-	case mediasoup.MediaKindVideo:
-		source = proto.TrackSource_CAMERA
 	}
 
 	track := &PublishedTrack{
@@ -1612,8 +1605,8 @@ func (p *Participant) RegisterWHIPProducer(trackSid string, producer *mediasoup.
 		p.mu.Unlock()
 	})
 
-	p.logger.Info("WHIP track registered",
-		"trackSid", track.sid, "kind", producer.Kind(), "producerId", producer.Id())
+	p.logger.Info("Ingest track registered",
+		"trackSid", track.sid, "kind", producer.Kind(), "producerId", producer.Id(), "source", string(source))
 
 	if p.room != nil {
 		p.room.OnTrackPublished(p, track)

@@ -15,6 +15,7 @@ type Config struct {
 	Auth  AuthConfig  `json:"auth"`
 	Nats  NatsConfig  `json:"nats"`
 	Whip  WhipConfig  `json:"whip"`
+	Rtmp  RtmpConfig  `json:"rtmp"`
 }
 
 // WHEP resource-id routing schemes. The scheme decides how a node that
@@ -31,12 +32,35 @@ const (
 	WhepRoutingKV = "kv"
 )
 
-// WhipConfig tunes WHIP/WHEP specific behaviour.
+// WhipConfig tunes WHIP/WHEP specific behavior.
 type WhipConfig struct {
 	// WhepRouting selects the distributed-lookup scheme for WHEP
 	// PATCH/DELETE. See the WhepRouting* constants. Defaults to
 	// WhepRoutingPrefix.
 	WhepRouting string `json:"whepRouting"`
+}
+
+// RtmpConfig tunes the RTMP push ingest service. The implementation
+// speaks both classic RTMP and Enhanced RTMP (ExAudio / ExVideo) so
+// publishers can push H.264 + Opus without transcoding; any other codec
+// is dropped without failing the connection.
+//
+// The ingest is disabled when Listen is empty; only axonkit operators who
+// explicitly opt-in by setting a bind address (e.g. ":1935") pay the
+// go-rtmp goroutine / port cost.
+//
+// A single axonkit node serves both WHIP (WebRTC) and RTMP pushes into
+// the same rooms. Authentication is JWT-based and carried in the RTMP
+// stream key as a query parameter: publishers point at
+// "rtmp://host/<app>/<room>?token=<jwt>".
+type RtmpConfig struct {
+	// Listen is the TCP bind address for the RTMP server (e.g. ":1935").
+	// Empty disables the service so `go-rtmp` is never wired in.
+	Listen string `json:"listen"`
+
+	// MaxMessageSize caps individual RTMP messages accepted from
+	// publishers. 0 means use go-rtmp default.
+	MaxMessageSize uint32 `json:"maxMessageSize,omitempty"`
 }
 
 type NodeConfig struct {
@@ -61,7 +85,7 @@ type RoomConfig struct {
 	// CodecRegressionThreshold controls when PREFER_REGRESSION policy
 	// triggers codec regression. When 0 (default) or when the room's
 	// participant count is below this threshold, regression is used.
-	// Otherwise the system falls back to simulcast behaviour.
+	// Otherwise the system falls back to simulcast behavior.
 	CodecRegressionThreshold int `json:"codecRegressionThreshold"`
 	// MaxMessages is the maximum number of messages kept in room history.
 	// Oldest messages are evicted when the limit is exceeded. 0 means use default (10000).
@@ -132,6 +156,9 @@ func DefaultConfig() *Config {
 		},
 		Whip: WhipConfig{
 			WhepRouting: WhepRoutingPrefix,
+		},
+		Rtmp: RtmpConfig{
+			Listen: ":1935",
 		},
 	}
 }

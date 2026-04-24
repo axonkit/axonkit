@@ -471,7 +471,7 @@ func pickProducer(producers []*mediasoup.Producer, kind mediasoup.MediaKind) int
 //	offer=active   → remote is DTLS client → answer setup:passive, role=client
 //	offer=passive  → remote is DTLS server → answer setup:active,  role=server
 //	offer=actpass  → we choose; prefer passive for parity with historical
-//	                 behaviour (works with all browsers, OBS, GStreamer).
+//	                 behavior (works with all browsers, OBS, GStreamer).
 //	offer=""       → treated as actpass; some minimal WHIP clients omit setup.
 //
 // Keeping the answer's `a=setup` and mediasoup's `DtlsRole` in lockstep is

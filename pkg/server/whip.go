@@ -246,7 +246,7 @@ func (s *HTTPServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
 	// PipeToRouter so the consumer transport sees a local copy of the
 	// producer. The same cache that powers SFU cross-router subscribe
 	// (rtc.Participant.PipeProducerTo) is reused here so a single pipe
-	// is shared across both signalling protocols.
+	// is shared across both signaling protocols.
 	result, err := s.whipSvc.CreateWHEP(whip.CreateWHEPOptions{
 		OfferSDP:          offerSDP,
 		Producers:         producers,
@@ -406,7 +406,7 @@ func extractBearerToken(r *http.Request) string {
 			return strings.TrimSpace(h[len(prefix):])
 		}
 	}
-	if v := r.URL.Query().Get("access_token"); v != "" {
+	if v := r.URL.Query().Get("token"); v != "" {
 		return v
 	}
 	return ""
@@ -704,45 +704,20 @@ func (s *HTTPServer) findParticipantByIdentity(roomName, participantID string) (
 }
 
 func (s *HTTPServer) attachPublishSession(result *whip.CreateWHIPResult, claims *auth.Claims, roomName string) (*rtc.Participant, error) {
-	if s.roomManager == nil {
-		return nil, fmt.Errorf("room manager not configured")
-	}
-	roomCfg := s.cfg.Room
-	room := s.roomManager.GetOrCreateRoom(roomName, roomCfg.MaxParticipants, "")
-	if room == nil {
-		return nil, fmt.Errorf("room %q unavailable", roomName)
-	}
-
-	identity := claims.Identity()
-	if identity == "" {
-		identity = claims.Name
-	}
-	if identity == "" {
-		return nil, fmt.Errorf("participant identity required")
-	}
-	name := claims.Name
-	if name == "" {
-		name = identity
-	}
-
-	participant := rtc.NewParticipant(rtc.ParticipantParams{
-		Sid:           "whip_" + xid.New().String(),
-		Identity:      identity,
-		Name:          name,
-		Grants:        claims.Grants,
-		Router:        result.Router,
-		TokenVerifier: s.verifier,
-		NodeId:        string(s.node.ID),
-	})
-	participant.SetTransports(result.Transport, nil, nil)
-	// Headless signaling: WHIP has no datachannel. SetSignal with all nils
-	// latches signalHeadless so broadcast fan-out silently drops messages
-	// instead of logging "signal channel not established" per update, and
-	// messageLoop is never started for this participant.
-	participant.SetSignal(nil, nil, nil, nil)
-
-	if err := room.AddParticipant(participant); err != nil {
-		return nil, fmt.Errorf("add participant: %w", err)
+	// WHIP itself does not carry a track-source hint, but downstream SDKs
+	// commonly pivot on `source` (camera/mic) to pick which <video>/<audio>
+	// element to attach to. Default to the obvious value per kind so demos
+	// and dashboards render WHIP ingest out of the box.
+	attached := make([]AttachedProducer, 0, len(result.Producers))
+	for _, producer := range result.Producers {
+		source := proto.TrackSource_UNKNOWN
+		switch producer.Kind() {
+		case mediasoup.MediaKindAudio:
+			source = proto.TrackSource_MICROPHONE
+		case mediasoup.MediaKindVideo:
+			source = proto.TrackSource_CAMERA
+		}
+		attached = append(attached, AttachedProducer{Producer: producer, Source: source})
 	}
 
 	// Do NOT flip state to JOINED here. WHIP has no Ready request, but
@@ -751,19 +726,20 @@ func (s *HTTPServer) attachPublishSession(result *whip.CreateWHIPResult, claims 
 	// state to JOINED on the first IceStateConnected/Completed event (see
 	// onIceSourceUp), and the setup watchdog will close out the
 	// participant if ICE never reaches that state within setupTimeout.
-	for _, producer := range result.Producers {
-		trackSid := fmt.Sprintf("TR_%d", time.Now().UnixNano())
-		if err := participant.RegisterWHIPProducer(trackSid, producer); err != nil {
-			slog.Warn("WHIP register producer failed", "err", err, "trackSid", trackSid)
-			continue
-		}
-	}
-
-	// Participant is now the sole owner of transport and producers. ICE
-	// disconnect is handled by the participant's own ICE watchdog, which
-	// closes the participant (and thus the transport) on timeout — no
-	// Session / OnClose plumbing needed.
-	return participant, nil
+	//
+	// Participant is also the sole owner of transport and producers after
+	// this point. ICE disconnect is handled by the participant's own ICE
+	// watchdog, which closes the participant (and thus the transport) on
+	// timeout — no Session / OnClose plumbing needed.
+	return s.AttachPublishParticipant(AttachPublishParticipantOptions{
+		SidPrefix:     "whip_",
+		RoomName:      roomName,
+		Claims:        claims,
+		Router:        result.Router,
+		Transport:     result.Transport,
+		TransportKind: TransportKindSend,
+		Producers:     attached,
+	})
 }
 
 func (s *HTTPServer) writeWHIPResponse(w http.ResponseWriter, prefix, roomName, resourceID, answer, etag string) {

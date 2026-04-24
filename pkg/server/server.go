@@ -13,6 +13,7 @@ import (
 	"github.com/axonkit/axonkit/pkg/media"
 	"github.com/axonkit/axonkit/pkg/routing"
 	"github.com/axonkit/axonkit/pkg/rtc"
+	rtmpingest "github.com/axonkit/axonkit/pkg/rtc/rtmp"
 	"github.com/axonkit/axonkit/pkg/store"
 	"github.com/axonkit/axonkit/pkg/types"
 
@@ -40,6 +41,7 @@ type Server struct {
 	nodeRPC     *NodeRPCService
 	httpAPI     *HTTPServer
 	httpServer  *http.Server
+	rtmpSvc     *rtmpingest.Service
 
 	probeCancel context.CancelFunc
 }
@@ -204,6 +206,22 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		Handler: WithLogging(WithCORS(mux)),
 	}
 
+	// RTMP ingest shares the same Participant machinery as WHIP: the
+	// HTTPServer exposes the attach hooks, and the rtmp.Service drives
+	// them from inbound RTMP connections. Opt-in via cfg.Rtmp.Listen;
+	// an empty listen address leaves the service nil so we don't even
+	// import go-rtmp's accept loop. The underlying implementation
+	// handles classic and Enhanced RTMP (H.264 + Opus) transparently.
+	if cfg.Rtmp.Listen != "" {
+		n.rtmpSvc = rtmpingest.NewService(rtmpingest.ServiceParams{
+			Listen:         cfg.Rtmp.Listen,
+			Verifier:       verifier,
+			AllowAnonymous: cfg.Auth.AllowAnonymous,
+			Hooks:          httpAPI.buildRTMPHooks(),
+			Logger:         slog.Default().With("component", "rtmp.Service"),
+		})
+	}
+
 	return n, nil
 }
 
@@ -268,6 +286,13 @@ func (n *Server) Start(ctx context.Context) error {
 			slog.Error("HTTP server failed", "error", err)
 		}
 	}()
+
+	if n.rtmpSvc != nil {
+		if err := n.rtmpSvc.Start(); err != nil {
+			slog.Error("RTMP service failed to start", "error", err)
+			return fmt.Errorf("rtmp start: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -282,6 +307,12 @@ func (n *Server) Stop(ctx context.Context) error {
 	var httpErr error
 	if n.httpServer != nil {
 		httpErr = n.httpServer.Shutdown(ctx)
+	}
+	if n.rtmpSvc != nil {
+		if err := n.rtmpSvc.Stop(); err != nil {
+			slog.Warn("RTMP service stop error", "error", err)
+		}
+		n.rtmpSvc = nil
 	}
 	n.closeDeps()
 	return httpErr

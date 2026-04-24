@@ -668,11 +668,11 @@ func matchCapability(codec *mediasoup.RtpCodecParameters, caps *mediasoup.RtpCap
 	return nil
 }
 
-func codecParamsCompatible(codec *mediasoup.RtpCodecParameters, cap *mediasoup.RtpCodecCapability) bool {
+func codecParamsCompatible(codec *mediasoup.RtpCodecParameters, capability *mediasoup.RtpCodecCapability) bool {
 	mime := strings.ToLower(codec.MimeType)
 	switch {
 	case strings.HasSuffix(mime, "/h264"):
-		if codec.Parameters.PacketizationMode != cap.Parameters.PacketizationMode {
+		if codec.Parameters.PacketizationMode != capability.Parameters.PacketizationMode {
 			return false
 		}
 		// RFC 6184 §8.2.2: profile-level-id identifies a profile *and* a level,
@@ -683,11 +683,11 @@ func codecParamsCompatible(codec *mediasoup.RtpCodecParameters, cap *mediasoup.R
 		// our caps' `42e01f` (Constrained Baseline, Level 3.1), which are the
 		// same profile. Fall back to the strict compare only when we cannot
 		// decode either side.
-		if !h264ProfileCompatible(codec.Parameters.ProfileLevelId, cap.Parameters.ProfileLevelId) {
+		if !h264ProfileCompatible(codec.Parameters.ProfileLevelId, capability.Parameters.ProfileLevelId) {
 			return false
 		}
 	case strings.HasSuffix(mime, "/vp9"):
-		if cap.Parameters.ProfileId != codec.Parameters.ProfileId {
+		if capability.Parameters.ProfileId != codec.Parameters.ProfileId {
 			return false
 		}
 	}

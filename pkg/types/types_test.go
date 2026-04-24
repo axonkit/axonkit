@@ -1,6 +1,10 @@
 package types
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/jiyeyuran/mediasoup-go/v2"
+)
 
 func TestNewStreamID(t *testing.T) {
 	sid := NewStreamID("router-123", "producer-456")
@@ -42,7 +46,7 @@ func TestStreamID_ProducerID(t *testing.T) {
 }
 
 func TestStreamID_IsDataProducer(t *testing.T) {
-	data := NewStreamID("rt-abc", "dp-uuid")
+	data := NewStreamID("rt-abc", mediasoup.DataProducerIDPrefix+"uuid")
 	if !data.IsDataProducer() {
 		t.Fatal("expected IsDataProducer = true for dp- prefix")
 	}
