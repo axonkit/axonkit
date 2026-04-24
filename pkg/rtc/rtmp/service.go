@@ -32,7 +32,7 @@ type Service struct {
 	mu       sync.Mutex
 	listener net.Listener
 	server   *gortmp.Server
-	done     chan struct{}
+	wg       sync.WaitGroup
 }
 
 // ServiceParams carries the static wiring the RTMP listener needs.
@@ -93,7 +93,6 @@ func (s *Service) Start() error {
 		return fmt.Errorf("rtmp listen %q: %w", s.params.Listen, err)
 	}
 	s.listener = l
-	s.done = make(chan struct{})
 
 	// go-rtmp wants one Handler per connection. The factory closes over
 	// the service's auth/hook config and personalises the per-connection
@@ -115,13 +114,13 @@ func (s *Service) Start() error {
 	})
 	s.server = srv
 
-	go func() {
+	s.wg.Go(func() {
 		s.logger.Info("RTMP service listening", "addr", s.params.Listen)
 		if err := srv.Serve(l); err != nil && !errors.Is(err, gortmp.ErrClosed) {
 			s.logger.Error("rtmp serve returned", "err", err)
 		}
-		close(s.done)
-	}()
+	})
+
 	return nil
 }
 
@@ -132,9 +131,7 @@ func (s *Service) Start() error {
 func (s *Service) Stop() error {
 	s.mu.Lock()
 	srv := s.server
-	done := s.done
 	s.server = nil
-	s.done = nil
 	s.mu.Unlock()
 
 	if srv == nil {
@@ -143,8 +140,6 @@ func (s *Service) Stop() error {
 	if err := srv.Close(); err != nil {
 		return err
 	}
-	if done != nil {
-		<-done
-	}
+	s.wg.Wait()
 	return nil
 }
