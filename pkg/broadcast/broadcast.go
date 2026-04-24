@@ -44,7 +44,7 @@ type Params struct {
 	// Rooms gives us read-only access to live participants so we can
 	// find the bound producer (and react to its close).
 	Rooms RoomLookup
-	// WhipService is used to materialise the mix ingest transport +
+	// WhipService is used to materialize the mix ingest transport +
 	// producers on POST /rtc/broadcast/{id}/whip. Optional — when
 	// nil the mix endpoints return 501, the live path still works.
 	WhipService *whip.Service
@@ -466,7 +466,7 @@ func (b *Broadcast) terminate(reason TerminationReason) {
 //   - ErrTerminated:          broadcast is already torn down
 //   - ErrMixAlreadyConnected: a mix ingest is already attached
 //   - various wrapped errors from whip.Service.CreateWHIP
-func (b *Broadcast) AttachMix(offerSDP string) (answer string, etag string, err error) {
+func (b *Broadcast) AttachMix(offerSDP string) (answer, etag string, err error) {
 	b.mu.Lock()
 	if b.terminated {
 		b.mu.Unlock()

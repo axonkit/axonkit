@@ -19,7 +19,6 @@ const (
 
 	flvAVCPacketTypeSeqHeader byte = 0x00
 	flvAVCPacketTypeNALU      byte = 0x01
-	flvAVCPacketTypeEndOfSeq  byte = 0x02
 )
 
 // buildAVCSeqHeaderTag writes the FLV AVC seq header body:
@@ -57,18 +56,6 @@ func buildAVCFrameTag(isKey bool, avccAccessUnit []byte) []byte {
 	return out
 }
 
-// buildAVCEndOfSeqTag writes the "end of sequence" AVC tag (body has no
-// payload after the 5-byte header). Sending this at teardown gives
-// receivers a clean signal that no more frames will arrive on this
-// RTMP session, which helps ffmpeg finish muxing without a timeout.
-func buildAVCEndOfSeqTag() []byte {
-	return []byte{
-		flvFrameTypeKey | flvVideoCodecAVC,
-		flvAVCPacketTypeEndOfSeq,
-		0, 0, 0,
-	}
-}
-
 // Enhanced RTMP (E-RTMP) video tag layout — veovera
 // "enhanced-rtmp-v2" §7. Used for VP9 and AV1 where the classic
 // 1-byte (FrameType<<4 | CodecID) header cannot represent the codec.
@@ -94,10 +81,8 @@ const (
 	flvExVideoFrameTypeKey   byte = 0x10 // (1 << 4)
 	flvExVideoFrameTypeInter byte = 0x20 // (2 << 4)
 
-	flvExVideoPacketSeqStart   byte = 0x00
-	flvExVideoPacketCodedFrame byte = 0x01
-	flvExVideoPacketSeqEnd     byte = 0x02
-	flvExVideoPacketCodedFrmX  byte = 0x03
+	flvExVideoPacketSeqStart  byte = 0x00
+	flvExVideoPacketCodedFrmX byte = 0x03
 
 	flvExVideoFourCCVP9 = "vp09"
 	flvExVideoFourCCAV1 = "av01"
@@ -132,20 +117,10 @@ func buildExVideoFrameTag(fourCC string, isKey bool, accessUnit []byte) []byte {
 	return out
 }
 
-// buildExVideoEndOfSeqTag emits a SequenceEnd tag for the given FourCC.
-// Paired with buildAVCEndOfSeqTag for H264 — receivers treat both as
-// "no more frames" markers.
-func buildExVideoEndOfSeqTag(fourCC string) []byte {
-	out := make([]byte, 5)
-	out[0] = exVideoHeaderByte(true, flvExVideoPacketSeqEnd)
-	copy(out[1:5], []byte(fourCC))
-	return out
-}
-
 // buildVP9ConfigRecord produces a VPCodecConfigurationRecord (ISO/IEC
 // 14496-15 §10, vpcC box). E-RTMP re-uses the same 8-byte record.
 //
-// We default to profile 0 / 4:2:0 8-bit / BT.709 colour — the same
+// We default to profile 0 / 4:2:0 8-bit / BT.709 color — the same
 // parameters WebRTC stacks (Chrome, pion) overwhelmingly produce for
 // real-time VP9. If a publisher negotiates HDR we'd need to derive
 // these from the uncompressed VP9 frame header; for the broadcast
@@ -157,8 +132,8 @@ func buildVP9ConfigRecord(profile, level uint8) []byte {
 	out[1] = level
 	// bitDepth=8 (upper 4 bits), chromaSubsampling=1 (next 3 bits),
 	// videoFullRangeFlag=0 (lowest bit).
-	out[2] = (8 << 4) | (1 << 1) | 0
-	out[3] = 1 // colourPrimaries = BT.709
+	out[2] = (8 << 4) | (1 << 1)
+	out[3] = 1 // colorPrimaries = BT.709
 	out[4] = 1 // transferCharacteristics = BT.709
 	out[5] = 1 // matrixCoefficients = BT.709
 	// codecIntializationDataSize = 0 (bytes 6..7 already zero)
@@ -213,14 +188,13 @@ func buildAV1ConfigRecord(seqHeaderOBU []byte, seqProfile, seqLevel, seqTier uin
 // and some downstream consumers only accept the Ex path).
 //
 // Layout we emit:
-//   byte 0  : 0x9X — high nibble 9 = Ex-Audio marker; low nibble = packet type
-//   bytes 1-4: FourCC = "Opus"
-//   bytes 5..: body (OpusHead for SequenceStart, Opus packet for CodedFrames)
+//
+//	byte 0   : 0x9X — high nibble 9 = Ex-Audio marker; low nibble = packet type
+//	bytes 1-4: FourCC = "Opus"
+//	bytes 5..: body (OpusHead for SequenceStart, Opus packet for CodedFrames)
 const (
-	flvExAudioHeader           byte = 0x90 // 0x9 | (packetType 0)
-	flvExAudioPacketSeqStart   byte = 0x00
+	flvExAudioPacketSeqStart    byte = 0x00
 	flvExAudioPacketCodedFrames byte = 0x01
-	flvExAudioPacketSeqEnd     byte = 0x02
 
 	flvExAudioFourCCOpus = "Opus"
 )
@@ -236,10 +210,10 @@ func buildOpusSeqHeaderTag(channels uint8) []byte {
 	copy(opusHead[0:], "OpusHead")
 	opusHead[8] = 0x01 // version
 	opusHead[9] = channels
-	binary.LittleEndian.PutUint16(opusHead[10:], 0)     // preSkip = 0
+	binary.LittleEndian.PutUint16(opusHead[10:], 0)     // preSkip
 	binary.LittleEndian.PutUint32(opusHead[12:], 48000) // input sample rate
-	binary.LittleEndian.PutUint16(opusHead[16:], 0)     // outputGain = 0
-	opusHead[18] = 0                                    // mappingFamily = 0 (mono/stereo)
+	// opusHead[16..17] outputGain = 0 (left zero)
+	// opusHead[18]     mappingFamily = 0 (mono/stereo, left zero)
 
 	// Assemble full body: [0x90][FourCC "Opus"][OpusHead].
 	out := make([]byte, 5+len(opusHead))
@@ -256,14 +230,5 @@ func buildOpusFrameTag(opusPacket []byte) []byte {
 	out[0] = 0x90 | flvExAudioPacketCodedFrames
 	copy(out[1:5], []byte(flvExAudioFourCCOpus))
 	copy(out[5:], opusPacket)
-	return out
-}
-
-// buildOpusEndOfSeqTag signals the end of the Opus audio stream. Like
-// the video counterpart, ffmpeg treats this as "done, flush buffers".
-func buildOpusEndOfSeqTag() []byte {
-	out := make([]byte, 5)
-	out[0] = 0x90 | flvExAudioPacketSeqEnd
-	copy(out[1:5], []byte(flvExAudioFourCCOpus))
 	return out
 }

@@ -14,7 +14,7 @@ type ManagerParams struct {
 	// Rooms is typically *rtc.RoomManager.
 	Rooms RoomLookup
 	// WhipService is the shared whip.Service used by HTTPServer for
-	// per-room WHIP ingest; broadcast reuses it to materialise the
+	// per-room WHIP ingest; broadcast reuses it to materialize the
 	// mix ingest transport + producers without registering them as a
 	// room participant.
 	WhipService *whip.Service

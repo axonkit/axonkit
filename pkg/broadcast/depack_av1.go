@@ -136,9 +136,9 @@ func (d *AV1Depacketizer) ConfigRecord() []byte {
 	}
 	return buildAV1ConfigRecord(
 		d.seqHeaderOBU,
-		0,    // seq_profile = 0 (4:2:0 8-bit)
-		0,    // seq_level_idx = 0 (2.0)
-		0,    // seq_tier = 0 (Main)
+		0,     // seq_profile = 0 (4:2:0 8-bit)
+		0,     // seq_level_idx = 0 (2.0)
+		0,     // seq_tier = 0 (Main)
 		false, // high_bitdepth
 		false, // monochrome
 		true,  // chroma_subsampling_x = 1 (4:2:0)

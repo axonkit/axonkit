@@ -17,7 +17,8 @@ var (
 	nodeID            = flag.String("node", cfg.Node.ID, "Node ID")
 	regionID          = flag.String("region", cfg.Node.Region, "Region ID")
 	clusterID         = flag.String("cluster", cfg.Node.Cluster, "Cluster ID")
-	natsURL           = flag.String("nats", cfg.Nats.URL, "NATS URL")
+	natsURL           = flag.String("nats", cfg.Nats.URL, "NATS URL (empty enables the embedded in-process NATS server)")
+	natsStoreDir      = flag.String("nats-storedir", cfg.Nats.StoreDir, "JetStream store directory for the embedded NATS server (ignored when -nats is set)")
 	httpPort          = flag.Int("port", cfg.Node.Port, "HTTP Port")
 	workerBin         = flag.String("worker", cfg.Media.WorkerBin, "Path to mediasoup-worker binary")
 	apiKey            = flag.String("api-key", cfg.Auth.APIKey, "API key for token verification")
@@ -43,6 +44,7 @@ func main() {
 	cfg.Node.Port = *httpPort
 	cfg.Media.WorkerBin = *workerBin
 	cfg.Nats.URL = *natsURL
+	cfg.Nats.StoreDir = *natsStoreDir
 	cfg.Auth.APIKey = *apiKey
 	cfg.Auth.APISecret = *apiSecret
 	cfg.Auth.AllowAnonymous = *allowAnonymous

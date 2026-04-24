@@ -11,7 +11,7 @@ const (
 )
 
 // Codec is the codec carried by a MediaSample. Only the subset the
-// outbound pushers can serialise is declared — unknown codecs surface
+// outbound pushers can serialize is declared — unknown codecs surface
 // as ErrUnsupportedCodec at broadcast creation time.
 type Codec uint8
 

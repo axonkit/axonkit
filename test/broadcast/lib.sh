@@ -2,10 +2,11 @@
 #
 # Both verify.sh (ffmpeg WHIP simulator) and verify-avflow.sh (real
 # avflow Chrome-based mixer) share ~80% of their orchestration: build
-# axonkit, start nats, start axonkit, publish two fake users, wire up
-# an RTMP recorder, create a broadcast, run phase-1/2/3 assertions,
-# finalise the recording. Only the mix phase differs. Factor the
-# common bits here so fixes land once and the two scripts stay in sync.
+# axonkit, start axonkit (with its embedded in-process NATS + JetStream),
+# publish two fake users, wire up an RTMP recorder, create a broadcast,
+# run phase-1/2/3 assertions, finalise the recording. Only the mix
+# phase differs. Factor the common bits here so fixes land once and
+# the two scripts stay in sync.
 #
 # Callers must:
 #   1. `source` this file.
@@ -26,7 +27,6 @@
 : "${API_KEY:=axonkit-verify}"
 : "${API_SECRET:=$(openssl rand -hex 32)}"
 : "${HTTP_PORT:=17990}"
-: "${NATS_PORT:=14222}"
 : "${WEBRTC_MIN_PORT:=51200}"
 : "${WEBRTC_MAX_PORT:=51400}"
 : "${DST_RTMP_PORT:=11935}"
@@ -36,7 +36,11 @@
 # exercise the Enhanced-RTMP (E-RTMP) writer. Each codec pins the
 # ffmpeg encoder + the mediasoup capability negotiation on both the
 # live publishers and — for the ffmpeg variant — the mix simulator.
+# Normalised to lowercase so that `VIDEO_CODEC=VP9` / `H264` / `Av1` all
+# work on the command line without the user having to remember the
+# internal convention.
 : "${VIDEO_CODEC:=h264}"
+VIDEO_CODEC="$(printf '%s' "$VIDEO_CODEC" | tr '[:upper:]' '[:lower:]')"
 
 # Durations (seconds). Shared so both variants spend the same time in
 # each phase; tolerances in the assertions depend on these.
@@ -54,12 +58,21 @@ BIN_TOKEN="$REPO_ROOT/bin/token"
 WORKER_BIN="${WORKER_BIN:-$REPO_ROOT/bin/mediasoup-worker}"
 BASE_URL="http://127.0.0.1:$HTTP_PORT"
 
+# OUT_DIR is where the final verification artefacts (MP4 recording,
+# frame PNGs, per-run frames.txt report) land. Kept inside the test
+# tree so `.gitignore` can hide it and so nothing leaks into the
+# user's ~/Downloads. Override OUT_DIR to redirect elsewhere.
+OUT_DIR="${OUT_DIR:-$SCRIPT_DIR/out}"
+
 # Tracked child PIDs (cleaned up in _lib_cleanup).
 PIDS=()
 lib_track_pid() { [[ -n "${1:-}" ]] && PIDS+=("$1"); }
 
 # Populated by lib_init. STATE_DIR is the per-run scratch; LOG_DIR gets
-# a file per subsystem (nats, axonkit, publishers, avflow, recorder).
+# a file per subsystem (axonkit, publishers, avflow, recorder).
+# NATS_STORE is the JetStream directory for axonkit's embedded NATS —
+# we pin it inside STATE_DIR so a run never pollutes the repo with a
+# stray .data/ directory.
 STATE_DIR=""
 LOG_DIR=""
 REC_DIR=""
@@ -103,7 +116,6 @@ lib_init() {
     lib_require_bin ffmpeg
     lib_require_bin ffprobe
     lib_require_bin curl
-    lib_require_bin nats-server
     lib_require_bin openssl
     lib_require_bin awk
     lib_require_bin python3
@@ -162,7 +174,8 @@ _lib_cleanup() {
 }
 
 # ---------------------------------------------------------------------------
-# Build + boot axonkit/nats/publishers/recorder.
+# Build + boot axonkit/publishers/recorder. NATS runs embedded inside
+# axonkit so there is no separate broker process to launch.
 # ---------------------------------------------------------------------------
 
 lib_build_axonkit() {
@@ -176,26 +189,16 @@ lib_build_axonkit() {
     (cd "$REPO_ROOT" && go build -o bin/whipsim ./cmd/whipsim) >/dev/null
 }
 
-lib_start_nats() {
-    echo "[nats] starting on :$NATS_PORT"
-    nats-server -p "$NATS_PORT" -js -sd "$NATS_STORE" \
-        >"$LOG_DIR/nats.log" 2>&1 &
-    lib_track_pid "$!"
-    local i
-    for i in $(seq 1 50); do
-        if nc -z 127.0.0.1 "$NATS_PORT" 2>/dev/null; then break; fi
-        sleep 0.1
-    done
-    nc -z 127.0.0.1 "$NATS_PORT" 2>/dev/null || {
-        echo "nats-server failed to start" >&2
-        exit 1
-    }
-}
-
 lib_start_axonkit() {
-    echo "[axonkit] starting on :$HTTP_PORT (worker=$WORKER_BIN)"
+    # -nats "" selects the embedded in-process NATS server (see
+    # pkg/server/server.go:NewServer), so verify runs have zero
+    # external broker dependency. -nats-storedir pins JetStream to a
+    # path inside STATE_DIR, otherwise the embedded server would
+    # create a stray ./.data/ in the repo root.
+    echo "[axonkit] starting on :$HTTP_PORT (worker=$WORKER_BIN, embedded nats storedir=$NATS_STORE)"
     "$BIN_AXONKIT" \
-        -nats "nats://127.0.0.1:$NATS_PORT" \
+        -nats "" \
+        -nats-storedir "$NATS_STORE" \
         -port "$HTTP_PORT" \
         -worker "$WORKER_BIN" \
         -rtmp-listen "" \
@@ -263,13 +266,17 @@ lib_mint_subscriber_token() {
 # ---------------------------------------------------------------------------
 # RTMP receiver (broadcast destination).
 #
-# ffmpeg's RTMP demuxer is unforgiving about mid-stream sequence-header
-# resets: when axonkit flips between live↔mix sources with different
-# video SPS/PPS (or VP9/AV1 codec config), the receiver drops the TCP
-# connection. To tolerate that we run the receiver in a supervisor loop
-# that re-listens whenever the previous publisher disconnects, recording
-# each connection segment to its own FLV. Segments are concatenated
-# into out.flv after all publishers stop.
+# When the live↔mix flip carries a different video codec config
+# (SPS/PPS bytes differ, or the FourCC changes), ffmpeg's RTMP demuxer
+# treats the mid-stream SeqHeader tag as a codec change and drops its
+# TCP connection. axonkit avoids emitting that tag when the codec
+# config bytes don't actually change (see rtmpPusher.EnsureVideoSeqHeader
+# skip path), and the verify scripts align the live + mix publishers
+# to share the same resolution / encoder so the happy path is a single
+# uninterrupted session. The supervisor loop here is kept as a defence
+# in depth — if someone explicitly drives live and mix with different
+# codec configs, each reconnect is captured as its own FLV segment and
+# all segments are concatenated into out.flv after the run.
 # ---------------------------------------------------------------------------
 lib_start_recorder() {
     echo "[recorder] persistent RTMP listener on rtmp://127.0.0.1:$DST_RTMP_PORT/live/out"
@@ -706,8 +713,15 @@ lib_finalize() {
 
     local stamp dest_dir mp4_path
     stamp=$(date +%Y%m%d-%H%M%S)
-    dest_dir="$HOME/Downloads"
-    mp4_path="$dest_dir/axonkit-broadcast-verify-$VARIANT-$stamp.mp4"
+    # One subdirectory per run keeps MP4 + frame PNGs + report colocated
+    # so a failing run can be inspected by pointing an image viewer at
+    # the directory. The variant + timestamp already live in the
+    # directory name, so the files inside are short and uniform:
+    # recording.mp4, frames.txt, tNs-<label>.png. OUT_DIR lives under
+    # test/broadcast/ and is .gitignore'd at the repo root so commits
+    # don't pick up artefacts.
+    dest_dir="$OUT_DIR/$VARIANT-$stamp"
+    mp4_path="$dest_dir/recording.mp4"
     mkdir -p "$dest_dir"
     ffmpeg -hide_banner -loglevel error -y -i "$flv" -c copy "$mp4_path"
 
@@ -717,7 +731,7 @@ lib_finalize() {
         "$(( LIVE_FLIP_REC + POST_DETACH / 2 ))"
     )
     local probe_label=(live-A mix-AB live-A-again)
-    local frame_report="$dest_dir/axonkit-broadcast-verify-$VARIANT-$stamp.frames.txt"
+    local frame_report="$dest_dir/frames.txt"
     : > "$frame_report"
 
     declare -a mean_rgb=()
@@ -725,7 +739,7 @@ lib_finalize() {
     for i in 0 1 2; do
         ts="${probe_ts[$i]}"
         label="${probe_label[$i]}"
-        png="$dest_dir/axonkit-broadcast-verify-$VARIANT-$stamp.t${ts}s-$label.png"
+        png="$dest_dir/t${ts}s-$label.png"
         if ! lib_extract_frame "$mp4_path" "$ts" "$png"; then
             echo "failed to extract frame at ${ts}s (label=$label)" >&2
             echo "  mp4=$mp4_path" >&2
@@ -760,8 +774,8 @@ lib_finalize() {
 
     if [[ -n "$halves_check" ]]; then
         local mix_ts="${probe_ts[1]}"
-        local l_png="$dest_dir/axonkit-broadcast-verify-$VARIANT-$stamp.t${mix_ts}s-mix-left.png"
-        local r_png="$dest_dir/axonkit-broadcast-verify-$VARIANT-$stamp.t${mix_ts}s-mix-right.png"
+        local l_png="$dest_dir/t${mix_ts}s-mix-left.png"
+        local r_png="$dest_dir/t${mix_ts}s-mix-right.png"
         local l_rgb r_rgb
         l_rgb=$(lib_probe_half "$mp4_path" "$mix_ts" left  "$l_png") || { echo "failed to probe left half" >&2; fail=1; }
         r_rgb=$(lib_probe_half "$mp4_path" "$mix_ts" right "$r_png") || { echo "failed to probe right half" >&2; fail=1; }

@@ -32,7 +32,7 @@ const defaultAudioTick = 960
 const defaultVideoTick = 3000
 
 // rebaser turns a noisy per-source RTP-clock into a continuous output
-// clock. It is not thread-safe — the switcher serialises access by
+// clock. It is not thread-safe — the switcher serializes access by
 // delivering audio and video on separate goroutines (one consumer per
 // kind) and holding no lock between rebase and emit.
 type rebaser struct {
@@ -105,8 +105,8 @@ func (r *rebaser) onSourceFlip() { r.hasBase = false }
 type switcher struct {
 	logger *slog.Logger
 
-	mu       sync.RWMutex
-	state    switchState
+	mu         sync.RWMutex
+	state      switchState
 	terminated bool
 	// mixReady flips true once mix has emitted its first video
 	// keyframe (or the fallback grace has elapsed). Until then the

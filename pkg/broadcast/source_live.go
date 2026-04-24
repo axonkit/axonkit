@@ -76,9 +76,9 @@ type liveSource struct {
 // liveSourceParams groups the inputs liveSource needs so callers do
 // not have to juggle a seven-argument constructor.
 type liveSourceParams struct {
-	Participant    *rtc.Participant
-	AudioProducer  *mediasoup.Producer
-	VideoProducer  *mediasoup.Producer
+	Participant   *rtc.Participant
+	AudioProducer *mediasoup.Producer
+	VideoProducer *mediasoup.Producer
 	// VideoCodec selects the depacketizer used to decode the video
 	// producer. Must be one of CodecH264 / CodecVP9 / CodecAV1 and
 	// must match the codec negotiated on VideoProducer.
@@ -263,7 +263,7 @@ func newVideoDepacketizer(codec Codec) (videoDepacketizer, error) {
 }
 
 // pickLiveProducers returns the audio + video producers for the
-// participant, filtered to codecs the pushers can serialise. Returns
+// participant, filtered to codecs the pushers can serialize. Returns
 // the negotiated video codec so the caller can instantiate the right
 // depacketizer. Prefers camera > other sources for the video leg.
 func pickLiveProducers(p *rtc.Participant) (audio, video *mediasoup.Producer, videoCodec Codec, err error) {
@@ -316,10 +316,6 @@ func isOpusProducer(p *mediasoup.Producer) bool {
 		}
 	}
 	return false
-}
-
-func isH264Producer(p *mediasoup.Producer) bool {
-	return producerVideoCodec(p) == CodecH264
 }
 
 // producerVideoCodec maps a mediasoup video producer's negotiated

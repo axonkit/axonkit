@@ -4,7 +4,7 @@
 // required by the Enhanced-RTMP output path cannot be covered by
 // ffmpeg alone; whipsim plugs that gap by consuming IVF video + Ogg
 // audio produced by ffmpeg and pushing them as real-time WebRTC media
-// over the WHIP signalling handshake.
+// over the WHIP signaling handshake.
 //
 // Usage (as invoked by test/broadcast/lib.sh):
 //
@@ -312,7 +312,7 @@ func doWhipPost(ctx context.Context, url, token, extraHeader, offer string) (ans
 // logged by the caller; they're not fatal because the broadcast side
 // will eventually GC the session via ICE timeout.
 func doWhipDelete(ctx context.Context, location, token, extraHeader string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, location, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, location, http.NoBody)
 	if err != nil {
 		return err
 	}
@@ -344,7 +344,7 @@ func splitHeader(s string) (name, value string, ok bool) {
 }
 
 // resolveURL joins a relative Location path to its POST URL base,
-// mirroring http.Client's own behaviour. Only the protocol+host
+// mirroring http.Client's own behavior. Only the protocol+host
 // prefix is preserved; query strings on the POST URL are dropped.
 func resolveURL(base, rel string) string {
 	// Very small implementation — WHIP Locations in practice are

@@ -9,7 +9,7 @@ import (
 
 // fakeSink captures emitted samples + packets so tests can assert on
 // what the switcher forwarded. All writes happen on the caller's
-// goroutine; no synchronisation needed.
+// goroutine; no synchronization needed.
 type fakeSink struct {
 	samples []MediaSample
 	packets []struct {

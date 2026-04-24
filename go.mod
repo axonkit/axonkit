@@ -9,6 +9,7 @@ require (
 	github.com/nats-io/nats.go v1.48.0
 	github.com/pion/rtp v1.10.1
 	github.com/pion/sdp/v3 v3.0.18
+	github.com/pion/webrtc/v4 v4.2.11
 	github.com/rs/xid v1.6.0
 	github.com/yutopp/go-rtmp v0.0.7
 	golang.org/x/sync v0.20.0
@@ -40,7 +41,6 @@ require (
 	github.com/pion/stun/v3 v3.1.1 // indirect
 	github.com/pion/transport/v4 v4.0.1 // indirect
 	github.com/pion/turn/v4 v4.1.4 // indirect
-	github.com/pion/webrtc/v4 v4.2.11 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/sirupsen/logrus v1.7.0 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect

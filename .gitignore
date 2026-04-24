@@ -24,3 +24,7 @@ go.work
 /bin
 .vscode/
 *.log
+
+# Broadcast verify script artefacts: per-run MP4 + frame PNGs +
+# frames.txt land in test/broadcast/out/<variant>-<timestamp>/.
+/test/broadcast/out/

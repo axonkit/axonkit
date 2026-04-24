@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -46,7 +45,6 @@ type whipPusher struct {
 	lastErr    atomic.Pointer[string]
 	done       chan struct{}
 	setupDone  chan struct{}
-	setupOnce  sync.Once
 	httpClient *http.Client
 }
 
@@ -356,7 +354,7 @@ func (p *whipPusher) postOffer(sdp string) (string, string, error) {
 func (p *whipPusher) deleteResource() {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, p.resourceURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, p.resourceURL, http.NoBody)
 	if err != nil {
 		return
 	}

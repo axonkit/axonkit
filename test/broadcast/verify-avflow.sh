@@ -13,7 +13,7 @@
 # Pipeline:
 #   1. Build axonkit CLIs + the avflow binary (web bundle must already
 #      be built — `cd $AVFLOW_REPO/web && pnpm build` once).
-#   2. Start nats + axonkit + two WHIP publishers (red userA, green
+#   2. Start axonkit (embedded in-process NATS) + two WHIP publishers (red userA, green
 #      userB), same as verify.sh.
 #   3. Start avflow in HTTP-only mode so Chrome is warmed up by the
 #      time we submit a job.
@@ -38,8 +38,17 @@ VARIANT="avflow"
 source "$SCRIPT_DIR/lib.sh"
 
 # avflow control API + canvas knobs ------------------------------------------
+#
+# MIX_CANVAS_{W,H,FPS} default to the SAME resolution/frame rate as the
+# live publishers spawned by lib_start_publishers (320x240@30). Keeping
+# them in lockstep means avflow's mix WHIP egress negotiates the same
+# codec config as the live users, so axonkit's RTMP pusher will see a
+# byte-identical SPS/PPS on the live↔mix flip and skip re-emitting the
+# FLV SeqHeader tag — that avoids the ffmpeg RTMP receiver dropping
+# the TCP connection mid-stream. Override these env vars if you want
+# to test the codec-change / re-connect path explicitly.
 : "${AVFLOW_CONTROL_PORT:=18090}"
-: "${MIX_CANVAS_W:=640}"
+: "${MIX_CANVAS_W:=320}"
 : "${MIX_CANVAS_H:=240}"
 : "${MIX_CANVAS_FPS:=30}"
 
@@ -67,7 +76,6 @@ if [[ ! -s "$AVFLOW_REPO/pkg/server/static/index.html" ]]; then
     exit 1
 fi
 
-lib_start_nats
 lib_start_axonkit
 lib_mint_tokens
 

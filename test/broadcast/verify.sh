@@ -9,7 +9,8 @@
 #
 # Pipeline:
 #   1. Build axonkit + token CLIs.
-#   2. Start an embedded nats-server + axonkit on loopback.
+#   2. Start axonkit on loopback (axonkit boots its own in-process NATS
+#      + JetStream, so there is no external broker dependency).
 #   3. Publish two fake room users (userA: red / A-440Hz, userB: green
 #      / A-880Hz) into the room via WHIP. VIDEO_CODEC controls whether
 #      the publishers use H.264 (default), VP9 or AV1 — the same codec
@@ -24,7 +25,8 @@
 #      short-circuit ICE timeout). Switcher flips back to live; the
 #      recording flips blue→red.
 #   7. Stop everything, concat captured FLV segments, transcode to MP4
-#      into ~/Downloads, and run mean-RGB assertions on each phase.
+#      into test/broadcast/out/<variant>-<stamp>/, and run mean-RGB
+#      assertions on each phase.
 #
 # Because the mix here is a single-source ffmpeg publisher there is no
 # composite layout to verify — the halves-check is skipped. The avflow
@@ -44,7 +46,6 @@ source "$SCRIPT_DIR/lib.sh"
 
 lib_init
 lib_build_axonkit
-lib_start_nats
 lib_start_axonkit
 lib_mint_tokens
 
@@ -64,14 +65,20 @@ sleep "$WARMUP_LIVE"
 # ---------------------------------------------------------------------------
 # Mix phase: an ffmpeg WHIP publisher that stands in for avflow's
 # WHIPPushSink. Pushes a solid-blue 1000 Hz tone to
-# /rtc/broadcast/{id}/whip. The codec matches VIDEO_CODEC so axonkit's
-# mix depacketizer/pusher is exercised against the same bitstream the
-# live publishers are sending.
+# /rtc/broadcast/{id}/whip. The codec + resolution + frame rate match
+# the live publishers exactly — this is how a real mixer should behave
+# (same pipeline parameters so axonkit's RTMP pusher sees byte-
+# identical SPS/PPS across live↔mix flips and does NOT re-emit a mid-
+# stream SeqHeader, which would drop the RTMP receiver's TCP socket).
 # ---------------------------------------------------------------------------
 
 MIX_LOG="$LOG_DIR/mix-whip.log"
 echo "[mix-whip] starting solid-blue 1000Hz publisher → /rtc/broadcast/$BID/whip (codec=$VIDEO_CODEC)"
 MIX_URL="$BASE_URL/rtc/broadcast/$BID/whip"
+# Mix canvas is deliberately the same 320x240@30 as the live publishers
+# (lib_start_publishers) — see header comment for rationale.
+MIX_VIDEO_SRC="color=blue:size=320x240:rate=30"
+MIX_AUDIO_SRC="sine=frequency=1000:sample_rate=48000,aresample=async=1:first_pts=0"
 case "$VIDEO_CODEC" in
     h264)
         # ffmpeg's own -f whip muxer is H.264-only; for the h264
@@ -79,8 +86,8 @@ case "$VIDEO_CODEC" in
         # path to the previous verify.sh baseline.
         ffmpeg -hide_banner -loglevel warning -nostats \
             -re \
-            -f lavfi -i "color=blue:size=640x240:rate=30,format=yuv420p" \
-            -f lavfi -i "sine=frequency=1000:sample_rate=48000,aresample=async=1:first_pts=0" \
+            -f lavfi -i "$MIX_VIDEO_SRC,format=yuv420p" \
+            -f lavfi -i "$MIX_AUDIO_SRC" \
             $(_lib_video_encode_args) \
             -c:a libopus -b:a 64k -ar 48000 -ac 2 \
             -authorization "$TOKEN_MIX_PUB" \
@@ -93,8 +100,8 @@ case "$VIDEO_CODEC" in
         # only way to push VP9/AV1 into axonkit because ffmpeg WHIP
         # refuses non-H.264 video.
         MIX_PID=$(_lib_whip_publish_whipsim \
-            "color=blue:size=640x240:rate=30" \
-            "sine=frequency=1000:sample_rate=48000,aresample=async=1:first_pts=0" \
+            "$MIX_VIDEO_SRC" \
+            "$MIX_AUDIO_SRC" \
             "$TOKEN_MIX_PUB" \
             "$MIX_LOG" \
             "mix-whip" \

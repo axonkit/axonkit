@@ -35,13 +35,13 @@ const (
 type H264Depacketizer struct {
 	unmarshaller codecs.H264Packet
 
-	au         []byte
-	auIsKey    bool
-	auHasSPS   bool
-	auHasPPS   bool
-	sps        []byte
-	pps        []byte
-	seenIDR    bool
+	au       []byte
+	auIsKey  bool
+	auHasSPS bool
+	auHasPPS bool
+	sps      []byte
+	pps      []byte
+	seenIDR  bool
 }
 
 // Push delivers one RTP packet and, if that packet completes an access
@@ -214,18 +214,18 @@ func buildAVCDecoderConfigurationRecord(sps, pps []byte) []byte {
 	}
 	out := make([]byte, 0, 11+len(sps)+len(pps))
 	out = append(out,
-		0x01,            // configurationVersion
-		sps[1],          // profile_idc
-		sps[2],          // profile_compatibility
-		sps[3],          // level_idc
-		0xFF,            // 6 reserved bits '111111' + lengthSizeMinusOne '11' = 4-byte NALU length
-		0xE1,            // 3 reserved bits '111' + numOfSequenceParameterSets = 1
+		0x01,   // configurationVersion
+		sps[1], // profile_idc
+		sps[2], // profile_compatibility
+		sps[3], // level_idc
+		0xFF,   // 6 reserved bits '111111' + lengthSizeMinusOne '11' = 4-byte NALU length
+		0xE1,   // 3 reserved bits '111' + numOfSequenceParameterSets = 1
 	)
 	var spsLen [2]byte
 	binary.BigEndian.PutUint16(spsLen[:], uint16(len(sps)))
 	out = append(out, spsLen[:]...)
 	out = append(out, sps...)
-	out = append(out, 0x01) // numOfPictureParameterSets = 1
+	out = append(out, 0x01) // numOfPictureParameterSets is 1
 	var ppsLen [2]byte
 	binary.BigEndian.PutUint16(ppsLen[:], uint16(len(pps)))
 	out = append(out, ppsLen[:]...)

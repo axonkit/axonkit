@@ -71,7 +71,7 @@ func (d *VP9Depacketizer) flush(ts uint32) (MediaSample, bool) {
 
 // HasConfig reports whether the depacketizer has observed enough of
 // the bitstream to generate a VPCodecConfigurationRecord. For VP9 any
-// keyframe is sufficient — the record fields (profile/level/colour)
+// keyframe is sufficient — the record fields (profile/level/color)
 // we emit today are static defaults.
 func (d *VP9Depacketizer) HasConfig() bool { return d.seenKey }
 
@@ -82,7 +82,7 @@ func (d *VP9Depacketizer) SeenIDR() bool { return d.seenKey }
 
 // ConfigRecord returns the VPCodecConfigurationRecord for the E-RTMP
 // SequenceStart tag. We default to profile 0 / 4:2:0 8-bit / BT.709
-// colour — the dominant configuration for WebRTC VP9 publishers.
+// color — the dominant configuration for WebRTC VP9 publishers.
 // Parsing the uncompressed VP9 frame header to fill this out properly
 // is tracked as a follow-up for HDR / 10-bit streams.
 func (d *VP9Depacketizer) ConfigRecord() []byte {
