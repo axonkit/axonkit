@@ -37,7 +37,7 @@ func TestRoom_ShouldRegressCodec_BelowThreshold(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		p := newTestParticipant("p" + string(rune('a'+i)))
-		defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
+		t.Cleanup(func() { p.Close(proto.DisconnectReason_CLIENT_INITIATED) })
 		room.AddParticipant(p)
 	}
 
@@ -58,7 +58,7 @@ func TestRoom_ShouldRegressCodec_AboveThreshold(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		p := newTestParticipant("p" + string(rune('a'+i)))
-		defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
+		t.Cleanup(func() { p.Close(proto.DisconnectReason_CLIENT_INITIATED) })
 		room.AddParticipant(p)
 	}
 
@@ -79,7 +79,7 @@ func TestRoom_ShouldRegressCodec_ExactThreshold(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		p := newTestParticipant("exact" + string(rune('a'+i)))
-		defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
+		t.Cleanup(func() { p.Close(proto.DisconnectReason_CLIENT_INITIATED) })
 		room.AddParticipant(p)
 	}
 
@@ -181,7 +181,7 @@ func TestPublishedTrack_EnableRegression_PolicyPREFER_REGRESSION(t *testing.T) {
 
 			for i := 0; i < tc.numParts; i++ {
 				p := newTestParticipant(tc.name + string(rune('a'+i)))
-				defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
+				t.Cleanup(func() { p.Close(proto.DisconnectReason_CLIENT_INITIATED) })
 				room.AddParticipant(p)
 			}
 
@@ -235,9 +235,6 @@ func TestPublishedTrack_ToProto_BackupCodecPolicy(t *testing.T) {
 
 func TestPublishedTrack_BackupConsumers_Map(t *testing.T) {
 	track := &PublishedTrack{
-		sid:             "track-bc-map",
-		kind:            "video",
-		backupCodec:     "vp8",
 		backupConsumers: make(map[string]string),
 	}
 
@@ -939,8 +936,6 @@ func TestPublishedTrack_PendingBackupSubs(t *testing.T) {
 	defer pub.Close(proto.DisconnectReason_CLIENT_INITIATED)
 
 	track := &PublishedTrack{
-		sid:               "track-pbs",
-		kind:              "video",
 		pendingBackupSubs: nil,
 	}
 
@@ -969,12 +964,9 @@ func TestPublishedTrack_PendingBackupSubs(t *testing.T) {
 
 func TestPublishedTrack_BackupFieldsInit(t *testing.T) {
 	track := &PublishedTrack{
-		sid:               "track-init",
-		kind:              "video",
 		videoCodec:        "av1",
 		backupCodec:       "vp8",
 		backupCodecPolicy: proto.BackupCodecPolicy_PREFER_REGRESSION,
-		backupConsumers:   make(map[string]string),
 	}
 
 	if track.videoCodec != "av1" {

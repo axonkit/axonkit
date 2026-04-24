@@ -904,6 +904,13 @@ func (p *Participant) Room() *Room                         { return p.room }
 func (p *Participant) Router() *mediasoup.Router           { return p.router }
 func (p *Participant) SendTransport() *mediasoup.Transport { return p.sendTransport }
 
+// Done returns a channel that is closed when the participant has been
+// fully closed (either by the client, room manager, or admin kick).
+// Ingest protocols (WHIP/RTMP/SIP) use this to tear down the underlying
+// network session (DTLS / TCP) so that publishers notice the eviction
+// and stop pushing payloads the room no longer consumes.
+func (p *Participant) Done() <-chan struct{} { return p.done }
+
 func (p *Participant) IsPublisher() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -1561,29 +1568,28 @@ func (p *Participant) PublishTrack(req *proto.PublishTrackRequest) (*PublishedTr
 }
 
 // RegisterIngestProducer attaches a mediasoup.Producer that was created
-// out-of-band (by a WHIP/E-RTMP/SIP/etc. ingest session) to this
+// out-of-band (by a WHIP/RTMP/SIP/etc. ingest session) to this
 // participant so that room-side subscription, dynacast, and cleanup work
 // the same as a datachannel-based PublishTrack.
 //
-// trackSid: the caller-chosen track id. When empty a router-scoped id is
-// derived from the producer. source hints the downstream SDK which HTML
-// element to attach the track to (TrackSource_CAMERA /
-// TrackSource_MICROPHONE is the typical default for passive ingest).
+// source hints the downstream SDK which HTML element to attach the
+// track to (TrackSource_CAMERA / TrackSource_MICROPHONE is the typical
+// default for passive ingest). The trackSid is minted here as a
+// router-scoped id derived from the producer so every ingest protocol
+// agrees on the same naming scheme.
 //
 // The participant is expected to already own sess.Transport via
-// SetTransports, but this method does not re-validate that so WHIP/E-RTMP
+// SetTransports, but this method does not re-validate that so WHIP/RTMP
 // standalone participants (which may only have a send/direct transport)
 // can still publish.
-func (p *Participant) RegisterIngestProducer(trackSid string, source proto.TrackSource, producer *mediasoup.Producer) error {
+func (p *Participant) RegisterIngestProducer(source proto.TrackSource, producer *mediasoup.Producer) error {
 	if producer == nil {
 		return fmt.Errorf("nil producer")
 	}
 	if !p.CanPublish() {
 		return fmt.Errorf("no publish permission")
 	}
-	if trackSid == "" {
-		trackSid = string(types.NewStreamID(p.router.Id(), producer.Id()))
-	}
+	trackSid := string(types.NewStreamID(p.router.Id(), producer.Id()))
 
 	track := &PublishedTrack{
 		sid:       trackSid,

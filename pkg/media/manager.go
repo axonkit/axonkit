@@ -67,7 +67,7 @@ type Manager struct {
 
 	// Routing (optional; only wired in production). When nil, Register/
 	// Unregister skip advertise and EnsureProducer falls back to single-node
-	// behaviour. FIB is constructed internally when rib is provided; the
+	// behavior. FIB is constructed internally when rib is provided; the
 	// finder supplied via WithRIB drives FIB.Subscribe for remote streams.
 	rib    *routing.RIB
 	fib    *routing.FIB

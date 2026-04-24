@@ -56,3 +56,12 @@ issues:
   exclude-use-default: false
   max-issues-per-linter: 0
   max-same-issues: 0
+  exclude-rules:
+    # staticcheck's SA5011 doesn't model (*testing.T).Fatal /
+    # Fatalf / FailNow as terminating (they call runtime.Goexit
+    # internally). In tests the `if x == nil { t.Fatal(...) }; x.Foo`
+    # pattern is idiomatic, so silence the check only for _test.go.
+    - path: _test\.go
+      linters:
+        - staticcheck
+      text: "SA5011"

@@ -100,7 +100,7 @@ func (s *NodeRPCService) respond(msg *nats.Msg, status int, body json.RawMessage
 }
 
 // Request sends NodeRPCRequest to the target node, or runs the handler locally if target is this node or empty.
-func (s *NodeRPCService) Request(targetNodeID string, action string, payload json.RawMessage) (proto.NodeRPCResponse, error) {
+func (s *NodeRPCService) Request(targetNodeID, action string, payload json.RawMessage) (proto.NodeRPCResponse, error) {
 	if targetNodeID == "" || types.NodeID(targetNodeID) == s.myNodeID {
 		return s.invokeLocal(action, payload)
 	}

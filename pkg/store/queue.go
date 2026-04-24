@@ -52,7 +52,7 @@ func (q *queue[T]) get(ctx context.Context) (T, error) {
 		return zero, q.err
 	}
 	v := q.q[0]
-	copy(q.q[:], q.q[1:])
+	copy(q.q, q.q[1:])
 	q.q[len(q.q)-1] = zero
 	q.q = q.q[:len(q.q)-1]
 	return v, nil

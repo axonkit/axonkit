@@ -48,7 +48,7 @@ func TestPriorityQueue_PeekAndShift(t *testing.T) {
 		t.Fatal("expected item 'a'")
 	}
 
-	item, wait = pq.PeekAndShift(25)
+	item, _ = pq.PeekAndShift(25)
 	if item == nil || item.Value != "b" {
 		t.Fatal("expected item 'b'")
 	}

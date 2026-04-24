@@ -65,7 +65,7 @@ func waitFor(t *testing.T, cond func() bool, timeout time.Duration) {
 	t.Fatalf("condition not met within %s", timeout)
 }
 
-func createAxonkitNode(t *testing.T, srv interface{ ClientURL() string }, nodeID string, workerBin string) *axonkitNode {
+func createAxonkitNode(t *testing.T, srv interface{ ClientURL() string }, nodeID, workerBin string) *axonkitNode {
 	t.Helper()
 
 	nc, err := nats.Connect(srv.ClientURL())

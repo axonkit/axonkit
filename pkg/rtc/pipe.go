@@ -26,7 +26,7 @@ import (
 //     router other than the publisher's (cross-router WHEP subscribe).
 //
 // Both paths share the same `(srcProducerId, destRouterId) -> pipedId`
-// table so a single pipe is reused across signalling protocols.
+// table so a single pipe is reused across signaling protocols.
 type RouterPipe struct {
 	source *mediasoup.Router
 	sf     singleflight.Group
