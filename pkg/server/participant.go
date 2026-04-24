@@ -58,7 +58,7 @@ func (s *HTTPServer) handleForwardParticipant(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if _, err := s.authorizeAdmin(r, req.SrcRoom); err != nil {
+	if _, err := s.authorizeAdmin(r, req.SrcRoom, "anon_"); err != nil {
 		err.write(w)
 		return
 	}
@@ -89,7 +89,7 @@ func (s *HTTPServer) handleRemoveParticipant(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if _, err := s.authorizeAdmin(r, req.Room); err != nil {
+	if _, err := s.authorizeAdmin(r, req.Room, "anon_"); err != nil {
 		err.write(w)
 		return
 	}

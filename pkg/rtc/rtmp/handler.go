@@ -14,7 +14,6 @@ import (
 	"github.com/jiyeyuran/mediasoup-go/v2"
 
 	"github.com/axonkit/axonkit/pkg/auth"
-	"github.com/axonkit/axonkit/pkg/proto"
 )
 
 // PublishHooks are wired by the HTTP server so the Handler can attach a
@@ -247,6 +246,10 @@ func (h *handler) OnClose() {
 // authorize turns the stream-key token into a Claims payload. When the
 // verifier is nil and anonymous is allowed we mint a permissive claim
 // scoped to the room — this matches the HTTP AllowAnonymous behavior.
+//
+// Anonymous RTMP identities are prefixed "rtmp_" (matching the WHIP
+// "whip_" / admin-API "anon_" convention) so room logs make clear which
+// ingest surface the publisher came in through.
 func (h *handler) authorize(room, token string, hasToken bool) (*auth.Claims, error) {
 	if hasToken && token != "" && h.verifier != nil {
 		claims, err := h.verifier.Verify(token)
@@ -268,18 +271,5 @@ func (h *handler) authorize(room, token string, hasToken bool) (*auth.Claims, er
 	if !h.allowAnonymous {
 		return nil, fmt.Errorf("authentication required: add ?token=<jwt> to the stream key")
 	}
-	boolTrue := true
-	identity := "rtmp-anon-" + randomCName()
-	return &auth.Claims{
-		Sub:  identity,
-		Name: identity,
-		Grants: &proto.ClaimGrants{
-			Identity: identity,
-			Room:     &proto.RoomGrant{Name: room, Join: true, Admin: true},
-			Media: &proto.MediaGrant{
-				CanPublish:   &boolTrue,
-				CanSubscribe: &boolTrue,
-			},
-		},
-	}, nil
+	return auth.AnonymousClaims("rtmp_"+randomCName(), room), nil
 }

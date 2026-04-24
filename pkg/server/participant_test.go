@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -104,19 +105,22 @@ func doJSON(s *HTTPServer, method, path string, body any, token string, handler 
 func TestAuthorizeAdmin_AnonymousWhenAllowed(t *testing.T) {
 	s, _ := newTestServer(t, true)
 	req := httptest.NewRequest(http.MethodPost, "/", http.NoBody)
-	claims, werr := s.authorizeAdmin(req, "room-a")
+	claims, werr := s.authorizeAdmin(req, "room-a", "anon_")
 	if werr != nil {
 		t.Fatalf("expected nil whipErr, got %+v", werr)
 	}
 	if claims == nil || claims.Sub == "" {
 		t.Fatalf("expected anonymous claims, got %+v", claims)
 	}
+	if !strings.HasPrefix(claims.Sub, "anon_") {
+		t.Fatalf("expected anonymous identity prefixed with 'anon_', got %q", claims.Sub)
+	}
 }
 
 func TestAuthorizeAdmin_MissingTokenWhenAnonymousDisabled(t *testing.T) {
 	s, _ := newTestServer(t, false)
 	req := httptest.NewRequest(http.MethodPost, "/", http.NoBody)
-	_, werr := s.authorizeAdmin(req, "room-a")
+	_, werr := s.authorizeAdmin(req, "room-a", "anon_")
 	if werr == nil || werr.status != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %+v", werr)
 	}
@@ -126,7 +130,7 @@ func TestAuthorizeAdmin_InvalidToken(t *testing.T) {
 	s, _ := newTestServer(t, false)
 	req := httptest.NewRequest(http.MethodPost, "/", http.NoBody)
 	req.Header.Set("Authorization", "Bearer not-a-real-jwt")
-	_, werr := s.authorizeAdmin(req, "room-a")
+	_, werr := s.authorizeAdmin(req, "room-a", "anon_")
 	if werr == nil || werr.status != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %+v", werr)
 	}
@@ -137,7 +141,7 @@ func TestAuthorizeAdmin_MissingAdminGrant(t *testing.T) {
 	tok := adminToken(t, "room-a", false) // Admin=false
 	req := httptest.NewRequest(http.MethodPost, "/", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+tok)
-	_, werr := s.authorizeAdmin(req, "room-a")
+	_, werr := s.authorizeAdmin(req, "room-a", "anon_")
 	if werr == nil || werr.status != http.StatusForbidden {
 		t.Fatalf("expected 403 room-admin-required, got %+v", werr)
 	}
@@ -148,7 +152,7 @@ func TestAuthorizeAdmin_RoomScopeMismatch(t *testing.T) {
 	tok := adminToken(t, "room-a", true)
 	req := httptest.NewRequest(http.MethodPost, "/", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+tok)
-	_, werr := s.authorizeAdmin(req, "room-b")
+	_, werr := s.authorizeAdmin(req, "room-b", "anon_")
 	if werr == nil || werr.status != http.StatusForbidden {
 		t.Fatalf("expected 403 scope mismatch, got %+v", werr)
 	}
@@ -159,7 +163,7 @@ func TestAuthorizeAdmin_RoomScopeMatch(t *testing.T) {
 	tok := adminToken(t, "room-a", true)
 	req := httptest.NewRequest(http.MethodPost, "/", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+tok)
-	claims, werr := s.authorizeAdmin(req, "room-a")
+	claims, werr := s.authorizeAdmin(req, "room-a", "anon_")
 	if werr != nil {
 		t.Fatalf("expected success, got %+v", werr)
 	}
@@ -173,7 +177,7 @@ func TestAuthorizeAdmin_UnscopedGrantAllowsAnyRoom(t *testing.T) {
 	tok := adminToken(t, "", true) // grant.Name == ""
 	req := httptest.NewRequest(http.MethodPost, "/", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+tok)
-	if _, werr := s.authorizeAdmin(req, "any-room"); werr != nil {
+	if _, werr := s.authorizeAdmin(req, "any-room", "anon_"); werr != nil {
 		t.Fatalf("expected success for unscoped admin, got %+v", werr)
 	}
 }
@@ -184,8 +188,22 @@ func TestAuthorizeAdmin_EmptyRoomArgIgnoresScope(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+tok)
 	// Caller passes "" when the operation isn't room-specific — still valid.
-	if _, werr := s.authorizeAdmin(req, ""); werr != nil {
+	if _, werr := s.authorizeAdmin(req, "", "anon_"); werr != nil {
 		t.Fatalf("expected success when roomName is empty, got %+v", werr)
+	}
+}
+
+func TestAuthorizeAdmin_WHIPPrefix(t *testing.T) {
+	// WHIP/WHEP surfaces pass "whip_" so room logs show the ingest
+	// entry point. The prefix must flow through to the minted claim.
+	s, _ := newTestServer(t, true)
+	req := httptest.NewRequest(http.MethodPost, "/", http.NoBody)
+	claims, werr := s.authorizeAdmin(req, "room-a", "whip_")
+	if werr != nil {
+		t.Fatalf("expected success, got %+v", werr)
+	}
+	if !strings.HasPrefix(claims.Sub, "whip_") {
+		t.Fatalf("expected anonymous identity prefixed with 'whip_', got %q", claims.Sub)
 	}
 }
 

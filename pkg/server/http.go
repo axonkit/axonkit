@@ -234,10 +234,15 @@ func (s *HTTPServer) RegisterRoutes(mux *http.ServeMux) {
 // roomName may be empty when the operation does not target a specific
 // room (for example, "find-by-identity" style APIs that accept the room
 // name in the body and want to authorize strictly on Admin).
-func (s *HTTPServer) authorizeAdmin(r *http.Request, roomName string) (*auth.Claims, *whipErr) {
+//
+// anonPrefix is the identity prefix used when minting anonymous claims
+// (AllowAnonymous path). Callers supply "whip_" for WHIP/WHEP surfaces
+// and "anon_" for plain HTTP admin APIs; this lets room logs show which
+// entry point the caller came in through.
+func (s *HTTPServer) authorizeAdmin(r *http.Request, roomName, anonPrefix string) (*auth.Claims, *whipErr) {
 	token := extractBearerToken(r)
 	if token == "" && s.cfg.Auth.AllowAnonymous {
-		return anonymousClaims(roomName, true), nil
+		return auth.AnonymousClaims(anonPrefix+xid.New().String(), roomName), nil
 	}
 	if token == "" {
 		return nil, &whipErr{status: http.StatusUnauthorized, body: "missing Authorization: Bearer <token>"}
