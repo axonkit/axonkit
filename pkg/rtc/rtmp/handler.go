@@ -109,6 +109,16 @@ type handler struct {
 
 	connCtx    context.Context
 	cancelConn context.CancelFunc
+
+	// loggedAudioDrops / loggedVideoDrops dedupe the "rtmp audio/video
+	// dropped" debug lines so an unsupported codec only produces one
+	// entry per distinct reason per connection. Without this an AAC
+	// publisher (soundFormat=10) would emit ~50 messages/sec for the
+	// life of the session and bury everything else in the log.
+	// go-rtmp drives OnAudio/OnVideo serially per connection, so plain
+	// maps without a mutex are safe.
+	loggedAudioDrops map[string]struct{}
+	loggedVideoDrops map[string]struct{}
 }
 
 // NewHandler returns a go-rtmp.Handler bound to hooks + auth. The returned
@@ -121,12 +131,14 @@ func NewHandler(hooks PublishHooks, verifier *auth.TokenVerifier, allowAnonymous
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &handler{
-		cfg:            hooks,
-		verifier:       verifier,
-		allowAnonymous: allowAnonymous,
-		connLogger:     logger,
-		connCtx:        ctx,
-		cancelConn:     cancel,
+		cfg:              hooks,
+		verifier:         verifier,
+		allowAnonymous:   allowAnonymous,
+		connLogger:       logger,
+		connCtx:          ctx,
+		cancelConn:       cancel,
+		loggedAudioDrops: make(map[string]struct{}),
+		loggedVideoDrops: make(map[string]struct{}),
 	}
 }
 
@@ -207,7 +219,9 @@ func (h *handler) OnAudio(timestamp uint32, payload io.Reader) error {
 	tag, err := ParseAudioTag(data)
 	if err != nil {
 		if IsUnsupportedAudio(err) {
-			h.connLogger.Debug("rtmp audio dropped", "reason", err.Error())
+			if reason := err.Error(); firstSeen(h.loggedAudioDrops, reason) {
+				h.connLogger.Debug("rtmp audio dropped", "reason", reason)
+			}
 			return nil
 		}
 		h.connLogger.Warn("rtmp audio parse error", "err", err)
@@ -230,7 +244,9 @@ func (h *handler) OnVideo(timestamp uint32, payload io.Reader) error {
 	tag, err := ParseVideoTag(data)
 	if err != nil {
 		if IsUnsupportedVideo(err) {
-			h.connLogger.Debug("rtmp video dropped", "reason", err.Error())
+			if reason := err.Error(); firstSeen(h.loggedVideoDrops, reason) {
+				h.connLogger.Debug("rtmp video dropped", "reason", reason)
+			}
 			return nil
 		}
 		h.connLogger.Warn("rtmp video parse error", "err", err)
@@ -251,6 +267,18 @@ func (h *handler) OnClose() {
 		h.cfg.OnSessionClosed(h.attached)
 	}
 	h.connLogger.Info("RTMP session closed")
+}
+
+// firstSeen records key in seen and returns true the first time it
+// appears. The map is mutated in place; callers ensure the map is
+// non-nil. Used by OnAudio/OnVideo to log each unique drop reason
+// exactly once per RTMP connection.
+func firstSeen(seen map[string]struct{}, key string) bool {
+	if _, ok := seen[key]; ok {
+		return false
+	}
+	seen[key] = struct{}{}
+	return true
 }
 
 // authorize turns the stream-key token into a Claims payload. When the
