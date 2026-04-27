@@ -323,6 +323,21 @@ func (ms *mixSource) fireGone(reason string) {
 // or live) flip.
 func (ms *mixSource) VideoDepack() videoDepacketizer { return ms.videoDepack }
 
+// RestartIce implements mixIngress.RestartIce by delegating to the
+// underlying mediasoup WebRtcTransport, which generates fresh ICE
+// credentials and returns the new IceUfrag (used as the WHIP ETag).
+// The pion bypass implements the same interface in source_mix_h265.go.
+func (ms *mixSource) RestartIce() (string, error) {
+	if ms.transport == nil {
+		return "", fmt.Errorf("mixsource: transport already closed")
+	}
+	iceParams, err := ms.transport.RestartIce()
+	if err != nil {
+		return "", err
+	}
+	return iceParams.UsernameFragment, nil
+}
+
 // Close tears down consumers, DirectTransport and WHIP transport.
 // Safe to call concurrently with the watchdog goroutine; the flags
 // ensure exactly-once teardown. The WHIP transport close also tears

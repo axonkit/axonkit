@@ -79,6 +79,28 @@ type DestinationStatus struct {
 	LastError string          `json:"lastError,omitempty"`
 }
 
+// mixIngress abstracts the two implementations of the mix-source side
+// of a Broadcast: the standard mediasoup-routed WHIP transport
+// (mixSource) and the pion-terminated H.265 bypass (h265MixSource).
+// Broadcast holds whichever one was created at AttachMix time and only
+// ever speaks to it through this surface.
+//
+// Method semantics:
+//   - Close: tear down all owned plumbing (transports, pion PC, etc.).
+//     Idempotent. Must be safe to call concurrently with the watchdog
+//     goroutine that may already be firing OnGone.
+//   - VideoDepack: returns the video depacketizer the switcher consults
+//     to fetch the codec configuration record (avcC / vpcC / av1C /
+//     hvcC) when synthesizing RTMP SeqHeader on every flip.
+//   - RestartIce: optional ICE restart triggered by PATCH /whip with
+//     If-Match: *. Implementations that do not support restart return
+//     a non-nil error — the HTTP layer turns that into a 4xx.
+type mixIngress interface {
+	Close()
+	VideoDepack() videoDepacketizer
+	RestartIce() (etag string, err error)
+}
+
 // Broadcast is the runtime object for one "push room user → N sinks"
 // task. A Broadcast owns a mediasoup Router-dedicated DirectTransport
 // pair (one for live, one for mix — created lazily in later milestones
@@ -100,9 +122,15 @@ type Broadcast struct {
 
 	createdAt time.Time
 
-	mu               sync.RWMutex
-	mixConnected     bool
-	mixIceState      mediasoup.IceState
+	mu           sync.RWMutex
+	mixConnected bool
+	// mixIceState is the human-readable ICE state of the active mix
+	// ingress. Both the mediasoup path (mediasoup.IceState values:
+	// "connected" / "completed" / "disconnected" / "closed") and the
+	// pion bypass (mirrored to the same vocabulary in h265MixSource)
+	// write here, so consumers of Status() never need to know which
+	// implementation is running.
+	mixIceState      string
 	mixETag          string
 	terminated       bool
 	terminatedReason TerminationReason
@@ -119,7 +147,7 @@ type Broadcast struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	live     *liveSource
-	mix      *mixSource
+	mix      mixIngress
 	pushers  []destinationPusher
 	switcher *switcher
 }
@@ -192,7 +220,7 @@ func (b *Broadcast) Status() Status {
 		LiveIdentity:     b.liveIdentity,
 		Source:           source,
 		MixConnected:     b.mixConnected,
-		MixIceState:      string(b.mixIceState),
+		MixIceState:      b.mixIceState,
 		Destinations:     dsts,
 		Terminated:       b.terminated,
 		TerminatedReason: b.terminatedReason,
@@ -466,6 +494,15 @@ func (b *Broadcast) terminate(reason TerminationReason) {
 // the resulting producers into the switcher as the "mix" source.
 // Returns the WHIP answer SDP + ICE ETag.
 //
+// Routing: SDP offers whose only m=video codec is H.265 cannot be
+// terminated by mediasoup-go (its supported RTP capability table
+// omits H.265 by design — see pkg/media/caps.go). For those offers we
+// take the "pion bypass" path: a stand-alone webrtc.PeerConnection
+// terminates the WHIP session, OnTrack hands raw RTP to the switcher,
+// and the existing Switcher/Pusher pipeline pushes it out via E-RTMP
+// (`hvc1`) or WHIP egress unchanged. Every other offer (H.264 / VP9 /
+// AV1 / VP8, mixed or alone) keeps the original mediasoup route.
+//
 // Errors:
 //   - ErrTerminated:          broadcast is already torn down
 //   - ErrMixAlreadyConnected: a mix ingest is already attached
@@ -476,10 +513,6 @@ func (b *Broadcast) AttachMix(offerSDP string) (answer, etag string, err error) 
 		b.mu.Unlock()
 		return "", "", ErrTerminated
 	}
-	if b.whipSvc == nil {
-		b.mu.Unlock()
-		return "", "", fmt.Errorf("broadcast: no WHIP service configured")
-	}
 	if b.mix != nil {
 		b.mu.Unlock()
 		return "", "", ErrMixAlreadyConnected
@@ -487,7 +520,18 @@ func (b *Broadcast) AttachMix(offerSDP string) (answer, etag string, err error) 
 	sw := b.switcher
 	b.mu.Unlock()
 
-	result, err := b.whipSvc.CreateWHIP(whip.CreateWHIPOptions{OfferSDP: offerSDP})
+	if offerNeedsH265Bypass(offerSDP) {
+		return b.attachMixH265Bypass(offerSDP, sw)
+	}
+
+	b.mu.RLock()
+	whipSvc := b.whipSvc
+	b.mu.RUnlock()
+	if whipSvc == nil {
+		return "", "", fmt.Errorf("broadcast: no WHIP service configured")
+	}
+
+	result, err := whipSvc.CreateWHIP(whip.CreateWHIPOptions{OfferSDP: offerSDP})
 	if err != nil {
 		return "", "", fmt.Errorf("mix whip create: %w", err)
 	}
@@ -508,7 +552,7 @@ func (b *Broadcast) AttachMix(offerSDP string) (answer, etag string, err error) 
 		PacketSink:    func(kind SampleKind, pkt *rtp.Packet) { sw.feedPacket(SourceMix, kind, pkt) },
 		OnReady:       func() { b.handleMixReady() },
 		OnGone:        func(reason string) { b.handleMixGone(reason) },
-		OnIceState:    func(state mediasoup.IceState) { b.setMixIceState(state) },
+		OnIceState:    func(state mediasoup.IceState) { b.setMixIceState(string(state)) },
 		Logger:        mixLogger,
 	})
 	if err != nil {
@@ -531,6 +575,46 @@ func (b *Broadcast) AttachMix(offerSDP string) (answer, etag string, err error) 
 
 	b.logger.Info("mix attached", "etag", result.ETag, "producers", len(result.Producers))
 	return result.Answer, result.ETag, nil
+}
+
+// attachMixH265Bypass is the H.265 ingress path. avflow (or any WHIP
+// publisher whose only m=video codec is H.265) terminates DTLS/SRTP
+// directly against a pion PeerConnection that we own here; the
+// resulting RTP feeds the Switcher and pushers exactly like the
+// mediasoup mix source does, except the entire mediasoup leg is
+// skipped. Lifecycle, OnReady, OnGone, ICE-state mirroring and
+// flip-to-live behavior all stay identical so neither the switcher
+// nor the HTTP layer can tell the two paths apart.
+func (b *Broadcast) attachMixH265Bypass(offerSDP string, sw *switcher) (answer, etag string, err error) {
+	mixLogger := b.logger.With("source", "mix", "ingress", "pion-h265")
+	ms, err := newH265MixSource(h265MixSourceParams{
+		OfferSDP:   offerSDP,
+		SampleSink: func(s MediaSample) { sw.feedSample(SourceMix, s) },
+		PacketSink: func(kind SampleKind, pkt *rtp.Packet) { sw.feedPacket(SourceMix, kind, pkt) },
+		OnReady:    func() { b.handleMixReady() },
+		OnGone:     func(reason string) { b.handleMixGone(reason) },
+		OnIceState: func(state string) { b.setMixIceState(state) },
+		Logger:     mixLogger,
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("mix h265 bypass: %w", err)
+	}
+
+	b.mu.Lock()
+	if b.terminated {
+		b.mu.Unlock()
+		ms.Close()
+		return "", "", ErrTerminated
+	}
+	b.mix = ms
+	b.mixConnected = true
+	b.mixETag = ms.ETag()
+	b.mu.Unlock()
+
+	sw.bindMix(func() []byte { return ms.VideoDepack().ConfigRecord() })
+
+	b.logger.Info("mix attached (h265 bypass)", "etag", ms.ETag())
+	return ms.Answer(), ms.ETag(), nil
 }
 
 // DetachMix is the DELETE /rtc/broadcast/{id}/whip fast-path: flip
@@ -575,12 +659,12 @@ func (b *Broadcast) PatchMixICE(ifMatch, _ string) (string, error) {
 	if ifMatch != "*" {
 		return etag, nil
 	}
-	iceParams, err := mix.transport.RestartIce()
+	newETag, err := mix.RestartIce()
 	if err != nil {
 		return "", fmt.Errorf("mix ice restart: %w", err)
 	}
 	b.mu.Lock()
-	b.mixETag = iceParams.UsernameFragment
+	b.mixETag = newETag
 	etag = b.mixETag
 	b.mu.Unlock()
 	return etag, nil
@@ -594,9 +678,13 @@ func (b *Broadcast) MixETag() string {
 	return b.mixETag
 }
 
-// setMixIceState is wired to the mix transport's OnIceStateChange so
-// Status() always reflects the live state.
-func (b *Broadcast) setMixIceState(state mediasoup.IceState) {
+// setMixIceState is wired to the mix transport's OnIceStateChange (or
+// the pion bypass's OnICEConnectionStateChange) so Status() always
+// reflects the live state. Both callers pass mediasoup-vocabulary
+// strings ("connected"/"completed"/"disconnected"/"closed") to keep
+// the API consumer-facing semantics independent of which ingress is
+// active.
+func (b *Broadcast) setMixIceState(state string) {
 	b.mu.Lock()
 	b.mixIceState = state
 	b.mu.Unlock()
