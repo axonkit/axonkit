@@ -249,6 +249,11 @@ func (ls *liveSource) producerGone(kind string) {
 // newVideoDepacketizer wires up the concrete depacketizer that matches
 // the producer's negotiated codec. Non-video / unknown codecs yield an
 // error so callers fail cleanly rather than silently dropping frames.
+//
+// CodecH265 is accepted here (not by producerVideoCodec) because
+// mediasoup-go cannot expose an H.265 producer to begin with — see
+// pkg/media/caps.go. The future pion-based mix WHIP ingress instead
+// constructs a depacketizer directly via this factory.
 func newVideoDepacketizer(codec Codec) (videoDepacketizer, error) {
 	switch codec {
 	case CodecH264:
@@ -257,6 +262,10 @@ func newVideoDepacketizer(codec Codec) (videoDepacketizer, error) {
 		return &VP9Depacketizer{}, nil
 	case CodecAV1:
 		return &AV1Depacketizer{}, nil
+	case CodecVP8:
+		return &VP8Depacketizer{}, nil
+	case CodecH265:
+		return &H265Depacketizer{}, nil
 	default:
 		return nil, fmt.Errorf("broadcast: unsupported video codec %v", codec)
 	}
@@ -300,7 +309,7 @@ func pickLiveProducers(p *rtc.Participant) (audio, video *mediasoup.Producer, vi
 		return nil, nil, CodecUnknown, fmt.Errorf("broadcast: no Opus audio producer found for live identity")
 	}
 	if video == nil {
-		return nil, nil, CodecUnknown, fmt.Errorf("broadcast: no supported video producer (H264/VP9/AV1) found for live identity")
+		return nil, nil, CodecUnknown, fmt.Errorf("broadcast: no supported video producer (H264/VP9/AV1/VP8) found for live identity")
 	}
 	return audio, video, videoCodec, nil
 }
@@ -321,6 +330,12 @@ func isOpusProducer(p *mediasoup.Producer) bool {
 // producerVideoCodec maps a mediasoup video producer's negotiated
 // codec MIME onto the broadcast Codec enum. Returns CodecUnknown if
 // none of the supported codecs are present.
+//
+// H.265 is intentionally absent: pkg/media/caps.go cannot register
+// it (mediasoup-go would fail Router validation), so a producer that
+// somehow surfaced H.265 here would be a bug. The H.265 path enters
+// the broadcast pipeline through the future pion-terminated mix WHIP
+// ingress, which builds the depacketizer directly.
 func producerVideoCodec(p *mediasoup.Producer) Codec {
 	rp := p.RtpParameters()
 	if rp == nil {
@@ -334,6 +349,8 @@ func producerVideoCodec(p *mediasoup.Producer) Codec {
 			return CodecVP9
 		case mimeTypeIs(c.MimeType, "video/av1"):
 			return CodecAV1
+		case mimeTypeIs(c.MimeType, "video/vp8"):
+			return CodecVP8
 		}
 	}
 	return CodecUnknown

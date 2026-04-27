@@ -255,12 +255,16 @@ func (p *rtmpPusher) WriteSample(s MediaSample) {
 		body = buildExVideoFrameTag(flvExVideoFourCCVP9, s.IsKeyFrame, s.Data)
 	case CodecAV1:
 		body = buildExVideoFrameTag(flvExVideoFourCCAV1, s.IsKeyFrame, s.Data)
+	case CodecH265:
+		body = buildExVideoFrameTag(flvExVideoFourCCH265, s.IsKeyFrame, s.Data)
 	case CodecOpus:
 		body = buildOpusFrameTag(s.Data)
 	default:
-		// Unsupported codecs should never reach WriteSample because
-		// Broadcast.Start rejects them, but guard anyway so a future
-		// addition does not silently corrupt the stream.
+		// Unsupported codecs (notably CodecVP8 — Enhanced-RTMP v2
+		// has no FourCC for VP8) should never reach WriteSample
+		// because Broadcast.Start rejects RTMP destinations for
+		// them, but guard anyway so a future addition does not
+		// silently corrupt the stream.
 		return
 	}
 	p.enqueue(&rtmpFrame{kind: s.Kind, timestampMs: ts, body: body})

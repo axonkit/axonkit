@@ -95,10 +95,12 @@ case "$VIDEO_CODEC" in
             >"$MIX_LOG" 2>&1 &
         MIX_PID=$!
         ;;
-    vp9|av1)
+    vp8|vp9|av1)
         # ffmpeg → IVF+Ogg FIFOs → whipsim (pion WHIP client) — the
-        # only way to push VP9/AV1 into axonkit because ffmpeg WHIP
-        # refuses non-H.264 video.
+        # only way to push VP8/VP9/AV1 into axonkit because ffmpeg WHIP
+        # refuses non-H.264 video. Note that VP8 may not reach RTMP
+        # destinations (Enhanced-RTMP v2 has no VP8 FourCC); the mix
+        # leg here is exercised over WHIP only.
         MIX_PID=$(_lib_whip_publish_whipsim \
             "$MIX_VIDEO_SRC" \
             "$MIX_AUDIO_SRC" \

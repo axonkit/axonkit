@@ -230,6 +230,10 @@ func (b *Broadcast) Start() error {
 		return fmt.Errorf("%w: %v", ErrIdentityNotPublishing, err)
 	}
 
+	if err := validateDestinationsForCodec(b.destinations, videoCodec); err != nil {
+		return err
+	}
+
 	pushers, err := b.buildPushers()
 	if err != nil {
 		return err
@@ -641,9 +645,11 @@ func (b *Broadcast) handleMixGone(reason string) {
 // (audio, video). avflow is expected to publish exactly one of each;
 // additional producers are rejected so configuration drift surfaces
 // early rather than causing confusing A/V-sync bugs later. Any video
-// codec axonkit's pushers support (H.264 / VP9 / AV1) is accepted —
-// avflow pushing VP9 / AV1 matches the live publisher's codec so the
-// RTMP egress passes bitstreams through untouched.
+// codec axonkit's pushers support via mediasoup (H.264 / VP9 / AV1 /
+// VP8) is accepted — avflow pushing the same codec the live publisher
+// uses lets the RTMP egress pass bitstreams through untouched. H.265
+// is intentionally absent here: see producerVideoCodec for why
+// mediasoup cannot surface it.
 func pickMixProducers(producers []*mediasoup.Producer) (audio, video *mediasoup.Producer, err error) {
 	for _, p := range producers {
 		switch p.Kind() {
@@ -660,7 +666,7 @@ func pickMixProducers(producers []*mediasoup.Producer) (audio, video *mediasoup.
 				return nil, nil, fmt.Errorf("mix ingest published more than one video producer")
 			}
 			if producerVideoCodec(p) == CodecUnknown {
-				return nil, nil, fmt.Errorf("mix ingest video must be H264, VP9 or AV1")
+				return nil, nil, fmt.Errorf("mix ingest video must be H264, VP9, AV1 or VP8")
 			}
 			video = p
 		}
@@ -672,4 +678,24 @@ func pickMixProducers(producers []*mediasoup.Producer) (audio, video *mediasoup.
 		return nil, nil, fmt.Errorf("mix ingest missing video producer")
 	}
 	return audio, video, nil
+}
+
+// validateDestinationsForCodec enforces the subset of (codec,
+// destination protocol) combinations the pushers can serialize.
+// Today the only hard reject is "live codec is VP8 + at least one
+// RTMP destination": Enhanced-RTMP v2 does not register a FourCC
+// for VP8, so the RTMP receiver would either close the connection
+// or display garbage. A WHIP destination remains valid because the
+// pusher passes RTP through verbatim. See sample.go::CodecVP8 for
+// the full rationale.
+func validateDestinationsForCodec(dsts []Destination, videoCodec Codec) error {
+	if videoCodec != CodecVP8 {
+		return nil
+	}
+	for _, d := range dsts {
+		if d.Type == DestinationRTMP {
+			return fmt.Errorf("broadcast: VP8 cannot be pushed to RTMP destinations (Enhanced-RTMP v2 has no FourCC for VP8); use a WHIP destination or republish in H.264/VP9/AV1")
+		}
+	}
+	return nil
 }

@@ -210,12 +210,14 @@ func codecMime(codec string) (string, uint32, error) {
 	switch strings.ToLower(codec) {
 	case "h264":
 		return webrtc.MimeTypeH264, 90000, nil
+	case "vp8":
+		return webrtc.MimeTypeVP8, 90000, nil
 	case "vp9":
 		return webrtc.MimeTypeVP9, 90000, nil
 	case "av1":
 		return webrtc.MimeTypeAV1, 90000, nil
 	default:
-		return "", 0, fmt.Errorf("unsupported video codec %q (want h264|vp9|av1)", codec)
+		return "", 0, fmt.Errorf("unsupported video codec %q (want h264|vp8|vp9|av1)", codec)
 	}
 }
 
@@ -244,6 +246,14 @@ func registerCodecs(m *webrtc.MediaEngine, videoCodec string) error {
 				SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
 			},
 			PayloadType: 102,
+		}, webrtc.RTPCodecTypeVideo)
+	case "vp8":
+		return m.RegisterCodec(webrtc.RTPCodecParameters{
+			RTPCodecCapability: webrtc.RTPCodecCapability{
+				MimeType:  webrtc.MimeTypeVP8,
+				ClockRate: 90000,
+			},
+			PayloadType: 96,
 		}, webrtc.RTPCodecTypeVideo)
 	case "vp9":
 		return m.RegisterCodec(webrtc.RTPCodecParameters{

@@ -70,7 +70,13 @@ func (a *rtmpPusherAdapter) WriteSample(s MediaSample, extradata []byte) {
 				a.inner.EnsureExVideoSeqHeader(flvExVideoFourCCVP9, extradata)
 			case CodecAV1:
 				a.inner.EnsureExVideoSeqHeader(flvExVideoFourCCAV1, extradata)
+			case CodecH265:
+				a.inner.EnsureExVideoSeqHeader(flvExVideoFourCCH265, extradata)
 			default:
+				// CodecVP8 falls through here on purpose: there is no
+				// FourCC the Enhanced-RTMP receiver would accept, and
+				// validateDestinationsForCodec already rejects this
+				// combination at Broadcast.Start time.
 				return
 			}
 		}

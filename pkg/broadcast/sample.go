@@ -26,6 +26,22 @@ const (
 	// flv.go and the VP9 / AV1 depacketizers.
 	CodecVP9
 	CodecAV1
+	// CodecVP8 covers WebRTC's most common legacy video codec.
+	// Enhanced-RTMP v2 does NOT assign a FourCC for VP8 (the spec
+	// only blesses avc1 / vp09 / av01 / hvc1), so a Broadcast that
+	// has any RTMP destination is rejected at Start() time when
+	// the live codec is VP8 — see validateDestinationsForCodec.
+	// VP8 is forwarded verbatim over WHIP egress.
+	CodecVP8
+	// CodecH265 (HEVC) uses E-RTMP FourCC "hvc1" with an
+	// HEVCDecoderConfigurationRecord. mediasoup-go's supported
+	// capability table does not include H.265 (registering it
+	// fails Router validation), so the live source can never
+	// negotiate H.265. The path is reachable from a future
+	// pion-terminated mix WHIP ingress that bypasses mediasoup
+	// (see docs/patent/broadcast-source-switch.md figure 5);
+	// the egress plumbing here is ready ahead of that work.
+	CodecH265
 )
 
 // IsVideo reports whether a Codec carries video payload. Used by
@@ -33,7 +49,7 @@ const (
 // duplicating case lists for every new codec.
 func (c Codec) IsVideo() bool {
 	switch c {
-	case CodecH264, CodecVP9, CodecAV1:
+	case CodecH264, CodecVP9, CodecAV1, CodecVP8, CodecH265:
 		return true
 	}
 	return false

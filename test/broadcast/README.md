@@ -55,6 +55,14 @@ VIDEO_CODEC=av1 make verify-broadcast
 make verify-broadcast-avflow
 ```
 
+> Note: `VIDEO_CODEC=vp8` and `VIDEO_CODEC=h265` are recognised by the
+> publisher path (whipsim publishes VP8 ingest into the SFU; the
+> H.265 ingress requires a future pion-based bypass that does not yet
+> ship), but `verify.sh` creates RTMP-only destinations, so VP8 will
+> deliberately fail at `Broadcast.Start` with
+> `broadcast: VP8 cannot be pushed to RTMP destinations`. The
+> rejection is exercised by `pkg/broadcast.TestValidateDestinationsForCodec`.
+
 A successful run ends with:
 
 ```
@@ -116,7 +124,7 @@ knobs are documented in that script's header comment.
 
 | Variable          | Default                   | Meaning                |
 | ----------------- | ------------------------- | ---------------------- |
-| `VIDEO_CODEC`     | `h264` (case-insensitive) | `h264` / `vp9` / `av1` |
+| `VIDEO_CODEC`     | `h264` (case-insensitive) | `h264` / `vp9` / `av1` (verify-broadcast end-to-end); `vp8` is accepted by the SFU path but the script's RTMP-only destinations will be rejected at `Broadcast.Start` (covered by unit test instead). |
 | `HTTP_PORT`       | 17990                     | axonkit HTTP           |
 | `WEBRTC_MIN_PORT` | 51200                     | WebRTC UDP range start |
 | `WEBRTC_MAX_PORT` | 51400                     | WebRTC UDP range end   |

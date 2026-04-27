@@ -310,7 +310,19 @@ lib_start_recorder() {
 _lib_video_encode_args() {
     case "$VIDEO_CODEC" in
         h264)
-            echo "-c:v libx264 -preset ultrafast -tune zerolatency -profile:v baseline -pix_fmt yuv420p -g 30 -r 30"
+            # WebRTC / WHIP forbids B frames (libavformat/whip.c rejects
+            # par->video_delay > 0 with "Unsupported B frames by RTC").
+            # Keep -bf 0 regardless of profile so a future profile change
+            # doesn't silently re-introduce reorder latency.
+            echo "-c:v libx264 -preset ultrafast -tune zerolatency -profile:v main -bf 0 -pix_fmt yuv420p -g 30 -r 30"
+            ;;
+        vp8)
+            # libvpx in real-time mode. -deadline realtime + -cpu-used 4
+            # match what WebRTC's libvpx encoder does in browsers, and
+            # -auto-alt-ref 0 keeps the encoder strictly causal so the
+            # IVF stream is safe to feed straight into whipsim's RTP
+            # packetizer (which has no reorder buffer).
+            echo "-c:v libvpx -deadline realtime -cpu-used 4 -pix_fmt yuv420p -g 30 -r 30 -b:v 1M -auto-alt-ref 0 -lag-in-frames 0"
             ;;
         vp9)
             # libvpx-vp9 in real-time mode. deadline=realtime + cpu-used=8
@@ -406,7 +418,11 @@ _lib_whip_publish() {
         h264)
             _lib_whip_publish_ffmpeg "$color" "$tone" "$token" "$logfile"
             ;;
-        vp9|av1)
+        vp8|vp9|av1)
+            # ffmpeg's -f whip muxer is hard-coded to H.264, so VP8 / VP9
+            # / AV1 ingest goes through whipsim, which talks pion WebRTC
+            # directly. The pipeline is identical for all three codecs:
+            # ffmpeg → IVF + Ogg FIFOs → whipsim → axonkit WHIP ingest.
             _lib_whip_publish_whipsim "$color" "$tone" "$token" "$logfile" "$label" \
                 "$BASE_URL/whip/$ROOM"
             ;;
