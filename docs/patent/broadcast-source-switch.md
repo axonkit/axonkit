@@ -467,29 +467,38 @@ mediasoup-go 的 `supportedRtpCapabilities` 表没有 HEVC，**无法**在 Route
 注册 `video/H265` Capability，否则 Router 创建直接报错。但 avflow 完全可以输
 出 HEVC over WHIP。本发明的解法：
 
-1. `POST /rtc/broadcast/{id}/whip` 收到 SDP Offer 时，先 `parseSDPCodecs`：
-   - 若 `m=video` 段只含 H.264 / VP9 / AV1 / VP8 → 走 mediasoup
-     `WebRtcTransport` + `Producer` 的常规路径；
-   - 若 `m=video` 段含 H.265 → 走旁路：用 pion `webrtc.PeerConnection`
-     直接 SetRemoteDescription、AddTransceiver、注册
-     `OnTrack`，把每帧 RTP 拿到手即往 `mixSource.handleVideo` 喂。
-2. 两条路径对外**返回同一份 Switcher Sink**。Switcher 完全不知道下层是哪种
-   实现，只看到一个实现 `videoDepacketizer` 的对象。
-3. 由 `H265Depacketizer` 抓取 VPS / SPS / PPS 三组 NALU，构造 `hvcC` 作为
-   `ConfigRecord()` 返回值——之后 Switcher → RTMP Pusher 仍走模块 4 的
-   `EnsureExVideoSeqHeader("hvc1", hvcC)` 路径，与 H.264 / VP9 / AV1 完
-   全对称。
+1. `POST /rtc/broadcast/{id}/whip` 收到 SDP Offer 时，`offerNeedsH265Bypass`
+   先做轻量分类：
+   - 若 `m=video` 段只含 H.264 / VP9 / AV1 / VP8（或 H.264+H.265 混编） →
+     走 mediasoup `WebRtcTransport` + `Producer` 的常规路径；
+   - 若 `m=video` 段**只含** H.265 → `attachMixH265Bypass` 启动一条独立的
+     pion `webrtc.PeerConnection`，注册 H.265+Opus 编解码能力，
+     SetRemoteDescription / CreateAnswer / SetLocalDescription，等待 ICE
+     完成。
+2. pion 侧 `OnTrack` 触发后，每个 remote track 起一条 RTP 读循环：每个 RTP
+   包同时投喂 `H265Depacketizer`（出口 RTMP 用）与 `packetSink`（出口 WHIP
+   用），与 mediasoup 路径完全同形。
+3. 两条路径对外**实现同一个 `mixIngress` 接口**（`Close` / `VideoDepack` /
+   `RestartIce`），Broadcast / Switcher 不区分下层实现，一个 `videoDepacketizer`
+   的对象就足够。
+4. 生命周期对齐：`OnICEConnectionStateChange` 的 `disconnected` / `failed`
+   触发 5 秒看门狗，超时即 `flipToLive`；`closed` / `PeerConnection failed`
+   立刻触发同样的回切。所有动作复用 `Broadcast.handleMixGone`，与 mediasoup
+   路径走同一段代码。
+5. RTMP 出口仍走模块 4 的 `EnsureExVideoSeqHeader("hvc1", hvcC)` 路径，与
+   H.264 / VP9 / AV1 完全对称——SFU 内部是否能承载该编码与 RTMP 出口能力
+   解耦。
 
-#### 5.1 关键代码位置（实施时）
+#### 5.1 关键代码位置
 
 ```
 pkg/broadcast/depack_h265.go      // H.265 NAL 拼装 + hvcC 生成
-pkg/broadcast/source_mix_h265.go  // 旁路 pion WHIP 终端 (实现 mixSource 接口)
-pkg/broadcast/source_mix.go       // case-by-codec 分派 H.265 → source_mix_h265.go
-pkg/broadcast/flv.go              // buildExVideoH265Tag (hvc1 + CTS24)
+pkg/broadcast/source_mix_h265.go  // 旁路 pion WHIP 终端 + offerNeedsH265Bypass
+pkg/broadcast/broadcast.go        // attachMixH265Bypass 分派；mixIngress 抽象
+pkg/broadcast/source_mix.go       // mediasoup 路径仍是默认；实现 mixIngress
+pkg/broadcast/flv.go              // buildExVideoH265Tag / buildHEVCConfigRecord
 pkg/broadcast/rtmp_pusher.go      // WriteSample: case CodecH265
 pkg/broadcast/sample.go           // CodecH265 enum, IsVideo() 包含
-pkg/rtc/whip/parse.go             // 让 H265 不再被丢弃, 但只走旁路
 ```
 
 ---
@@ -608,5 +617,5 @@ pkg/rtc/whip/parse.go             // 让 H265 不再被丢弃, 但只走旁路
 | VP8 Depack（仅 SFU 侧 / WHIP 出口） | `pkg/broadcast/depack_vp8.go` | 已实现 |
 | H.265 Depack + hvcC（出口侧） | `pkg/broadcast/depack_h265.go`, `pkg/broadcast/flv.go::buildHEVCConfigRecord` | 已实现 |
 | H.265 RTMP 路由（FourCC `hvc1`） | `pkg/broadcast/rtmp_pusher.go`, `pkg/broadcast/pusher.go` | 已实现 |
-| H.265 旁路 WHIP 终结（pion 直接 PeerConnection） | 待新增 `pkg/broadcast/source_mix_h265.go` | 计划（mediasoup 不支持 HEVC，需 pion 旁路） |
+| H.265 旁路 WHIP 终结（pion 直接 PeerConnection） | `pkg/broadcast/source_mix_h265.go`, `pkg/broadcast/broadcast.go::attachMixH265Bypass` | 已实现（offer SDP 仅含 H.265 时自动路由到 pion 旁路；OnTrack→H265Depacketizer→Switcher；ICE 看门狗与 mediasoup 路径同源） |
 | 端到端验证 | `test/broadcast/verify.sh`, `test/broadcast/verify-avflow.sh` | 已实现（H.264 / VP9 / AV1）；VP8 / HEVC 待补 WHIP 出口验证目标 |
