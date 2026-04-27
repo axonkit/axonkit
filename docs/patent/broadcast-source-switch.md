@@ -2,63 +2,68 @@
 
 ## 背景
 
-WebRTC SFU（如 mediasoup、livekit、janus）擅长低时延音视频转发，但其上游通道
-是逐路 RTP，缺乏"将多路用户流合成单一直播流"的能力。常规做法是将房间里若干用
-户的轨道送给一台外部合流服务（avflow、ffmpeg、Wirecast 等），再由合流端推 RTMP
+WebRTC 选择性转发单元（Selective Forwarding Unit，下文简称 SFU）擅长低时延音
+视频转发，但其上游通道是逐路 RTP 流，缺乏"将多路用户媒体合成单一直播流"的能
+力。常规做法是把房间内若干用户的轨道送给一台外部合流服务，再由合流端推 RTMP
 到分发 CDN。
 
-这一组合的痛点：
+这一组合存在以下普遍痛点：
 
-1. **直播 ↔ 连麦切换是一次"重连"**：从"主播单人直播"切到"两人连麦合流"通常
-   需要断开旧的 RTMP 推流、重启合流任务、重新建立到 CDN 的 TCP 连接，CDN 端
-   会丢一段播放、回看中也会断帧；反向切回亦然。
-2. **合流端崩了直播就停了**：一旦合流服务的 ICE 失联或进程退出，下游 CDN 立
-   刻收不到帧。
-3. **新一代编码（VP9 / AV1 / HEVC）走 RTMP 受阻**：经典 FLV 视频 tag 只能放
-   `CodecID` 低 4 位的几个老编码（AVC 是 7）。Enhanced-RTMP（以下简称 E-RTMP）
-   定义了 FourCC 头但仍需要按编码路由不同的 SequenceStart payload。
-4. **mediasoup 不支持 HEVC**：仅靠 SFU 内部，HEVC 流根本进不来；可生产 HEVC
-   的合流服务（avflow）必须走另一条路径接入。
+1. **直播 ↔ 连麦切换是一次"重连"**：从"主播单人直播"切到"两人连麦合流"通
+   常需要断开旧的 RTMP 推流、重启合流任务、重新建立到 CDN 的 TCP 连接，CDN 端
+   会丢一段播放、回看也会断帧；反向切回亦然。
+2. **合流端故障即直播停播**：一旦合流服务的 ICE 失联或进程退出，下游 CDN 立
+   刻收不到帧，缺乏统一的兜底机制。
+3. **新一代视频编码走 RTMP 受阻**：经典 FLV 视频 tag 的 `CodecID` 字段只能编
+   码 H.264 等少数老编码。Enhanced-RTMP（下文简称 E-RTMP）规范引入了 FourCC
+   扩展头，但每种编码仍需要按其 RTP 净荷格式构造对应的 SequenceStart 配置记
+   录与 CodedFrames 帧体，缺一不可。
+4. **部分 SFU 实现不接受 HEVC**：典型开源 SFU 的可生产能力表中并未注册 HEVC
+   的 RTP Capability，导致带有 HEVC 的 Producer 根本无法在 SFU 内成立；而能产
+   出 HEVC 的合流服务（外部混流器）必须借助一条独立路径才能接入。
 
-本发明解决上述问题：在同一条对外 RTMP / WHIP 推流通道上，**对接两类异构源**
-（房间内 SFU 直推流、合流服务 WHIP 入流），**通过关键帧对齐 + 时间戳重基 +
-配置记录字节级去重**实现无感切换、自动兜底，并在编解码层面统一路由 H.264 /
-VP9 / AV1 / VP8 / HEVC 五种编码到正确的 E-RTMP / WHIP 出口：
+本发明针对上述痛点，在同一条对外推流通道上，**对接两类异构源**——房间内
+SFU 直推流（下文简称"直播源"）与合流服务通过 WHIP 协议入流（下文简称"合
+流源"），**通过关键帧对齐、时间戳重基、配置记录字节级去重**实现源切换在出
+口推流连接上不可感知；并在编解码层面统一路由 H.264 / VP9 / AV1 / VP8 / HEVC
+五种编码到合适的出口形态：
 
-- H.264 / VP9 / AV1 既可走经典 / E-RTMP 也可走 WHIP；
+- H.264 / VP9 / AV1 既可走经典 / 增强 RTMP 也可走 WHIP；
 - VP8 在 SFU 与 WHIP 出口路径下完整可用，但**因 Enhanced-RTMP v2 标准未为
-  VP8 注册 FourCC**，本系统在创建带有 RTMP 目标的广播任务时主动拒绝
-  VP8 直播源，避免下游 RTMP 接收端解码失败；
-- HEVC 因为 mediasoup 实现不支持其 RTP Capability，必须**单独走基于 pion
-  的旁路 WebRTC 终结器**接入，再桥接到同一 Switcher / RTMP Pusher 管线，
-  E-RTMP 出口侧使用 FourCC `hvc1` + `HEVCDecoderConfigurationRecord`。
+  VP8 注册 FourCC**，本系统在创建带有 RTMP 目标的广播任务时主动拒绝 VP8 直
+  播源，避免下游 RTMP 接收端解码失败；
+- HEVC 因部分 SFU 实现未注册其 RTP Capability，必须**单独走基于独立 WebRTC
+  终结模块的旁路入口**接入，再桥接到同一切换 / 推流管线，E-RTMP 出口侧使
+  用 FourCC `hvc1` + HEVCDecoderConfigurationRecord。
 
 ---
 
 ## 发明内容
 
-本发明提出一种**广播任务（Broadcast Task）**抽象与一种**双源切换装置
+本发明提出一种**广播任务（Broadcast Task）抽象**与一种**双源切换装置
 （Switcher）**：
 
-- **广播任务**：以"房间 ID + 直播身份 ID + N 个推流目标 URL"为参数创建。任务
-  内部固定一对外部出口（一组 RTMP pusher、一组 WHIP pusher），但内部源是可替
-  换的；初始绑定**直播源（live source）**，可在运行期附加**合流源（mix source）**
-  并由内部规则裁决哪一路驱动出口。
-- **双源切换装置**：包含两个核心组件——
-  1. **关键帧对齐切换器**，确保从直播切到合流的瞬间一定从合流的下一个 IDR /
-     关键帧起跳，反向切回则向直播侧主动 PLI 请关键帧；
-  2. **时间戳重基器（rebaser）**，将每路源的 RTP 时间戳重新映射到统一的输出
-     时钟，源切换时强制施加一段"追赶刻度"以保证输出严格单调；
-- **编解码无关 E-RTMP 路由层**：FourCC + SequenceStart 配置记录 + CodedFramesX
-  按编码动态选择（H.264 / VP9 / AV1 / HEVC），并对配置记录进行字节级去重以
-  避免中途 SeqHeader 触发 RTMP 服务端断开 TCP；
-- **目标 ↔ 编码兼容性校验**：在广播任务 `Start()` 阶段一次性核对所选直播身
-  份的视频编码与每个目标协议的兼容性，遇到 VP8 + RTMP 这类标准未覆盖的组合
-  立刻报错返回，不允许进入媒体路径，从源头消除"运行期发现 FourCC 缺失"导
-  致的下游回传错误；
-- **HEVC 旁路 WHIP 入口**：对于 SFU 不支持的 HEVC 路径，使用基于 pion 的独立
-  WebRTC 终结器消费 avflow 的 WHIP 推流，再把 RTP 桥接到同一套 Switcher /
-  Pusher 管线。
+- **广播任务**：以"房间标识 + 直播身份标识 + N 个推流目标地址"为输入参数
+  创建。任务内部固定一组对外出口（一组 RTMP 出口、一组 WHIP 出口），但内部
+  源是可替换的；初始绑定**直播源**，可在运行期附加 / 卸载**合流源**，并由
+  内部规则裁决哪一路驱动出口。
+- **双源切换装置**包含两个核心子模块：
+  1. **关键帧对齐切换器**：确保从直播切到合流的瞬间一定从合流的下一个
+     IDR / 关键帧起跳；反向切回则向直播侧主动请求关键帧。
+  2. **时间戳重基器**：将每路源的 RTP 时间戳重新映射到统一的输出时钟；源
+     切换时强制施加一段"追赶刻度"以保证输出时钟严格单调且不回绕。
+- **编解码无关 E-RTMP 路由层**：FourCC + SequenceStart 配置记录 +
+  CodedFrames 按编码动态选择（H.264 / VP9 / AV1 / HEVC），并对每路出口缓存
+  "上次发出的配置记录字节"，源切换前后做字节级比较以避免触发 RTMP 服务端
+  断开 TCP。
+- **目标 ↔ 编码兼容性校验**：在广播任务启动阶段一次性核对所选直播身份的
+  视频编码与每个出口协议的兼容性，遇到 VP8 + RTMP 这类规范未覆盖的组合立
+  刻拒绝，不允许进入媒体路径，从源头消除"运行期发现 FourCC 缺失"导致的下
+  游回传错误。
+- **旁路 WebRTC 终结路径**：合流入口对 SDP Offer 进行编码探测，若 Offer 中
+  的视频编码超出当前 SFU 的可注册能力（如 HEVC），系统切换到**独立的
+  WebRTC 终结模块**直接终结 DTLS / SRTP，将解出的 RTP 接入同一关键帧对齐切
+  换器与重基器；上层完全不感知下层 ingest 走的是 SFU 还是旁路。
 
 ---
 
@@ -68,30 +73,30 @@ VP9 / AV1 / VP8 / HEVC 五种编码到正确的 E-RTMP / WHIP 出口：
 
 ```mermaid
 flowchart LR
-    subgraph Room[Room - mediasoup Router]
-        UA[UserA Producer\nH.264 / VP9 / AV1 / VP8]
-        UB[UserB Producer]
+    subgraph Room[房间 - SFU 路由器]
+        UA[用户 A 视频源\nH.264 / VP9 / AV1 / VP8]
+        UB[用户 B 视频源]
     end
 
-    subgraph Avflow[avflow 外部合流]
-        AV[输入: UserA + UserB\n输出: 单路合流\nVP9 / AV1 / VP8 / H.264 / HEVC]
+    subgraph Mixer[外部合流服务]
+        AV[输入: 房间内多路用户\n输出: 单路合流\nH.264 / VP9 / AV1 / VP8 / HEVC]
     end
 
-    subgraph Broadcast[Broadcast Task]
-        LS[Live Source\n直接消费 mediasoup Producer]
-        MS[Mix Source\nWHIP ingest]
-        H265[HEVC 旁路终端\npion WebRTC]
-        SW{Switcher\n关键帧对齐 + 时间戳重基}
-        RP[RTMP Pusher\n经典 AVC + E-RTMP]
-        WP[WHIP Pusher\nRTP 直透]
+    subgraph Broadcast[广播任务]
+        LS[直播源\n直接消费 SFU 上的房间生产者]
+        MS[合流源\nWHIP 入口 - SFU 终结]
+        H265[旁路 WebRTC 终结模块\nHEVC 等 SFU 不支持的编码]
+        SW{切换器\n关键帧对齐 + 时间戳重基}
+        RP[RTMP / E-RTMP 出口]
+        WP[WHIP 出口\nRTP 直透]
     end
 
     UA --> LS
     UB --> LS
     UA --> AV
     UB --> AV
-    AV -- "WHIP H.264/VP9/AV1/VP8" --> MS
-    AV -- "WHIP HEVC" --> H265
+    AV -- "WHIP / SFU 可承载编码" --> MS
+    AV -- "WHIP / SFU 不可承载编码" --> H265
     LS --> SW
     MS --> SW
     H265 --> SW
@@ -104,26 +109,27 @@ flowchart LR
 ASCII 兜底：
 
 ```
-   UserA, UserB Producers ─┐                    ┌─► RTMP CDN  (经典 AVC / E-RTMP)
-                           ├─► Live Source ─┐   │
-                           │                ├─► Switcher ─►┤
-                           ├─► avflow 合流  │              │
-                           │   └─► Mix WHIP ┘              └─► WHIP / RTC 平台
-                           │       (mediasoup 终结)
-                           └─► avflow HEVC ──► pion 旁路终端 ──► Switcher
+   房间内多路用户生产者 ─┐                    ┌─► RTMP CDN  (经典 / 增强 RTMP)
+                         ├─► 直播源 ─┐        │
+                         │           ├─► 切换器 ─►┤
+                         ├─► 合流服务 │           │
+                         │   └─► 合流源 (SFU 终结)└─► WHIP / RTC 平台
+                         │
+                         └─► 合流服务 ──► 旁路 WebRTC 终结 ──► 切换器
+                              (HEVC 等编码)
 ```
 
-### 图 2：Switcher 状态机
+### 图 2：切换器状态机
 
 ```mermaid
 stateDiagram-v2
-    [*] --> sourceLiveActive
-    sourceLiveActive --> sourceLiveActive: 直播源样本\n(直接放行)
-    sourceLiveActive --> sourceMixActive: AttachMix() 完成\n+ mixReady=true\n+ 第一个合流 IDR
-    sourceMixActive --> sourceMixActive: 合流源样本\n(直接放行)
-    sourceMixActive --> sourceLiveActive: DetachMix()\n或 ICE 5s 看门狗超时\n或 mix Producer 关闭
-    sourceLiveActive --> [*]: terminate()\n(直播身份不再发布)
-    sourceMixActive --> [*]: terminate()
+    [*] --> 直播激活
+    直播激活 --> 直播激活: 直播源样本\n(直接放行至出口)
+    直播激活 --> 合流激活: 附加合流源完成\n+ 合流就绪标志置位\n+ 第一个合流关键帧到达
+    合流激活 --> 合流激活: 合流源样本\n(直接放行至出口)
+    合流激活 --> 直播激活: 显式卸载合流源\n或 ICE 宽限期超时\n或 合流上游关闭
+    直播激活 --> [*]: 任务终止\n(直播身份不再发布)
+    合流激活 --> [*]: 任务终止
 ```
 
 ASCII 兜底：
@@ -131,12 +137,13 @@ ASCII 兜底：
 ```
                 ┌──────────────────────────────────────────────────────┐
                 │                                                      │
-   [start] ──► sourceLiveActive ──(mix IDR & ready)──► sourceMixActive │
-                  ▲       ▲                                  │         │
-                  │       │  ICE down 5s OR DetachMix       │         │
-                  │       └──────────────────────────────────┘         │
+   [开始] ──► 直播激活 ──(合流关键帧 & 就绪)──► 合流激活                │
+                  ▲       ▲                          │                 │
+                  │       │ ICE 持续断开 ≥ 宽限期      │                 │
+                  │       │ 或显式卸载合流             │                 │
+                  │       └──────────────────────────┘                 │
                   │                                                    │
-   live producer gone ─► terminate ◄── any state                       │
+   直播上游关闭 ─► 任务终止 ◄── 任意状态                                  │
                                        └────────────────────────────────┘
 ```
 
@@ -144,51 +151,51 @@ ASCII 兜底：
 
 ```mermaid
 sequenceDiagram
-    participant Live as Live Source
-    participant Mix as Mix Source
-    participant SW as Switcher
-    participant RP as RTMP Pusher
+    participant Live as 直播源
+    participant Mix as 合流源
+    participant SW as 切换器
+    participant RP as RTMP 出口
     participant CDN as RTMP CDN
 
-    Note over SW,RP: 初态: state=Live, mixReady=false<br/>videoSeqBody=AVCC(LiveSPS,LivePPS)
+    Note over SW,RP: 初态: 状态=直播激活, 合流就绪=否<br/>序列头缓存=直播配置记录(SPS/PPS)
 
-    Live->>SW: video sample (P-frame, ts=t0)
-    SW->>RP: WriteSample (rebase → outLast+Δ)
-    RP->>CDN: FLV NALU tag
+    Live->>SW: 视频样本 (P 帧, ts=t0)
+    SW->>RP: 写入样本 (重基 → 上次输出+Δ)
+    RP->>CDN: 视频帧标签
 
-    Note over Mix: avflow ICE Connected
-    Mix->>SW: markMixReady()
-    SW->>SW: mixReady=true
+    Note over Mix: 合流 ICE 进入 Connected
+    Mix->>SW: 标记"合流就绪"
+    SW->>SW: 合流就绪=是
 
-    Mix->>SW: video sample (IDR, has SPS/PPS)
-    SW->>SW: tryFlipToMixOnKeyframe()<br/>state=Mix<br/>onSourceFlip(): rebaser 标记翻转
-    SW->>SW: extradataFor(Mix) → AVCC(MixSPS,MixPPS)
-    SW->>RP: emitSample(IDR, extradata=AVCC)
-    RP->>RP: ResetVideoHeader()<br/>EnsureVideoSeqHeader(AVCC)<br/>对比 videoSeqBody
-    alt AVCC 完全等于上次发出的字节
-        RP-->>RP: 跳过 SeqHeader 标签<br/>(避免触发 ffmpeg 关闭 TCP)
-    else AVCC 不同
-        RP->>CDN: 新的 SequenceStart 标签
+    Mix->>SW: 视频样本 (关键帧, 携带 SPS/PPS)
+    SW->>SW: 在关键帧上原子翻转<br/>状态=合流激活<br/>切源处理: 重基器进入翻转态
+    SW->>SW: 取出合流配置记录(SPS/PPS)
+    SW->>RP: 发送(关键帧, extradata=合流配置记录)
+    RP->>RP: 重置"序列头已发"标志<br/>序列头字节级比较
+    alt 配置记录字节与缓存完全一致
+        RP-->>RP: 跳过序列头标签<br/>(避免 RTMP 服务端断开 TCP)
+    else 配置记录字节不同
+        RP->>CDN: 发送新的序列头标签
     end
-    RP->>CDN: FLV IDR NALU 标签 (ts = outLast+catchup)
+    RP->>CDN: 关键帧标签 (ts = 上次输出+追赶刻度)
     Note over CDN: 单条 TCP 连续承载<br/>从直播无缝切到合流
 ```
 
 ASCII 兜底：
 
 ```
-Live  ─frame─►─frame─►─frame─►   (state=Live)
-                                 ┌── markMixReady (ICE Connected) ──┐
-Mix                              │                                  │
-       (preroll, dropped)        ▼                                  ▼
-                                IDR ──►  Switcher.flip()  ──►  Pusher
-                                                                |
-                                                       extradata 对比 →
-                                                       同 → 不发 SeqHeader
-                                                       异 → 发 SeqHeader
-                                                                |
-                                                    输出时钟 += catchup
-                                                                |
+直播  ─帧─►─帧─►─帧─►   (状态=直播激活)
+                                 ┌── 合流标记就绪 (ICE Connected) ──┐
+合流                              │                                  │
+       (前置帧, 全部丢弃)           ▼                                  ▼
+                                关键帧 ──►  切换器原子翻转  ──►  出口模块
+                                                                │
+                                                       配置记录字节比较 →
+                                                       同 → 不发序列头
+                                                       异 → 发新序列头
+                                                                │
+                                                    输出时钟 += 追赶刻度
+                                                                │
                                                                 ▼
                                                          RTMP CDN (单条 TCP)
 ```
@@ -206,12 +213,12 @@ flowchart TB
     end
 
     subgraph Path[出口路径]
-        AVCFLV[经典 FLV 视频 tag\nFrameType<<4 \\| 0x07\nAVCDecoderConfigurationRecord]
-        ERTMP9[E-RTMP\nFourCC=vp09\nVPCodecConfigurationRecord]
-        ERTMP1[E-RTMP\nFourCC=av01\nAV1CodecConfigurationRecord]
-        ERTMPH[E-RTMP\nFourCC=hvc1\nHEVCDecoderConfigurationRecord]
-        REJECT[Start() 阶段拒绝\n"VP8 cannot be pushed to RTMP"]
-        WHIPRP[WHIP RTP 直透]
+        AVCFLV[经典 FLV 视频标签\nFrameType<<4 \\| CodecID=AVC\nAVC 配置记录]
+        ERTMP9[E-RTMP\nFourCC=vp09\nVP 配置记录]
+        ERTMP1[E-RTMP\nFourCC=av01\nAV1 配置记录]
+        ERTMPH[E-RTMP\nFourCC=hvc1\nHEVC 配置记录]
+        REJECT[启动阶段拒绝\n"VP8 不可推往 RTMP 目标"]
+        WHIPRP[WHIP 出口\nRTP 直透]
     end
 
     H264In --> AVCFLV
@@ -229,39 +236,39 @@ flowchart TB
 ASCII 兜底：
 
 ```
-H.264 ─► FLV[CodecID=7]  (legacy AVC)              ┐
-VP9   ─► E-RTMP FourCC "vp09" + vpcC               │ 经字节级去重 SeqHeader
-AV1   ─► E-RTMP FourCC "av01" + AV1CC              │ 后发 CodedFramesX
-HEVC  ─► E-RTMP FourCC "hvc1" + hvcC               ┘
-VP8   ─► (RTMP destination 在 Broadcast.Start() 直接报错;
-         Enhanced-RTMP v2 没有 VP8 FourCC)
+H.264 ─► 经典 FLV (CodecID=AVC)                      ┐
+VP9   ─► E-RTMP FourCC "vp09" + VP 配置记录           │ 配置记录字节级去重
+AV1   ─► E-RTMP FourCC "av01" + AV1 配置记录          │ 后再发编码帧标签
+HEVC  ─► E-RTMP FourCC "hvc1" + HEVC 配置记录         ┘
+VP8   ─► (启动阶段拒绝带 RTMP 目标的广播任务;
+         Enhanced-RTMP v2 未为 VP8 分配 FourCC)
 
-任一编码 ─► WHIP egress = 原始 RTP 直透 (重基 timestamp)
+任一编码 ─► WHIP 出口 = 原始 RTP 直透 (重基时间戳)
                           (VP8 在 WHIP 出口完整可用)
 ```
 
-### 图 5：HEVC 旁路 WHIP 入口
+### 图 5：旁路 WebRTC 终结路径（以 HEVC 为例）
 
 ```mermaid
 flowchart LR
-    AV[avflow\nHEVC 输出] -- "WHIP\n(SDP m=video HEVC)" --> Pion
+    AV[合流服务\nHEVC 输出] -- "WHIP\n(SDP m=video 仅含 HEVC)" --> Pion
 
-    subgraph axonkit
+    subgraph axonkit[广播任务]
         direction TB
-        Pion[pion WebRTC\n独立 PeerConnection]
-        Depack[H.265 Depacketizer\nVPS/SPS/PPS → hvcC]
-        SW[Switcher]
-        RP[RTMP Pusher]
-        WP[WHIP Pusher]
+        Pion[旁路 WebRTC 终结模块\n独立 PeerConnection]
+        Depack[H.265 重组器\nVPS/SPS/PPS → 配置记录]
+        SW[切换器]
+        RP[RTMP 出口]
+        WP[WHIP 出口]
     end
 
     Pion -- "RTP H.265" --> Depack
     Pion -- "RTP H.265" --> WP
-    Depack -- "MediaSample (CodecH265)" --> SW
+    Depack -- "样本 (HEVC)" --> SW
     SW --> RP
     SW --> WP
 
-    Note["mediasoup 不接 HEVC, caps.go 注释:\n'advertising it causes validate errors\n at Router creation time'"]
+    Note["所选 SFU 实现未注册\n video/H265 能力,\n 因此必须旁路 SFU"]
     Pion -.-> Note
 ```
 
@@ -269,15 +276,15 @@ ASCII 兜底：
 
 ```
                   ┌──────────────────────────────────┐
-                  │  axonkit                         │
+                  │  广播任务                         │
                   │                                  │
-   avflow HEVC ──►│  pion WHIP 终端 (旁路 mediasoup) │
+   合流 HEVC  ──►│  旁路 WebRTC 终结 (绕过 SFU)      │
                   │     │                            │
-                  │     ├──► H.265 Depack ──► Switcher ──► RTMP / WHIP
-                  │     └──► RTP 直透 ──────► WHIP egress
+                  │     ├──► H.265 重组 ──► 切换器 ──► RTMP / WHIP
+                  │     └──► RTP 直透 ──────► WHIP 出口
                   │                                  │
-                  │  注: mediasoup-go 不支持 HEVC,    │
-                  │  否则 Router.Validate 报错       │
+                  │  注: 当前 SFU 实现不接受 HEVC,    │
+                  │  否则路由器创建即报错             │
                   └──────────────────────────────────┘
 ```
 
@@ -285,292 +292,280 @@ ASCII 兜底：
 
 ## 具体实施方式
 
-### 模块 1：广播任务（Broadcast Task）抽象
+### 模块 1：广播任务抽象
 
-广播任务接受请求 `POST /rtc/broadcast`：
+广播任务由控制面接口接收以下参数创建：房间标识、直播身份标识、N 个推流目标
+（每个目标包含协议类型与目的地址）。在某些实施例中，N 上限取小整数（例如 3）
+以保证出口侧资源可控。
 
-```json
-{
-  "roomId": "...",
-  "liveIdentity": "userA",
-  "destinations": [
-    {"protocol": "rtmp", "url": "rtmp://cdn1/live/k1"},
-    {"protocol": "whip", "url": "https://rtc2/whip/foo"}
-  ]
-}
-```
+任务创建过程包括：
 
-任务创建时：
+1. 在 SFU 路由器上为指定的直播身份建立媒体消费通路，订阅其音频与视频上游产
+   生者，得到**直播源**对象。视频上游必须协商出本系统支持的编码（H.264 /
+   VP9 / AV1 / VP8）之一；超出 SFU 可注册能力的编码（HEVC）由旁路终结路径
+   处理（见模块 6），不在直播源中出现。
+2. 为每个推流目标启动一个独立的出口模块（RTMP 或 WHIP），各自后台维护连接
+   状态与字节计数；上层 hot path 仅进行入队，不阻塞媒体处理线程。
+3. 创建并绑定切换器，初始状态为"直播激活"。
+4. 执行**目标 ↔ 编码兼容性校验**（见模块 5）。校验失败立即拒绝任务创建，
+   不进入媒体路径。
 
-1. 在 mediasoup Router 上为 `liveIdentity` 创建 `DirectTransport`，订阅其音频
-   和视频 Producer，构造 `liveSource`；视频 Producer 必须协商出 H.264 / VP9 /
-   AV1 / VP8 之一，否则报 `unsupported video codec`；HEVC 走旁路。
-2. 为每个目标 URL 启动一个独立 pusher（`rtmpPusher` 或 `whipPusher`），各自
-   后台 goroutine 维护连接，hot path 仅是 channel enqueue。
-3. 创建并绑定 Switcher，初态 `sourceLiveActive`。
-
-### 模块 2：Switcher 切换裁决
+### 模块 2：双源切换装置
 
 #### 2.1 状态机（图 2）
 
-`switchState` 仅两状态：`sourceLiveActive` / `sourceMixActive`。变量
-`mixReady` 是"合流源是否已经准备好接管"的旗标。
+切换器内部仅维护两个状态：**直播激活**与**合流激活**，外加一个布尔旗标
+"合流就绪"。"合流就绪"由合流入口在 ICE 进入 Connected 且第一个合流视频
+关键帧到达时置位。
 
 #### 2.2 关键帧对齐切换
 
-**直播 → 合流**：
+直播 → 合流：当切换器收到合流路径上的视频样本时，按以下规则裁决：
 
-```go
-// feedVideoSample 节选
-case SourceMix:
-    if !activeIsMix {
-        if !mixReady || !sample.IsKeyFrame {
-            return // 丢弃合流源所有非 IDR 帧, 等 IDR
-        }
-        if !s.tryFlipToMixOnKeyframe() {
-            return
-        }
-    }
+```
+若 状态 == 直播激活:
+    若 合流就绪 == 否 或 当前样本不是关键帧:
+        丢弃该样本, 直接 return
+    否则:
+        在该样本上原子地把 状态 改为 合流激活
+        发出该关键帧及其后续合流样本
 ```
 
-**合流 → 直播**：合流 ICE 持续断开 5 秒（`mixIceDisconnectGrace`）后由看门狗
-触发 `flipToLive("mix ICE watchdog expired")`，同时调用
-`liveSource.RequestKeyFrame()` 让 mediasoup 向直播身份回送 PLI，下一个
-IDR 落地即生效。
+合流 → 直播：在两种触发源下回切——
 
-#### 2.3 时间戳重基（rebaser）
+- **合流 ICE 看门狗超时**：合流入口的 ICE 状态进入 Disconnected / Failed 后，
+  若持续超过预设宽限期（典型值 5 秒）仍未恢复，看门狗强制翻转为直播激活，
+  并向直播源发起关键帧请求（PLI），下一个直播 IDR 落地即生效；
+- **合流上游关闭**：合流的上游生产者关闭事件先于看门狗到达时（典型场景：
+  显式 `DELETE` 合流入口资源），切换器立即翻转。
 
-每个 `(Kind, Path)` 维度独立持有一个 `rebaser`：
+#### 2.3 时间戳重基器
 
-```go
-type rebaser struct {
-    hasBase        bool
-    srcBase        uint32   // 当前源的本地基线
-    outLast        uint32   // 上一个对外发出的输出时钟
-    outInitialized bool
-    catchup        uint32   // 切源时人为追赶的刻度
-}
+每个 `(媒体类型, 路径)` 维度独立持有一个**时间戳重基器**，用以下抽象状态
+与算法描述：
 
-func (r *rebaser) rewrite(inTS uint32) uint32 {
-    if !r.outInitialized { ... return 0 }
-    if !r.hasBase { // 切源后第一个样本
-        r.hasBase = true
-        r.srcBase = inTS
-        r.outLast += r.catchup     // 追赶: 音频 960, 视频 3000
-        return r.outLast
-    }
-    delta := inTS - r.srcBase      // unsigned, 自然处理回绕
-    out := r.outLast + delta
-    if out < r.outLast {           // 单源内部回绕
-        r.srcBase = inTS
-        r.outLast += r.catchup
-        return r.outLast
-    }
-    r.outLast = out
-    r.srcBase = inTS
-    return out
-}
+```
+重基器内部状态:
+    源端基线: uint32        // 当前源的最近输入时间戳
+    输出最近: uint32        // 上一次对外发出的输出时间戳
+    输出已初始化: bool
+    源已初始化: bool
+    追赶刻度: uint32        // 切源时人为前进的刻度
+
+重基算法 rewrite(当前输入时间戳):
+    若 输出未初始化:                       // 第一帧
+        输出最近 = 0
+        输出已初始化 = 是
+        return 0
+    若 源未初始化:                         // 切源后第一帧
+        源端基线 = 当前输入
+        源已初始化 = 是
+        输出最近 += 追赶刻度               // 强制前进
+        return 输出最近
+    Δ = 当前输入 - 源端基线              // 无符号减法, 自然处理回绕
+    输出 = 输出最近 + Δ
+    若 输出 < 输出最近:                    // 单源内部回绕
+        源端基线 = 当前输入
+        输出最近 += 追赶刻度
+        return 输出最近
+    输出最近 = 输出
+    源端基线 = 当前输入
+    return 输出
 ```
 
-样本路径与裸 RTP 包路径**各自独立持有 rebaser**——前者发给 RTMP，后者发给
-WHIP；如果共用，depack 之前的 RTP 已被改写过，进入 sample sink 又会被再改写
-一次，导致 32 位下溢，输出 FLV 时间戳会变成几个小时（早期 verify-broadcast
-真实踩到的 bug，故文中将"分桶 rebaser"列入权利要求）。
+切源时，控制面调用重基器的"翻转"动作，将"源已初始化"重置为否，使得下
+一个该路径上的样本在 `rewrite` 函数中走进"切源后第一帧"分支，从而强制
+施加追赶刻度。
 
-### 模块 3：编解码 SequenceStart 字节级去重
+#### 2.4 分桶重基的必要性
 
-经典 RTMP receiver（含 ffmpeg flvenc）发现一条 TCP 上**第二次**出现
-SequenceStart 标签会断连。我们在 pusher 内部维护：
+样本路径（去包后送 RTMP 出口）与裸 RTP 包路径（直透到 WHIP 出口）在切换器
+内部各自持有独立的重基器实例，因为：
 
-```go
-type rtmpPusher struct {
-    videoSeqMu     sync.Mutex
-    videoSeqBody   []byte // 上一次发出的 SeqHeader 字节
-    videoSeqFourCC string // "" 表 AVC, 否则 E-RTMP FourCC
-    videoHdrSent   atomic.Bool
-}
+- 样本路径的时间戳是去包后的访问单元时间戳，已经经过 depacketizer 一次处
+  理；
+- 裸 RTP 包路径直接使用 RTP 包头里的 32 位时间戳。
+
+两条路径若共用一个重基器，去包之前的 RTP 已被改写，进入样本路径又会被再
+改写一次，导致 32 位下溢，输出时间戳跳变成数小时之远。因此本发明强调"分
+桶重基器"是单独的权利要求要素。
+
+### 模块 3：配置记录字节级去重
+
+经典 RTMP 接收端实现（含某些 FLV 录制器与转封装器）发现单条 TCP 连接上
+**第二次**出现同种类的 SequenceStart 配置记录会立即关闭连接，因为它把这
+当作"流参数变更"信号。本发明在每个 RTMP / E-RTMP 出口模块内部维护以下抽
+象状态：
+
+- "上一次发出的视频配置记录"字节缓存；
+- "上一次的 FourCC 标签"（空串代表经典 H.264，否则为 vp09 / av01 / hvc1
+  之一）；
+- "序列头已发出"原子标志。
+
+切换器在每次源翻转时，对所有出口模块调用"重置序列头"动作，将"已发出"
+原子标志清零；下一帧到达时，出口模块按以下流程发送序列头：
+
+```
+EnsureSeqHeader(新配置记录, 新 FourCC):
+    使用 CompareAndSwap 抢占"已发出"标志, 抢占失败直接 return
+    取互斥锁:
+        若 字节缓存 与 新配置记录 完全相同 且 FourCC 相同:
+            什么也不发, return false      // 关键去重点
+        否则:
+            字节缓存 = 新配置记录
+            FourCC 缓存 = 新 FourCC
+            生成 SequenceStart FLV 标签并入队
+            return true
 ```
 
-切源时：
-
-```go
-p.ResetVideoHeader()                         // videoHdrSent = false
-ok := p.EnsureVideoSeqHeader(newAVCC)        // 或 EnsureExVideoSeqHeader
-// EnsureXxx 内部先 CompareAndSwap, 拿到锁再
-// 字节比较 videoSeqBody == newAVCC, 相同则 return false 不入队.
-```
-
-效果：直播身份和 avflow 合流如果使用**完全相同的 SPS/PPS**（同分辨率、同
-profile、相同 SEI 订阅），切换时不会有任何 SeqHeader 出现在 TCP 上，下游
-ffmpeg 无感继续录制。
-
-> 该思路同样适用于 VP9 vpcC、AV1 av1C、HEVC hvcC、VP8 vpcC——只要源切换前后
-> 配置记录字节级一致就跳发。
+**效果**：在直播身份与合流任务的视频参数（分辨率、Profile、SPS/PPS、SEI 等）
+完全相同时，源切换不会产生任何序列头标签出现在 TCP 上，下游录制器不会感
+知到切换；参数不同则只触发**一次**新序列头，下游正常切换解码上下文。
 
 ### 模块 4：编解码无关 E-RTMP 路由
 
-```go
-func (p *rtmpPusher) WriteSample(s MediaSample) {
-    var body []byte
-    switch s.Codec {
-    case CodecH264:
-        body = buildAVCFrameTag(s.IsKeyFrame, s.Data)
-    case CodecVP9:
-        body = buildExVideoFrameTag(flvExVideoFourCCVP9, s.IsKeyFrame, s.Data)
-    case CodecAV1:
-        body = buildExVideoFrameTag(flvExVideoFourCCAV1, s.IsKeyFrame, s.Data)
-    case CodecH265:
-        body = buildExVideoFrameTag(flvExVideoFourCCH265, s.IsKeyFrame, s.Data)
-    case CodecOpus:
-        body = buildOpusFrameTag(s.Data)
-    default:
-        // VP8 落入 default: validateDestinationsForCodec 已在
-        // Broadcast.Start 阶段拒绝带 RTMP 目标的 VP8 直播源, 此处
-        // 兜底丢弃以防未来有人新增 RTMP 目标却忘了对应 FourCC.
-        return
-    }
-    p.enqueue(...)
-}
-```
+每个 RTMP / E-RTMP 出口模块对每个输入样本，按下表选取 FLV 视频标签的字节
+布局：
 
-```go
-// validateDestinationsForCodec: 仅在 Start() 阶段执行一次, 不在 hot path
-// 内做检查. 任一目标为 RTMP 且直播源编码为 VP8 时, 立即返回错误.
-func validateDestinationsForCodec(dsts []Destination, videoCodec Codec) error {
-    if videoCodec != CodecVP8 {
-        return nil
-    }
-    for _, d := range dsts {
-        if d.Type == DestinationRTMP {
-            return fmt.Errorf("broadcast: VP8 cannot be pushed to RTMP" +
-                " destinations (Enhanced-RTMP v2 has no FourCC for VP8);" +
-                " use a WHIP destination or republish in H.264/VP9/AV1")
-        }
-    }
-    return nil
-}
-```
+| 输入编码 | RTMP 出口 | FLV 标签布局 | FourCC | 配置记录类型 | 来源 |
+|----------|-----------|--------------|--------|--------------|------|
+| H.264    | 支持      | 经典：FrameType + CodecID(AVC) | — | AVCDecoderConfigurationRecord | depacketizer 缓存 SPS+PPS |
+| VP9      | 支持      | E-RTMP：IsExHeader=1 + FrameType + PacketType + FourCC + 帧体 | `vp09` | VPCodecConfigurationRecord | depacketizer 解码 uncompressed header |
+| AV1      | 支持      | E-RTMP                       | `av01` | AV1CodecConfigurationRecord | depacketizer 抓取 Sequence Header OBU |
+| HEVC     | 支持      | E-RTMP                       | `hvc1` | HEVCDecoderConfigurationRecord | depacketizer 缓存 VPS+SPS+PPS |
+| VP8      | **拒绝**  | —                           | — | — (Enhanced-RTMP v2 未注册) | 启动阶段拒绝（见模块 5） |
 
-SequenceStart 配置记录：
+WHIP 出口对所有支持的编码（含 VP8）均以原始 RTP 直透方式工作，仅做时间戳
+重基与 SSRC / 序列号改写，不做任何编码层重组。
 
-| 编码 | RTMP 出口 | FourCC | 记录类型 | 来源 |
-|------|-----------|--------|---------|------|
-| H.264 | ✅ | (legacy)`avc1`/0x07 | AVCDecoderConfigurationRecord (avcC) | depack 收到 SPS+PPS |
-| VP9 | ✅ | `vp09` | VPCodecConfigurationRecord (vpcC) | depack 解码 uncompressed header |
-| AV1 | ✅ | `av01` | AV1CodecConfigurationRecord (av1C) | depack 抓取 Sequence Header OBU |
-| VP8 | ❌ Start() 拒绝 | — | — (Enhanced-RTMP v2 未注册) | WHIP 出口侧由 RTP 直透 |
-| HEVC | ✅ | `hvc1` | HEVCDecoderConfigurationRecord (hvcC) | depack 收到 VPS+SPS+PPS |
+### 模块 5：目标 ↔ 编码兼容性校验
 
-### 模块 5：HEVC 旁路 WHIP 终端（图 5）
-
-mediasoup-go 的 `supportedRtpCapabilities` 表没有 HEVC，**无法**在 Router 上
-注册 `video/H265` Capability，否则 Router 创建直接报错。但 avflow 完全可以输
-出 HEVC over WHIP。本发明的解法：
-
-1. `POST /rtc/broadcast/{id}/whip` 收到 SDP Offer 时，`offerNeedsH265Bypass`
-   先做轻量分类：
-   - 若 `m=video` 段只含 H.264 / VP9 / AV1 / VP8（或 H.264+H.265 混编） →
-     走 mediasoup `WebRtcTransport` + `Producer` 的常规路径；
-   - 若 `m=video` 段**只含** H.265 → `attachMixH265Bypass` 启动一条独立的
-     pion `webrtc.PeerConnection`，注册 H.265+Opus 编解码能力，
-     SetRemoteDescription / CreateAnswer / SetLocalDescription，等待 ICE
-     完成。
-2. pion 侧 `OnTrack` 触发后，每个 remote track 起一条 RTP 读循环：每个 RTP
-   包同时投喂 `H265Depacketizer`（出口 RTMP 用）与 `packetSink`（出口 WHIP
-   用），与 mediasoup 路径完全同形。
-3. 两条路径对外**实现同一个 `mixIngress` 接口**（`Close` / `VideoDepack` /
-   `RestartIce`），Broadcast / Switcher 不区分下层实现，一个 `videoDepacketizer`
-   的对象就足够。
-4. 生命周期对齐：`OnICEConnectionStateChange` 的 `disconnected` / `failed`
-   触发 5 秒看门狗，超时即 `flipToLive`；`closed` / `PeerConnection failed`
-   立刻触发同样的回切。所有动作复用 `Broadcast.handleMixGone`，与 mediasoup
-   路径走同一段代码。
-5. RTMP 出口仍走模块 4 的 `EnsureExVideoSeqHeader("hvc1", hvcC)` 路径，与
-   H.264 / VP9 / AV1 完全对称——SFU 内部是否能承载该编码与 RTMP 出口能力
-   解耦。
-
-#### 5.1 关键代码位置
+广播任务在启动阶段，对解析出的直播源视频编码与全部出口目标做一次性兼容
+性校验：
 
 ```
-pkg/broadcast/depack_h265.go      // H.265 NAL 拼装 + hvcC 生成
-pkg/broadcast/source_mix_h265.go  // 旁路 pion WHIP 终端 + offerNeedsH265Bypass
-pkg/broadcast/broadcast.go        // attachMixH265Bypass 分派；mixIngress 抽象
-pkg/broadcast/source_mix.go       // mediasoup 路径仍是默认；实现 mixIngress
-pkg/broadcast/flv.go              // buildExVideoH265Tag / buildHEVCConfigRecord
-pkg/broadcast/rtmp_pusher.go      // WriteSample: case CodecH265
-pkg/broadcast/sample.go           // CodecH265 enum, IsVideo() 包含
+ValidateDestinationsForCodec(目标列表, 视频编码):
+    若 视频编码 != VP8:
+        return 通过
+    遍历 目标列表:
+        若 目标协议 == RTMP:
+            return 拒绝, 错误信息: "VP8 不可推往 RTMP 目标
+              (Enhanced-RTMP v2 未为 VP8 分配 FourCC);
+              请改用 WHIP 目标或重转码为 H.264 / VP9 / AV1"
+    return 通过
 ```
+
+校验**只在任务启动一次**，不在媒体 hot path 上重复检查；校验通过后，"启
+动失败"与"媒体路径运行期失败"被严格区分，控制面错误响应一目了然。
+
+### 模块 6：旁路 WebRTC 终结路径
+
+部分 SFU 实现的可生产能力表中并未注册某些视频编码（典型场景为开源 SFU 不
+支持 HEVC）。本发明的解法：
+
+1. **入口编码探测**：合流入口收到 SDP Offer 后，先扫描每个 m=video 段的
+   rtpmap 列表（剔除 RTX / RED / FEC 等辅助条目），按以下规则决定路由：
+   - 若所有视频 m 段提供的"主编码"都在 SFU 已注册集合内（H.264 / VP9 /
+     AV1 / VP8），或 Offer 中至少有一个 SFU 可承载的视频编码与 SFU 不支持
+     的编码并存（这种 Offer 中 SFU 可成功协商出可承载的那一种）→ 走**SFU
+     路径**；
+   - 若所有视频 m 段提供的主编码均**只有** SFU 未注册的编码（如 HEVC）
+     → 走**旁路 WebRTC 终结路径**。
+2. **旁路终结模块**：构造一个独立的 WebRTC PeerConnection 实例，注册目标
+   编码（如 HEVC）与 Opus 的编解码能力，以及标准的 RTCP 反馈处理；
+   Set Remote Description → Create Answer → Set Local Description → 等待
+   ICE 候选收集完成；将得到的 Answer SDP 与 ICE 用户名作为 WHIP 资源 ETag
+   返回给入口客户端。
+3. **远端轨道接管**：旁路终结模块的"远端轨道到达"事件触发后，对每条轨道
+   起一条 RTP 读循环：每个 RTP 包同时投递到——
+   - 该编码的 RTP 重组器，得到访问单元样本送入切换器（驱动 RTMP 出口）；
+   - 切换器的 RTP 包通道，原始 RTP 直透到 WHIP 出口。
+4. **生命周期对齐**：旁路终结模块同样实现"合流入口"接口，对外暴露与
+   SFU 路径完全一致的方法集（关闭、获取视频重组器、ICE 重启）；ICE 状态
+   `disconnected` / `failed` 触发与 SFU 路径**同一段**看门狗逻辑（见模
+   块 2.2）；PeerConnection 整体进入 Failed / Closed 状态时立即触发"合流
+   消失"回调，复用直播兜底。
+5. **出口对称**：旁路终结路径的样本进入切换器与重基器后，与 SFU 路径完全
+   等价；E-RTMP 出口对 HEVC 样本走与 H.264 / VP9 / AV1 同形的 SeqHeader 字
+   节级去重逻辑，FourCC 选用 `hvc1`，配置记录为 HEVCDecoderConfigurationRecord。
+
+**关键意义**：通过把"合流入口"抽象为接口（而非绑定具体的 SFU 终结实现），
+SFU 是否能承载某种编码与广播任务是否能用该编码作为合流源**完全解耦**。
+任何未来发布的新视频编码，只要在旁路 WebRTC 库中可终结，就能立即在本系
+统中作为合流源使用，无须等待 SFU 升级。
 
 ---
 
 ## 权利要求
 
 1. 一种基于 SFU 的直播任务系统，其特征在于：所述系统包含一个广播任务对象，
-   广播任务对象同时拥有：（a）一个由 SFU 直接消费房间内指定身份 Producer 的
-   **直播源**；（b）至少一个可在运行期附加 / 卸载的 **合流源**，其媒体来自
+   广播任务对象同时拥有：（a）一个由 SFU 直接消费房间内指定身份生产者的
+   **直播源**；（b）至少一个可在运行期附加 / 卸载的**合流源**，其媒体来自
    一个外部合流服务通过 WHIP 协议推送至本系统的 ingest 端点；（c）N 个对外
    推流目标，所述目标在源切换过程中保持单一长 TCP / WHIP 会话，不重连。
 
-2. 根据权利要求 1 所述的系统，其特征在于：所述广播任务包含一个**关键帧对齐
-   切换器**，所述切换器在收到合流源的第一个视频关键帧之前持续把直播源样本
-   发往出口推流器，并在该关键帧到达后的同一调用栈内原子地将后续样本切换为
-   合流源样本，避免出口推流器观察到非 IDR 起跳的 GOP。
+2. 根据权利要求 1 所述的系统，其特征在于：所述广播任务包含一个**关键帧对
+   齐切换器**，所述切换器在收到合流源的第一个视频关键帧之前持续把直播源样
+   本发往出口推流器，并在该关键帧到达后的同一调用栈内原子地将后续样本切换
+   为合流源样本，避免出口推流器观察到非 IDR 起跳的 GOP。
 
 3. 根据权利要求 2 所述的系统，其特征在于：所述切换器为每路出口分别为音频
-   样本、视频样本、音频原始 RTP、视频原始 RTP 维护四个独立的时间戳重基器，
+   样本、视频样本、音频原始 RTP、视频原始 RTP 维护四个独立的时间戳重基器；
    每个重基器记录上一发出的输出时钟与当前源的源端基线，源切换时强制施加一
    段追赶刻度，使得任一出口侧观察到的时间戳序列在源切换前后严格非递减且不
    回绕。
 
 4. 根据权利要求 3 所述的系统，其特征在于：所述追赶刻度的取值与对应媒体的
-   常规帧间隔一致，音频选取一帧时长（如 Opus 20 ms = 960 在 48 kHz 时钟），
-   视频选取一帧时长（如 30 fps = 3000 在 90 kHz 时钟）。
+   常规帧间隔一致，音频选取一帧时长（如 Opus 20 ms 在 48 kHz 时钟下为
+   960），视频选取一帧时长（如 30 fps 在 90 kHz 时钟下为 3000）。
 
 5. 根据权利要求 1 所述的系统，其特征在于：所述广播任务包含一个 **ICE 看门
-   狗**，看门狗监听合流源的 ICE 连接状态，当 ICE 状态进入断开持续超过预设
-   宽限期（如 5 秒）时，触发自动回切到直播源，并向直播源发起 PLI 请求新的
-   关键帧；当合流源的 mediasoup Producer 关闭事件先于看门狗到达时，立即
-   触发上述回切。
+   狗**，看门狗监听合流源的 ICE 连接状态；当 ICE 状态进入断开持续超过预设
+   宽限期（如 5 秒）时，触发自动回切到直播源，并向直播源发起关键帧请求；
+   当合流源上游媒体生产者的关闭事件先于看门狗到达时，立即触发上述回切。
 
 6. 根据权利要求 5 所述的系统，其特征在于：当回切的瞬间，所述切换器同时为
-   音频与视频两类时间戳重基器进入"切源"状态，使得回切后第一个直播源样本对
-   应的输出时间戳在原输出时钟上至少前进一个所述追赶刻度。
+   音频与视频两类时间戳重基器进入"切源"状态，使得回切后第一个直播源样
+   本对应的输出时间戳在原输出时钟上至少前进一个所述追赶刻度。
 
-7. 一种异构编码下的 RTMP / Enhanced-RTMP 推流方法，其特征在于：所述方法对
-   外保持单一长 TCP 推流连接，对内根据样本编码类型动态选择 FLV 视频 tag 的
-   字节布局：对 H.264 采用经典 `(FrameType << 4) | CodecID=7` 一字节头加
-   AVCC 接入单元；对 VP9 / AV1 / HEVC 采用 Enhanced-RTMP 扩展头
-   `IsExHeader=1 + FrameType + PacketType` 加 4 字节 FourCC（依次为 `vp09` /
-   `av01` / `hvc1`）加各自的配置记录或编码帧字节；对 VP8 因 Enhanced-RTMP v2
-   尚未注册 FourCC，方法在广播任务启动阶段对"VP8 + 至少一个 RTMP 目标"组合
-   进行一次性兼容性校验并直接拒绝，避免在 hot path 上动态降级或下游解码失败。
+7. 一种异构编码下的 RTMP / Enhanced-RTMP 推流方法，其特征在于：所述方法
+   对外保持单一长 TCP 推流连接，对内根据样本编码类型动态选择 FLV 视频标
+   签的字节布局：对 H.264 采用经典"FrameType + CodecID(AVC)"一字节头加
+   AVC 配置记录；对 VP9 / AV1 / HEVC 采用 Enhanced-RTMP 扩展头
+   "IsExHeader=1 + FrameType + PacketType"加 4 字节 FourCC（依次为
+   `vp09` / `av01` / `hvc1`）加各自的配置记录或编码帧字节；对 VP8 因
+   Enhanced-RTMP v2 尚未注册 FourCC，方法在广播任务启动阶段对"VP8 + 至
+   少一个 RTMP 目标"组合进行一次性兼容性校验并直接拒绝，避免在媒体处
+   理路径上动态降级或下游解码失败。
 
-8. 根据权利要求 7 所述的方法，其特征在于：所述推流方法在每条 RTMP 连接上
-   维护"上一次发出的视频 SequenceStart 字节"缓存，当切源动作发生时，先取消
-   "已发标志"，并对新源的配置记录进行字节级比较：完全相同则不再入队
+8. 根据权利要求 7 所述的方法，其特征在于：所述推流方法在每条 RTMP 连接
+   上维护"上一次发出的视频配置记录字节缓存"，当切源动作发生时，先取消
+   "已发出"标志，并对新源的配置记录进行字节级比较：完全相同则不再入队
    SequenceStart 标签，继续直接发送编码帧标签；不同则先入队新的
    SequenceStart 标签再继续，从而避免 RTMP 接收端因一条 TCP 上重复见到
    SequenceStart 而主动断开。
 
-9. 根据权利要求 7 所述的方法，其特征在于：所述配置记录分别由对应的
-   depacketizer 在接收到关键帧时构造，VP9 由 VPCodecConfigurationRecord 描
-   述，AV1 由 AV1CodecConfigurationRecord 描述（包含 Sequence Header OBU），
-   HEVC 由 HEVCDecoderConfigurationRecord 描述（包含 VPS / SPS / PPS），
-   H.264 由 AVCDecoderConfigurationRecord 描述；VP8 在 SFU 侧由
-   VP8Depacketizer 完成 RTP→帧重装并在 WHIP 出口路径上直透 RTP，但不参与
-   E-RTMP 配置记录构造。
+9. 根据权利要求 7 所述的方法，其特征在于：所述配置记录分别由对应编码的
+   RTP 重组器在接收到关键帧时构造，VP9 由 VPCodecConfigurationRecord 描
+   述，AV1 由 AV1CodecConfigurationRecord 描述（包含 Sequence Header
+   OBU），HEVC 由 HEVCDecoderConfigurationRecord 描述（包含 VPS / SPS /
+   PPS），H.264 由 AVCDecoderConfigurationRecord 描述；VP8 在 SFU 侧由
+   独立的 RTP 重组器完成 RTP→帧重装并在 WHIP 出口路径上直透 RTP，但不
+   参与 E-RTMP 配置记录构造。
 
-10. 根据权利要求 1 所述的系统，其特征在于：所述广播任务在合流源 ingest 端点
-    处对 SDP Offer 进行编码探测：若仅含 SFU 已注册支持的编码，则路由至基于
-    SFU 的 WHIP 终结路径；若含有 SFU 未注册支持的编码（如 HEVC），则路由
-    至独立的 WebRTC 终结路径，所述终结路径直接拥有 PeerConnection 与
-    RTP 处理逻辑，绕过 SFU；两条路径终结后均向同一关键帧对齐切换器投递
-    MediaSample 与 RTP 包，使得上层切换、重基、推流逻辑对底层 ingest 实现
-    完全无感。
+10. 根据权利要求 1 所述的系统，其特征在于：所述广播任务在合流源 ingest
+    端点处对 SDP Offer 进行编码探测：若 Offer 中所有视频 m 段提供的主编
+    码均位于当前 SFU 已注册的可承载编码集合内，则路由至基于 SFU 的 WHIP
+    终结路径；若 Offer 中所有视频 m 段提供的主编码均**仅含**当前 SFU 未
+    注册的编码，则路由至独立的 WebRTC 终结路径，所述终结路径直接拥有
+    PeerConnection 与 RTP 处理逻辑，绕过 SFU；两条路径均向同一关键帧对
+    齐切换器投递媒体样本与原始 RTP 包，使得上层切换、重基、推流逻辑对底
+    层 ingest 实现完全无感。
 
-11. 根据权利要求 10 所述的系统，其特征在于：所述独立 WebRTC 终结路径执行
-    与 SFU 路径相同的 ICE 看门狗、Producer 关闭探测，所述探测结果同样可
-    触发权利要求 5 所述的自动回切。
+11. 根据权利要求 10 所述的系统，其特征在于：所述独立 WebRTC 终结路径与
+    SFU 路径对外暴露同一组接口（包括关闭、暴露视频配置记录、ICE 重启）；
+    所述独立路径执行与 SFU 路径**完全相同的** ICE 看门狗与上游关闭探
+    测，所述探测结果同样可触发权利要求 5 所述的自动回切。
 
 12. 一种计算机可读存储介质，其上存储有指令，所述指令被处理器执行时实现
     权利要求 1 至 11 任一项所述的系统或方法。
@@ -579,11 +574,11 @@ pkg/broadcast/sample.go           // CodecH265 enum, IsVideo() 包含
 
 ## 说明书附图列表
 
-- 图 1（系统架构）：见上文 Mermaid 块 + ASCII 兜底。
-- 图 2（Switcher 状态机）：见上文 Mermaid 块。
-- 图 3（直播 → 合流 单帧无感切换时序）：见上文 Mermaid 块。
-- 图 4（编解码 → E-RTMP / WHIP 出口路由）：见上文 Mermaid 块。
-- 图 5（HEVC 旁路 WHIP 入口）：见上文 Mermaid 块。
+- 图 1（系统架构）：见上文 Mermaid 块及 ASCII 兜底。
+- 图 2（切换器状态机）：见上文 Mermaid 块及 ASCII 兜底。
+- 图 3（直播 → 合流 单帧无感切换时序）：见上文 Mermaid 块及 ASCII 兜底。
+- 图 4（编解码 → E-RTMP / WHIP 出口路由）：见上文 Mermaid 块及 ASCII 兜底。
+- 图 5（旁路 WebRTC 终结路径）：见上文 Mermaid 块及 ASCII 兜底。
 
 ---
 
@@ -592,30 +587,9 @@ pkg/broadcast/sample.go           // CodecH265 enum, IsVideo() 包含
 | 维度 | 传统方案 | 本发明 |
 |------|----------|--------|
 | 直播 ↔ 连麦切换 | 重建 RTMP TCP，CDN 见到一次断流 | 单条 TCP，配置记录字节级去重，下游无感 |
-| 切换时机 | 任意时间点 cut，下游解码出花屏 | 等合流 IDR 到达再切，回切则向直播 PLI |
-| 时间戳 | 切换后跳变可能负向 | 双源独立 rebaser + 强制追赶刻度，严格单调 |
-| 合流端崩溃 | 直播端口持续无帧 | ICE 看门狗 5 秒回切到直播源 |
-| 多编码 | 仅 H.264 走 RTMP；VP9/AV1/HEVC 需另起 WebRTC 通道 | 同一 RTMP 连接 + Enhanced-RTMP，按编码动态选 FourCC |
-| HEVC 入口 | mediasoup 无法承载 | 旁路 pion 终结，复用同一切换器 / 推流器 |
-
----
-
-## 实施现状对照（截至 2026-04）
-
-| 模块 | 文件 | 状态 |
-|------|------|------|
-| Broadcast Task | `pkg/broadcast/broadcast.go`, `manager.go` | 已实现 |
-| 目标 ↔ 编码兼容性校验（VP8 + RTMP 拒绝） | `pkg/broadcast/broadcast.go::validateDestinationsForCodec` | 已实现 |
-| Live Source | `pkg/broadcast/source_live.go` | 已实现（H.264 / VP9 / AV1 / VP8） |
-| Mix Source（mediasoup 路径） | `pkg/broadcast/source_mix.go` | 已实现（H.264 / VP9 / AV1 / VP8） |
-| Switcher + Rebaser | `pkg/broadcast/switcher.go` | 已实现 |
-| RTMP Pusher + 字节级去重 | `pkg/broadcast/rtmp_pusher.go` | 已实现 |
-| WHIP Pusher | `pkg/broadcast/whip_pusher.go` | 已实现 |
-| H.264 Depack + avcC | `pkg/broadcast/depack_h264.go` | 已实现 |
-| VP9 Depack + vpcC | `pkg/broadcast/depack_vp9.go` | 已实现 |
-| AV1 Depack + av1C | `pkg/broadcast/depack_av1.go` | 已实现 |
-| VP8 Depack（仅 SFU 侧 / WHIP 出口） | `pkg/broadcast/depack_vp8.go` | 已实现 |
-| H.265 Depack + hvcC（出口侧） | `pkg/broadcast/depack_h265.go`, `pkg/broadcast/flv.go::buildHEVCConfigRecord` | 已实现 |
-| H.265 RTMP 路由（FourCC `hvc1`） | `pkg/broadcast/rtmp_pusher.go`, `pkg/broadcast/pusher.go` | 已实现 |
-| H.265 旁路 WHIP 终结（pion 直接 PeerConnection） | `pkg/broadcast/source_mix_h265.go`, `pkg/broadcast/broadcast.go::attachMixH265Bypass` | 已实现（offer SDP 仅含 H.265 时自动路由到 pion 旁路；OnTrack→H265Depacketizer→Switcher；ICE 看门狗与 mediasoup 路径同源） |
-| 端到端验证 | `test/broadcast/verify.sh`, `test/broadcast/verify-avflow.sh` | 已实现（H.264 / VP9 / AV1）；VP8 / HEVC 待补 WHIP 出口验证目标 |
+| 切换时机 | 任意时间点 cut，下游解码出花屏 | 等合流关键帧到达再切，回切则向直播请求关键帧 |
+| 时间戳 | 切换后跳变可能负向 | 双源独立重基器 + 强制追赶刻度，严格单调 |
+| 合流端崩溃 | 直播端口持续无帧 | ICE 看门狗超时回切到直播源 |
+| 多编码 | 仅 H.264 走 RTMP；VP9/AV1/HEVC 需另起 WebRTC 通道 | 同一 RTMP 连接 + Enhanced-RTMP，按编码动态选 FourCC；VP8 在启动阶段拒绝以避免下游错误 |
+| HEVC 入口 | SFU 不接受 HEVC 即彻底无解 | 旁路独立 WebRTC 终结，复用同一切换器 / 推流器 |
+| 兼容性校验 | 运行期发现编码 / 协议不匹配 | 启动阶段一次性校验并拒绝不可承载组合 |
