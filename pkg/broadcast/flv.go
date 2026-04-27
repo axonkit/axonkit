@@ -39,11 +39,14 @@ func buildAVCSeqHeaderTag(avcc []byte) []byte {
 //
 //	[FrameType<<4 | CodecID] [AVCPacketType=1] [CTS SI24 BE] [AVCC access unit]
 //
-// CTS is the (PTS-DTS) offset in milliseconds. For pure passthrough
-// from live/mix WebRTC producers we have no separate DTS so we always
-// write CTS=0; B-frames are rare in real-time video and SFU publishers
-// typically disable them.
-func buildAVCFrameTag(isKey bool, avccAccessUnit []byte) []byte {
+// ctsMs is the (PTS-DTS) offset in milliseconds. For SFU passthrough
+// of WebRTC producers without B-frames the value is always 0; when
+// the live source is an RTMP ingest that used B-frames the egress
+// reorder buffer (rtmp_pusher.go) computes a non-zero CTS so the FLV
+// (and any downstream MP4 mux) preserves the publisher's display
+// order. Writing CTS=0 in that case is what manifested as "frames
+// jumping back" in recordings of B-frame H.264 streams.
+func buildAVCFrameTag(isKey bool, ctsMs int32, avccAccessUnit []byte) []byte {
 	out := make([]byte, 5+len(avccAccessUnit))
 	if isKey {
 		out[0] = flvFrameTypeKey | flvVideoCodecAVC // 0x17
@@ -51,9 +54,21 @@ func buildAVCFrameTag(isKey bool, avccAccessUnit []byte) []byte {
 		out[0] = flvFrameTypeInter | flvVideoCodecAVC // 0x27
 	}
 	out[1] = flvAVCPacketTypeNALU
-	// out[2..5] are CTS (signed 24-bit BE) — all zero.
+	encodeSignedInt24BE(out[2:5], ctsMs)
 	copy(out[5:], avccAccessUnit)
 	return out
+}
+
+// encodeSignedInt24BE writes a 24-bit signed big-endian integer into
+// the first 3 bytes of buf. Out-of-range values are wrapped modulo
+// 2^24, matching how go's int→uint conversion truncates: the
+// FLV/E-RTMP CTS field cannot exceed ±2^23 milliseconds (~2.3 hours)
+// in practice, so the truncation only matters as a defensive bound.
+func encodeSignedInt24BE(buf []byte, v int32) {
+	u := uint32(v) & 0x00FFFFFF
+	buf[0] = byte(u >> 16)
+	buf[1] = byte(u >> 8)
+	buf[2] = byte(u)
 }
 
 // Enhanced RTMP (E-RTMP) video tag layout — veovera
@@ -81,8 +96,9 @@ const (
 	flvExVideoFrameTypeKey   byte = 0x10 // (1 << 4)
 	flvExVideoFrameTypeInter byte = 0x20 // (2 << 4)
 
-	flvExVideoPacketSeqStart  byte = 0x00
-	flvExVideoPacketCodedFrmX byte = 0x03
+	flvExVideoPacketSeqStart    byte = 0x00
+	flvExVideoPacketCodedFrames byte = 0x01
+	flvExVideoPacketCodedFrmX   byte = 0x03
 
 	flvExVideoFourCCVP9  = "vp09"
 	flvExVideoFourCCAV1  = "av01"
@@ -110,11 +126,37 @@ func buildExVideoSeqHeaderTag(fourCC string, config []byte) []byte {
 // buildExVideoFrameTag constructs a CodedFramesX E-RTMP video tag for
 // a VP9/AV1 access unit — no composition time, one header byte, one
 // FourCC, then the raw frame bytes.
+//
+// Used for codecs whose RTP path does not surface a (PTS, DTS) skew
+// (VP9, AV1 today). HEVC takes the CodedFrames variant below so its
+// B-frame composition offset is preserved end-to-end.
 func buildExVideoFrameTag(fourCC string, isKey bool, accessUnit []byte) []byte {
 	out := make([]byte, 5+len(accessUnit))
 	out[0] = exVideoHeaderByte(isKey, flvExVideoPacketCodedFrmX)
 	copy(out[1:5], []byte(fourCC))
 	copy(out[5:], accessUnit)
+	return out
+}
+
+// buildExVideoCodedFramesTag constructs a CodedFrames (PacketType=1)
+// E-RTMP video tag carrying an HEVC (or future H.264-via-FourCC)
+// access unit:
+//
+//	[header byte] [FourCC] [SI24 CTS] [access unit]
+//
+// ctsMs is the (PTS-DTS) offset in milliseconds, encoded the same way
+// as buildAVCFrameTag's classic AVC tag — so the egress reorder
+// buffer in rtmp_pusher.go can hand HEVC samples to this builder
+// unchanged. For passthrough callers that do not maintain a (DTS,
+// CTS) split, ctsMs=0 produces the same wire layout as if the
+// CodedFramesX form had been used (modulo the extra 3 zero bytes),
+// which is the correct semantic: PTS == DTS.
+func buildExVideoCodedFramesTag(fourCC string, isKey bool, ctsMs int32, accessUnit []byte) []byte {
+	out := make([]byte, 8+len(accessUnit))
+	out[0] = exVideoHeaderByte(isKey, flvExVideoPacketCodedFrames)
+	copy(out[1:5], []byte(fourCC))
+	encodeSignedInt24BE(out[5:8], ctsMs)
+	copy(out[8:], accessUnit)
 	return out
 }
 

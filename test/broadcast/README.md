@@ -55,13 +55,18 @@ VIDEO_CODEC=av1 make verify-broadcast
 make verify-broadcast-avflow
 ```
 
-> Note: `VIDEO_CODEC=vp8` and `VIDEO_CODEC=h265` are recognised by the
-> publisher path (whipsim publishes VP8 ingest into the SFU; the
-> H.265 ingress requires a future pion-based bypass that does not yet
-> ship), but `verify.sh` creates RTMP-only destinations, so VP8 will
-> deliberately fail at `Broadcast.Start` with
-> `broadcast: VP8 cannot be pushed to RTMP destinations`. The
-> rejection is exercised by `pkg/broadcast.TestValidateDestinationsForCodec`.
+> Note: `VIDEO_CODEC=vp8` is recognised by the publisher path (whipsim
+> publishes VP8 ingest into the SFU) but `verify.sh` creates RTMP-only
+> destinations, so VP8 will deliberately fail at `Broadcast.Start` with
+> `broadcast: VP8 cannot be pushed to RTMP destinations`. The rejection
+> is exercised by `pkg/broadcast.TestValidateDestinationsForCodec`.
+>
+> H.265 ingest does **not** flow through `verify.sh` — `ffmpeg -f whip`
+> only speaks H.264 — but the codec is supported end-to-end by the
+> `attachMixH265Bypass` path (avflow → axonkit pion bypass → E-RTMP
+> `hvc1`). Coverage lives in `pkg/broadcast.TestH265MixSourceEndToEnd`,
+> which drives a pion publisher posting an H.265 SDP offer and asserts
+> the depacketized samples + raw RTP both reach the switcher pipeline.
 
 A successful run ends with:
 

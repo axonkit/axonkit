@@ -86,6 +86,31 @@ type rtmpPusher struct {
 	videoSeqBody   []byte
 	videoSeqFourCC string // "" for classic AVC, fourCC (e.g. "vp09") for E-RTMP
 
+	// videoReorder rebuilds the FLV (DTS, CTS) pair from a stream of
+	// PTS-only H.264 / H.265 access units. SFU producers typically
+	// disable B-frames so the buffer adds no latency in steady
+	// state, but an RTMP-ingest live source forwarded through here
+	// can carry B-frames whose PTS sequence in arrival order is
+	// non-monotonic; without the reorder the recipient's MP4 would
+	// have PTS == DTS over a B-frame bitstream and play frames in
+	// decode order.
+	//
+	// The buffer is codec-agnostic: it operates on MediaSample
+	// timestamps and lets enqueueVideoReorderEmit fan out to the
+	// codec-specific FLV builder (classic AVC tag for H.264, E-RTMP
+	// CodedFrames+SI24 tag for H.265).
+	//
+	// Nil when the destination opts out of reorder (see
+	// rtmpPusherOptions.DTSReorder); WriteSample then takes the
+	// direct path that maps PTS → DTS and writes CTS=0.
+	//
+	// Access is single-producer (mediasoup OnRtp callbacks are
+	// serialized per-consumer) but Stop runs from a different
+	// goroutine when it drains the trailing window, so we guard with
+	// a tiny mutex rather than reach for a lock-free queue.
+	videoReorderMu sync.Mutex
+	videoReorder   *dtsReorder
+
 	done chan struct{}
 }
 
@@ -95,10 +120,28 @@ const (
 	rtmpMaxRetries       = 5
 )
 
+// rtmpPusherOptions are the per-destination knobs newRTMPPusher
+// accepts. The zero value (DTSReorderMode = DTSReorderAuto) matches
+// the public Destination default — callers feeding from a Destination
+// should always go through Destination.DTSReorderMode rather than
+// hand-rolling the field.
+type rtmpPusherOptions struct {
+	// DTSReorderMode picks the (DTS, CTS) reconstruction policy
+	// applied to H.264 and H.265 video samples. See
+	// Destination.DTSReorder for semantics:
+	//
+	//   DTSReorderAuto   — buffered warm-up, adapt to passthrough
+	//                      when the input proves B-frame-free.
+	//   DTSReorderAlways — pin buffered, never adapt.
+	//   DTSReorderNever  — skip the buffer entirely; samples are
+	//                      written straight through with CTS=0.
+	DTSReorderMode DTSReorderMode
+}
+
 // newRTMPPusher constructs a pusher but does NOT open the connection.
 // Start must be called before the first WriteSample; WriteSample is a
 // no-op when the pusher is not started.
-func newRTMPPusher(destURL string, logger *slog.Logger) (*rtmpPusher, error) {
+func newRTMPPusher(destURL string, logger *slog.Logger, opts rtmpPusherOptions) (*rtmpPusher, error) {
 	parsed, err := parseRTMPURL(destURL)
 	if err != nil {
 		return nil, fmt.Errorf("rtmp url: %w", err)
@@ -106,13 +149,46 @@ func newRTMPPusher(destURL string, logger *slog.Logger) (*rtmpPusher, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &rtmpPusher{
+	p := &rtmpPusher{
 		url:    destURL,
 		parsed: parsed,
-		logger: logger.With("sink", "rtmp", "url", destURL),
-		queue:  make(chan *rtmpFrame, rtmpPusherQueueDepth),
-		done:   make(chan struct{}),
-	}, nil
+		logger: logger.With("sink", "rtmp", "url", destURL,
+			"dts_reorder", reorderModeLabel(opts.DTSReorderMode)),
+		queue: make(chan *rtmpFrame, rtmpPusherQueueDepth),
+		done:  make(chan struct{}),
+	}
+	switch opts.DTSReorderMode {
+	case DTSReorderNever:
+		// videoReorder stays nil — WriteSample takes the direct
+		// path and the rest of the buffer machinery is skipped.
+	case DTSReorderAlways:
+		p.videoReorder = newDTSReorderMode(dtsReorderWindow, dtsReorderModeAlways)
+	default:
+		// DTSReorderAuto and any future value default to the
+		// adaptive buffered-then-passthrough mode.
+		p.videoReorder = newDTSReorderMode(dtsReorderWindow, dtsReorderModeAuto)
+	}
+	if p.videoReorder != nil {
+		// Hand the per-destination logger to the buffer so its
+		// state-transition Info lines (buffered↔passthrough) carry
+		// the same sink/url/dts_reorder fields as the rest of the
+		// egress logs.
+		p.videoReorder.SetLogger(p.logger)
+	}
+	return p, nil
+}
+
+// reorderModeLabel renders a DTSReorderMode for the structured logger,
+// keeping the value space stable for log scrapers.
+func reorderModeLabel(m DTSReorderMode) string {
+	switch m {
+	case DTSReorderAlways:
+		return "always"
+	case DTSReorderNever:
+		return "never"
+	default:
+		return "auto"
+	}
 }
 
 // Start launches the background connect/publish/send loop. Safe to
@@ -138,8 +214,29 @@ func (p *rtmpPusher) Stop() {
 		return
 	default:
 	}
+	// Flush the trailing window of the H.264 reorder buffer first so
+	// the recipient's recording does not lose the last ~100 ms of
+	// frames simply because the publisher disconnected. Drain runs
+	// before close(p.queue) so the emits land in the same FIFO that
+	// pump is still draining.
+	p.flushVideoReorder()
 	close(p.queue)
 	<-p.done
+}
+
+// flushVideoReorder pops every remaining sample out of the H.264 /
+// H.265 reorder buffer and enqueues them as FLV tags. Safe to call
+// any number of times; later calls find an empty queue and do nothing.
+func (p *rtmpPusher) flushVideoReorder() {
+	if p.videoReorder == nil {
+		return
+	}
+	p.videoReorderMu.Lock()
+	emits := p.videoReorder.Drain()
+	p.videoReorderMu.Unlock()
+	for _, e := range emits {
+		p.enqueueVideoReorderEmit(e)
+	}
 }
 
 // BytesOut returns the approximate number of FLV body bytes sent so
@@ -245,18 +342,36 @@ func (p *rtmpPusher) ResetVideoHeader() { p.videoHdrSent.Store(false) }
 // for send. Drops the sample (with a counter bump) if the send queue
 // is full — this preserves hot-path latency under back-pressure, which
 // matters more than occasional late A/V for live broadcast.
+//
+// H.264 and H.265 video samples normally take a detour through
+// dtsReorder so that publishers using B-frames produce a recording
+// with proper display order. Destinations that opt out
+// (Destination.DTSReorder = false) leave p.videoReorder nil; their
+// samples go straight out with CTS=0, which is correct only when the
+// upstream encoder is guaranteed not to use B-frames. Everything else
+// (audio, VP9/AV1 carried via CodedFramesX) is muxed and enqueued
+// inline regardless of the toggle.
 func (p *rtmpPusher) WriteSample(s MediaSample) {
-	ts := p.timestampMs(s)
+	if s.Kind == SampleKindVideo && (s.Codec == CodecH264 || s.Codec == CodecH265) {
+		if p.videoReorder == nil {
+			p.enqueueVideoDirect(s)
+			return
+		}
+		p.videoReorderMu.Lock()
+		emits := p.videoReorder.Push(s)
+		p.videoReorderMu.Unlock()
+		for _, emit := range emits {
+			p.enqueueVideoReorderEmit(emit)
+		}
+		return
+	}
+	ts := p.timestampMs(s.Kind, s.RTPTimestamp)
 	var body []byte
 	switch s.Codec {
-	case CodecH264:
-		body = buildAVCFrameTag(s.IsKeyFrame, s.Data)
 	case CodecVP9:
 		body = buildExVideoFrameTag(flvExVideoFourCCVP9, s.IsKeyFrame, s.Data)
 	case CodecAV1:
 		body = buildExVideoFrameTag(flvExVideoFourCCAV1, s.IsKeyFrame, s.Data)
-	case CodecH265:
-		body = buildExVideoFrameTag(flvExVideoFourCCH265, s.IsKeyFrame, s.Data)
 	case CodecOpus:
 		body = buildOpusFrameTag(s.Data)
 	default:
@@ -268,6 +383,55 @@ func (p *rtmpPusher) WriteSample(s MediaSample) {
 		return
 	}
 	p.enqueue(&rtmpFrame{kind: s.Kind, timestampMs: ts, body: body})
+}
+
+// enqueueVideoDirect builds the FLV tag for an H.264 / H.265 sample
+// in the no-reorder direct path (Destination.DTSReorder = false), where
+// PTS maps straight to DTS and CTS is fixed at 0. Lives next to the
+// reorder-emit helper so the two paths share the codec dispatch.
+func (p *rtmpPusher) enqueueVideoDirect(s MediaSample) {
+	ts := p.timestampMs(SampleKindVideo, s.RTPTimestamp)
+	body := buildVideoFrameTagForCodec(s.Codec, s.IsKeyFrame, 0, s.Data)
+	if body == nil {
+		return
+	}
+	p.enqueue(&rtmpFrame{kind: SampleKindVideo, timestampMs: ts, body: body})
+}
+
+// enqueueVideoReorderEmit muxes one (sample, dts, cts) triple coming
+// out of the reorder buffer into the codec-appropriate FLV video tag
+// and enqueues it. The FLV tag timestamp is the DTS in the per-stream
+// millisecond clock; the embedded CTS field carries the original
+// (PTS - DTS) skew. H.264 lands on the classic AVC tag layout; H.265
+// lands on the Enhanced-RTMP CodedFrames (PacketType=1) tag, both of
+// which carry an SI24 CTS field in the same position semantically.
+//
+// No per-frame log line: the only events that change observable
+// behavior are the buffered↔passthrough flips, which dtsReorder
+// reports at Info on the same logger.
+func (p *rtmpPusher) enqueueVideoReorderEmit(e dtsReorderEmit) {
+	ts := p.timestampMs(SampleKindVideo, e.dts90k)
+	body := buildVideoFrameTagForCodec(e.sample.Codec, e.sample.IsKeyFrame, e.ctsMs, e.sample.Data)
+	if body == nil {
+		return
+	}
+	p.enqueue(&rtmpFrame{kind: SampleKindVideo, timestampMs: ts, body: body})
+}
+
+// buildVideoFrameTagForCodec dispatches H.264 / H.265 to the right FLV
+// tag builder. Returns nil for any codec that should not reach the
+// reorder/direct video path — callers treat nil as a silent drop, so a
+// future codec addition fails loud at WriteSample's switch rather
+// than corrupting the stream here.
+func buildVideoFrameTagForCodec(codec Codec, isKey bool, ctsMs int32, data []byte) []byte {
+	switch codec {
+	case CodecH264:
+		return buildAVCFrameTag(isKey, ctsMs, data)
+	case CodecH265:
+		return buildExVideoCodedFramesTag(flvExVideoFourCCH265, isKey, ctsMs, data)
+	default:
+		return nil
+	}
 }
 
 // enqueue pushes one frame onto the queue or drops it (with a log) if
@@ -285,12 +449,15 @@ func (p *rtmpPusher) enqueue(f *rtmpFrame) {
 	}
 }
 
-// timestampMs converts a sample's RTP timestamp into FLV-tag milliseconds,
-// using the first observed sample of that kind as zero.
-func (p *rtmpPusher) timestampMs(s MediaSample) uint32 {
+// timestampMs converts a source-clock timestamp into FLV-tag
+// milliseconds, using the first observed value on the given kind as
+// zero. ts is in the kind's native clock domain (90 kHz for video,
+// 48 kHz for audio). The function is split so the reorder buffer
+// can pass the derived DTS instead of the sample's PTS.
+func (p *rtmpPusher) timestampMs(kind SampleKind, ts uint32) uint32 {
 	var startSlot *atomic.Uint64
 	var clockHz uint32
-	switch s.Kind {
+	switch kind {
 	case SampleKindVideo:
 		startSlot = &p.videoStart
 		clockHz = 90000
@@ -303,13 +470,13 @@ func (p *rtmpPusher) timestampMs(s MediaSample) uint32 {
 	existing := startSlot.Load()
 	if existing == 0 {
 		// Store "set" flag in high bit so zero can be sentinel.
-		startSlot.CompareAndSwap(0, uint64(1)<<32|uint64(s.RTPTimestamp))
+		startSlot.CompareAndSwap(0, uint64(1)<<32|uint64(ts))
 		existing = startSlot.Load()
 	}
 	start := uint32(existing & 0xFFFFFFFF)
 	// Unsigned subtraction handles RTP-timestamp wraparound
 	// correctly for the 32-bit field.
-	delta := s.RTPTimestamp - start
+	delta := ts - start
 	return uint32(uint64(delta) * 1000 / uint64(clockHz))
 }
 

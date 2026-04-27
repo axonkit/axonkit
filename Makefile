@@ -2,7 +2,7 @@ MODULE   := github.com/axonkit/axonkit
 BINARY   := axonkit
 CMD_DIR  := ./cmd/axonkit
 
-.PHONY: all build run test lint fmt vet tidy clean verify-broadcast verify-broadcast-avflow
+.PHONY: all build run test lint fmt vet tidy clean verify-broadcast verify-broadcast-avflow verify-broadcast-rtmp
 
 all: fmt lint build
 
@@ -50,3 +50,12 @@ verify-broadcast:
 # test/broadcast/out/avflow-<timestamp>/.
 verify-broadcast-avflow:
 	./test/broadcast/verify-avflow.sh
+
+# verify-broadcast-rtmp pushes an H.264-with-B-frames + Opus stream to
+# axonkit over RTMP, fans it out through /rtc/broadcast to a local
+# ffmpeg RTMP recorder, and asserts the recorded MP4 decodes without
+# errors. Exercises the RTMP ingest path (-rtmp-listen), the FLV
+# B-frame composition-time handling, and the Enhanced-RTMP "Opus"
+# audio FourCC. Artefacts land in test/broadcast/out/rtmp-<timestamp>/.
+verify-broadcast-rtmp:
+	./test/broadcast/verify-rtmp.sh

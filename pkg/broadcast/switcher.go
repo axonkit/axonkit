@@ -32,58 +32,91 @@ const defaultAudioTick = 960
 const defaultVideoTick = 3000
 
 // rebaser turns a noisy per-source RTP-clock into a continuous output
-// clock. It is not thread-safe — the switcher serializes access by
-// delivering audio and video on separate goroutines (one consumer per
-// kind) and holding no lock between rebase and emit.
+// clock that preserves the input clock's intra-source PTS shape —
+// crucially including the per-frame backward steps a B-frame source
+// produces. The rebaser anchors each source's first sample at a
+// monotonically-advancing output base and emits everything else as
+// `outBase + (inTS - srcBase)` (signed delta). The hwm running
+// maximum of all outputs is what advances on a source flip so the new
+// source's first sample lands above every value the old source ever
+// emitted, while the within-source PTS reordering is left untouched
+// for downstream dts-reorder logic to recover the (DTS, CTS) pair.
+//
+// Not thread-safe — the switcher serializes access by delivering audio
+// and video on separate goroutines (one consumer per kind) and holding
+// no lock between rebase and emit.
 type rebaser struct {
+	// initialized is true once the rebaser has seen any sample at
+	// all. Distinct from hasBase so the very first sample produces
+	// output 0 instead of catchup.
+	initialized bool
 	// hasBase indicates the current source has contributed at least
 	// one sample under this rebaser; used to distinguish the "first
 	// sample after a source flip" from the steady state.
 	hasBase bool
 	// srcBase is the in-TS of the current source's first sample
-	// since the last flip. Set on the first call after a flip, used
-	// to compute deltas thereafter.
+	// since the last flip. NOT updated on every frame — only on the
+	// initial sample of a source — so the signed delta below
+	// (inTS - srcBase) preserves intra-source PTS reordering.
 	srcBase uint32
-	// outLast is the last TS we emitted to the pushers, in the
-	// continuous output clock. Preserved across source flips so the
-	// new source picks up where the old one left off.
-	outLast uint32
-	// outInitialized gates the outLast initialisation. Zero is a
-	// legitimate TS so we cannot rely on it as a sentinel.
-	outInitialized bool
-	// catchup is the tick count applied to outLast when a new
-	// source's first sample arrives. Audio uses 960, video 3000.
+	// outBase is the output TS that corresponds to srcBase (i.e. the
+	// output emitted on the source's very first sample). Set on
+	// init / source flip; constant across the rest of that source.
+	outBase uint32
+	// hwm is the modular running maximum of all outputs ever
+	// emitted. catchup is applied to hwm — never to a possibly
+	// out-of-order outBase + sdelta — so a source flip lands
+	// strictly above every previously emitted timestamp even if the
+	// last sample of the prior source was a B-frame whose output
+	// was below the local high-water mark.
+	hwm uint32
+	// catchup is the tick count added on top of hwm when a new
+	// source's first sample arrives. Audio uses 960 (one Opus
+	// ptime), video 3000 (~33 ms at 90 kHz).
 	catchup uint32
 }
 
-// rewrite returns the output TS for an incoming sample. Monotonically
-// non-decreasing inside a given source, and guaranteed to advance
-// across source flips so no push-side receiver sees the clock "rewind".
+// rewrite returns the output TS for an incoming sample. Output is
+// monotonic *across* source flips (driven by hwm + catchup) but is
+// allowed to step backwards *within* a source whenever the input PTS
+// does — exactly the case for an H.264 B-frame whose presentation
+// timestamp precedes the prior P-frame in arrival order. The previous
+// implementation collapsed this into a strictly-monotonic sequence by
+// treating any backward delta as 32-bit wraparound, which silently
+// erased the CompositionTime offset the egress dts-reorder buffer
+// needs to rebuild a playable recording.
 func (r *rebaser) rewrite(inTS uint32) uint32 {
-	if !r.outInitialized {
-		r.outInitialized = true
+	if !r.initialized {
+		r.initialized = true
 		r.hasBase = true
 		r.srcBase = inTS
-		r.outLast = 0
+		r.outBase = 0
+		r.hwm = 0
 		return 0
 	}
 	if !r.hasBase {
 		r.hasBase = true
 		r.srcBase = inTS
-		r.outLast += r.catchup
-		return r.outLast
+		// catchup is applied to hwm, not outBase, so the new
+		// source starts strictly above the old source's furthest
+		// emitted timestamp regardless of where outBase + sdelta
+		// landed on the prior source's last sample.
+		r.outBase = r.hwm + r.catchup
+		r.hwm = r.outBase
+		return r.outBase
 	}
-	delta := inTS - r.srcBase // unsigned so it wraps correctly
-	out := r.outLast + delta
-	if out < r.outLast {
-		// wraparound inside a single source; bounce srcBase so
-		// the next delta starts from here.
-		r.srcBase = inTS
-		r.outLast += r.catchup
-		return r.outLast
+	// Signed delta from this source's anchor. For the canonical
+	// IBPBP… mediasoup feed the anchor is the source's first IDR,
+	// so all subsequent samples have inTS >= srcBase by construction
+	// (every GOP sample's PTS lies inside or after the IDR). B-frame
+	// reorder shows up as sdelta moving backwards relative to the
+	// prior sample but never crossing zero.
+	sdelta := int32(inTS - r.srcBase) //nolint:gosec // intentional uint32→int32 modular cast
+	out := uint32(int64(r.outBase) + int64(sdelta))
+	// Modular comparison so wraparound past 2^32 is handled too.
+	if int32(out-r.hwm) > 0 {
+		r.hwm = out
 	}
-	r.outLast = out
-	r.srcBase = inTS
 	return out
 }
 

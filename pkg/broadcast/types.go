@@ -29,6 +29,74 @@ const (
 type Destination struct {
 	Type DestinationType `json:"type"`
 	URL  string          `json:"url"`
+
+	// DTSReorder controls the (DTS, CTS) reconstruction buffer on
+	// the egress side of this destination, applied to H.264 and
+	// H.265 video samples. Pointer-typed so the JSON form
+	// distinguishes the three usable settings:
+	//
+	//   nil    → auto (default).
+	//   true   → always reorder.
+	//   false  → always direct (no buffer; CTS=0 + PTS→DTS).
+	//
+	// In auto mode the egress starts in reorder-buffer mode and
+	// monitors the input PTS sequence: once it has emitted enough
+	// consecutive frames whose CTS came out as zero (i.e. the head
+	// of the lookahead window was already the smallest PTS in the
+	// window — the canonical "no reorder happening" signal), it
+	// flips to direct passthrough so latency-sensitive pipelines do
+	// not pay the buffering tax. If a later PTS regression is
+	// observed the egress flips back into buffered mode at one
+	// frame of jitter cost.
+	//
+	// Set to true to pin reorder on regardless of observed input
+	// (useful for recording pipelines where ~133 ms of buffering
+	// is fine and you want to avoid the rare flip-back jitter).
+	// Set to false to pin it off when the upstream is guaranteed
+	// B-frame-free (typical for WebRTC SFU producers and avflow
+	// mixes) and you want zero buffer latency.
+	//
+	// Has no effect on VP9 / AV1 destinations: those codecs travel
+	// through the Enhanced-RTMP CodedFramesX tag, which has no
+	// CompositionTime field, so the egress always passes them
+	// through unchanged regardless of this setting. H.265 uses the
+	// CodedFrames (PacketType=1) tag with an SI24 CTS field, the
+	// HEVC analog of the classic AVC tag — same reorder policy
+	// applies.
+	DTSReorder *bool `json:"dts_reorder,omitempty"`
+}
+
+// DTSReorderMode encodes the resolved (post-default) reorder policy
+// for an outbound destination. Used by the pusher to wire the right
+// shape of dtsReorder buffer.
+type DTSReorderMode uint8
+
+const (
+	// DTSReorderAuto starts in buffered mode and adapts based on
+	// the observed PTS sequence: switches to direct passthrough
+	// after a stable streak of zero-CTS emits, and switches back
+	// when a PTS regression is detected.
+	DTSReorderAuto DTSReorderMode = iota
+	// DTSReorderAlways pins the buffer on for the lifetime of the
+	// pusher.
+	DTSReorderAlways
+	// DTSReorderNever skips the buffer entirely; H.264 / H.265
+	// samples are muxed straight through with CTS=0.
+	DTSReorderNever
+)
+
+// DTSReorderMode returns the effective reorder policy for d, applying
+// the documented default ("absent → auto"). Centralized so call sites
+// in the pusher / manager / tests cannot accidentally disagree about
+// what nil means.
+func (d Destination) DTSReorderMode() DTSReorderMode {
+	if d.DTSReorder == nil {
+		return DTSReorderAuto
+	}
+	if *d.DTSReorder {
+		return DTSReorderAlways
+	}
+	return DTSReorderNever
 }
 
 // SourceKind names the active forwarding source inside the Switcher.

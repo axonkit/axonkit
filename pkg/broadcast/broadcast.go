@@ -337,7 +337,9 @@ func (b *Broadcast) buildPushers() ([]destinationPusher, error) {
 		switch d.Type {
 		case DestinationRTMP:
 			var rp *rtmpPusher
-			rp, err = newRTMPPusher(d.URL, b.logger.With("dst", d.URL))
+			rp, err = newRTMPPusher(d.URL, b.logger.With("dst", d.URL), rtmpPusherOptions{
+				DTSReorderMode: d.DTSReorderMode(),
+			})
 			if err == nil {
 				pp = &rtmpPusherAdapter{inner: rp}
 			}

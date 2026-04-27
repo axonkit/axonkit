@@ -9,9 +9,22 @@ import (
 // calling Start, so enqueue just appends to the internal channel and
 // tests can assert on what was produced. The channel is sized like the
 // production default so a burst of enqueues doesn't block.
+//
+// DTSReorderMode defaults to "always" (pin buffered) so tests that
+// only care about the seq-header / muxing logic don't accidentally
+// trip the auto-mode passthrough flip after dtsReorderAutoStableFrames
+// trivial emits. Tests that exercise specific modes go through
+// newTestPusherOpts.
 func newTestPusher(t *testing.T) *rtmpPusher {
 	t.Helper()
-	p, err := newRTMPPusher("rtmp://localhost/app/stream", nil)
+	return newTestPusherOpts(t, rtmpPusherOptions{DTSReorderMode: DTSReorderAlways})
+}
+
+// newTestPusherOpts is the option-bearing variant for tests that
+// need to flip knobs (currently only DTSReorderMode).
+func newTestPusherOpts(t *testing.T, opts rtmpPusherOptions) *rtmpPusher {
+	t.Helper()
+	p, err := newRTMPPusher("rtmp://localhost/app/stream", nil, opts)
 	if err != nil {
 		t.Fatalf("newRTMPPusher: %v", err)
 	}
@@ -154,3 +167,253 @@ func TestEnsureExVideoSeqHeader_EmitOnFourCCChange(t *testing.T) {
 		t.Fatalf("expected 2 SeqHeader tags on FourCC change, got %d", len(seqBodies))
 	}
 }
+
+// TestDestinationDTSReorderModeDefault pins the public helper's
+// "absent → auto, true → always, false → never" mapping. Other code
+// in this package (and any API client doing pre-flight validation)
+// reads this value, so an accidental remap would silently change
+// behavior for every existing caller.
+func TestDestinationDTSReorderModeDefault(t *testing.T) {
+	cases := []struct {
+		name string
+		val  *bool
+		want DTSReorderMode
+	}{
+		{"nil-default", nil, DTSReorderAuto},
+		{"explicit-true", boolPtr(true), DTSReorderAlways},
+		{"explicit-false", boolPtr(false), DTSReorderNever},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			d := Destination{Type: DestinationRTMP, URL: "rtmp://x/y", DTSReorder: c.val}
+			if got := d.DTSReorderMode(); got != c.want {
+				t.Fatalf("DTSReorderMode = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestWriteSampleH264_DTSReorderNever exercises the direct egress
+// path: every H.264 sample lands in the queue immediately (no window
+// delay), the AVC tag has CTS=0, and the FLV tag DTS equals the
+// sample's RTP timestamp expressed in milliseconds-from-first.
+//
+// This is the steady-state path operators get when they pin
+// DTSReorder=false on a destination — it must avoid the reorder
+// buffer entirely so latency-sensitive pipelines feeding
+// B-frame-free encoders don't pay the buffering tax.
+func TestWriteSampleH264_DTSReorderNever(t *testing.T) {
+	p := newTestPusherOpts(t, rtmpPusherOptions{DTSReorderMode: DTSReorderNever})
+	defer close(p.queue)
+
+	if p.videoReorder != nil {
+		t.Fatalf("videoReorder should be nil when DTSReorderMode=Never")
+	}
+
+	// Push three frames at 90 kHz: 0 ms, 33 ms, 67 ms. Decode order
+	// matches presentation order (no B-frames, the reason callers
+	// disable reorder).
+	samples := []MediaSample{
+		{Kind: SampleKindVideo, Codec: CodecH264, RTPTimestamp: 0, IsKeyFrame: true, Data: []byte{0xAA}},
+		{Kind: SampleKindVideo, Codec: CodecH264, RTPTimestamp: 2970, IsKeyFrame: false, Data: []byte{0xBB}},
+		{Kind: SampleKindVideo, Codec: CodecH264, RTPTimestamp: 6030, IsKeyFrame: false, Data: []byte{0xCC}},
+	}
+	for _, s := range samples {
+		p.WriteSample(s)
+	}
+
+	wantTSMs := []uint32{0, 33, 67}
+	for i := range samples {
+		select {
+		case f := <-p.queue:
+			if f.kind != SampleKindVideo {
+				t.Fatalf("frame %d: kind = %v, want video", i, f.kind)
+			}
+			if got := f.timestampMs; got != wantTSMs[i] {
+				t.Fatalf("frame %d: timestampMs = %d, want %d (PTS→DTS direct map)", i, got, wantTSMs[i])
+			}
+			// FLV AVC NALU body layout: [0]=FrameType|CodecID,
+			// [1]=AVCPacketType, [2..5)=CTS SI24 BE.
+			if f.body[1] != flvAVCPacketTypeNALU {
+				t.Fatalf("frame %d: AVCPacketType = %#x, want NALU(%#x)", i, f.body[1], flvAVCPacketTypeNALU)
+			}
+			cts := int32(uint32(f.body[2])<<16 | uint32(f.body[3])<<8 | uint32(f.body[4]))
+			if cts != 0 {
+				t.Fatalf("frame %d: CTS = %d, want 0 (no reorder)", i, cts)
+			}
+		default:
+			t.Fatalf("frame %d: queue empty, expected immediate emit (no window delay)", i)
+		}
+	}
+
+	// No trailing tags should remain — the direct path emits
+	// exactly one tag per WriteSample.
+	select {
+	case f := <-p.queue:
+		t.Fatalf("unexpected extra frame in queue: kind=%v body=%v", f.kind, f.body)
+	default:
+	}
+}
+
+// TestWriteSampleH264_DTSReorderAlwaysBuffersWindow guards the
+// "always" mode: the default operator-pinned reorder must absorb the
+// first `dtsReorderWindow` samples before emitting anything. Tests in
+// dts_reorder_test.go already cover the algorithm itself; this one
+// just makes sure newRTMPPusher actually wires the buffer in when
+// the mode is Always.
+func TestWriteSampleH264_DTSReorderAlwaysBuffersWindow(t *testing.T) {
+	p := newTestPusherOpts(t, rtmpPusherOptions{DTSReorderMode: DTSReorderAlways})
+	defer close(p.queue)
+
+	if p.videoReorder == nil {
+		t.Fatalf("videoReorder should be non-nil when DTSReorderMode=Always")
+	}
+
+	// Push exactly window samples — buffer is filling, no emits.
+	for i := 0; i < dtsReorderWindow; i++ {
+		p.WriteSample(MediaSample{
+			Kind:         SampleKindVideo,
+			Codec:        CodecH264,
+			RTPTimestamp: uint32(i) * 3000, //nolint:gosec // small bounded loop
+			IsKeyFrame:   i == 0,
+			Data:         []byte{byte(i)},
+		})
+	}
+	select {
+	case f := <-p.queue:
+		t.Fatalf("expected no frame after window samples, got kind=%v ts=%d", f.kind, f.timestampMs)
+	default:
+	}
+
+	// (window+1)-th sample pops the head.
+	p.WriteSample(MediaSample{
+		Kind: SampleKindVideo, Codec: CodecH264,
+		RTPTimestamp: uint32(dtsReorderWindow) * 3000, //nolint:gosec // small bounded value
+		Data:         []byte{0xFF},
+	})
+	select {
+	case f := <-p.queue:
+		if f.kind != SampleKindVideo {
+			t.Fatalf("first emit kind = %v, want video", f.kind)
+		}
+	default:
+		t.Fatalf("expected one emit after window+1 samples, queue empty")
+	}
+}
+
+// TestWriteSampleH265_DTSReorderNeverWritesCodedFrames mirrors the
+// H.264 direct-path test for HEVC. Egress must wrap each sample in
+// the Enhanced-RTMP CodedFrames (PacketType=1) tag with a SI24 CTS=0
+// field and a "hvc1" FourCC, and the FLV millisecond timestamp must
+// equal the per-stream PTS→ms mapping (no buffering). The wire layout
+// is what makes the recording side ffmpeg parse the HEVC stream the
+// same way it parses an AVC stream — getting the header byte wrong
+// would silently flip the recorder over to CodedFramesX.
+func TestWriteSampleH265_DTSReorderNeverWritesCodedFrames(t *testing.T) {
+	p := newTestPusherOpts(t, rtmpPusherOptions{DTSReorderMode: DTSReorderNever})
+	defer close(p.queue)
+
+	if p.videoReorder != nil {
+		t.Fatalf("videoReorder should be nil when DTSReorderMode=Never")
+	}
+
+	samples := []MediaSample{
+		{Kind: SampleKindVideo, Codec: CodecH265, RTPTimestamp: 0, IsKeyFrame: true, Data: []byte{0x40, 0x01}},
+		{Kind: SampleKindVideo, Codec: CodecH265, RTPTimestamp: 2970, IsKeyFrame: false, Data: []byte{0x42, 0x02}},
+		{Kind: SampleKindVideo, Codec: CodecH265, RTPTimestamp: 6030, IsKeyFrame: false, Data: []byte{0x42, 0x03}},
+	}
+	for _, s := range samples {
+		p.WriteSample(s)
+	}
+
+	wantTSMs := []uint32{0, 33, 67}
+	wantHeaderByte := []byte{0x91, 0xA1, 0xA1} // key|CodedFrames, inter|CodedFrames, inter|CodedFrames
+	for i, s := range samples {
+		select {
+		case f := <-p.queue:
+			if f.kind != SampleKindVideo {
+				t.Fatalf("frame %d: kind = %v, want video", i, f.kind)
+			}
+			if got := f.timestampMs; got != wantTSMs[i] {
+				t.Fatalf("frame %d: timestampMs = %d, want %d (PTS→DTS direct map)", i, got, wantTSMs[i])
+			}
+			if f.body[0] != wantHeaderByte[i] {
+				t.Fatalf("frame %d: header byte = 0x%02X, want 0x%02X", i, f.body[0], wantHeaderByte[i])
+			}
+			if string(f.body[1:5]) != flvExVideoFourCCH265 {
+				t.Fatalf("frame %d: FourCC = %q, want %q", i, string(f.body[1:5]), flvExVideoFourCCH265)
+			}
+			cts := int32(uint32(f.body[5])<<16 | uint32(f.body[6])<<8 | uint32(f.body[7]))
+			if cts != 0 {
+				t.Fatalf("frame %d: CTS = %d, want 0 (no reorder)", i, cts)
+			}
+			if !bytes.Equal(f.body[8:], s.Data) {
+				t.Fatalf("frame %d: payload mismatch", i)
+			}
+		default:
+			t.Fatalf("frame %d: queue empty, expected immediate emit (no window delay)", i)
+		}
+	}
+
+	select {
+	case f := <-p.queue:
+		t.Fatalf("unexpected extra frame in queue: kind=%v body=%v", f.kind, f.body)
+	default:
+	}
+}
+
+// TestWriteSampleH265_DTSReorderAlwaysBuffersWindow guards that the
+// reorder buffer is wired up for HEVC the same way it is for AVC:
+// pinned-Always mode must absorb the first dtsReorderWindow samples
+// before the first emit appears in the queue, regardless of codec.
+// dts_reorder_test.go covers the algorithm itself; this is the
+// codec-routing assertion.
+func TestWriteSampleH265_DTSReorderAlwaysBuffersWindow(t *testing.T) {
+	p := newTestPusherOpts(t, rtmpPusherOptions{DTSReorderMode: DTSReorderAlways})
+	defer close(p.queue)
+
+	if p.videoReorder == nil {
+		t.Fatalf("videoReorder should be non-nil when DTSReorderMode=Always")
+	}
+
+	for i := 0; i < dtsReorderWindow; i++ {
+		p.WriteSample(MediaSample{
+			Kind:         SampleKindVideo,
+			Codec:        CodecH265,
+			RTPTimestamp: uint32(i) * 3000, //nolint:gosec // small bounded loop
+			IsKeyFrame:   i == 0,
+			Data:         []byte{0x40, byte(i)},
+		})
+	}
+	select {
+	case f := <-p.queue:
+		t.Fatalf("expected no frame after window samples, got kind=%v ts=%d", f.kind, f.timestampMs)
+	default:
+	}
+
+	p.WriteSample(MediaSample{
+		Kind: SampleKindVideo, Codec: CodecH265,
+		RTPTimestamp: uint32(dtsReorderWindow) * 3000, //nolint:gosec // small bounded value
+		Data:         []byte{0x42, 0xFF},
+	})
+	select {
+	case f := <-p.queue:
+		if f.kind != SampleKindVideo {
+			t.Fatalf("first emit kind = %v, want video", f.kind)
+		}
+		// The first emit must use the HEVC CodedFrames layout, not
+		// the AVC layout — proves the codec branch survived the
+		// reorder buffer round trip.
+		if f.body[0]&0x80 == 0 {
+			t.Fatalf("first emit header byte = 0x%02X, want IsExHeader bit set (HEVC CodedFrames)", f.body[0])
+		}
+		if string(f.body[1:5]) != flvExVideoFourCCH265 {
+			t.Fatalf("first emit FourCC = %q, want %q", string(f.body[1:5]), flvExVideoFourCCH265)
+		}
+	default:
+		t.Fatalf("expected one emit after window+1 samples, queue empty")
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }

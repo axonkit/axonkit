@@ -106,6 +106,14 @@ type Session struct {
 	// without flooding stdout.
 	videoEmptyPacketize uint64
 
+	// videoBFramesLogged latches the one-shot Info log emitted on the
+	// first NALU tag whose CompositionTimeMs is non-zero. Operators
+	// looking at the structured logs care about "this stream uses
+	// B-frames" exactly once — every subsequent B-frame is implicit
+	// and visible downstream via the egress reorder/emit logs.
+	// Guarded by s.mu like the rest of IngestVideo state.
+	videoBFramesLogged bool
+
 	// idleTimeout is the maximum silence we tolerate between consecutive
 	// media tags before the watchdog fires closeConn. 0 disables the
 	// watchdog entirely.
@@ -312,7 +320,41 @@ func (s *Session) IngestVideo(ctx context.Context, timestampMs uint32, tag *Vide
 			return nil
 		}
 		s.trackStartTs(&s.video, timestampMs)
-		pts90k := convertMsToClock(timestampMs-s.video.StartTimestampMs, 90000)
+		// FLV's tag timestamp is DTS in milliseconds; CompositionTimeMs
+		// (24-bit signed) carries (PTS - DTS) and is non-zero whenever
+		// the publisher used B-frames. RFC 6184 §5.1 requires the H.264
+		// RTP timestamp to be the *sampling/presentation* time of the
+		// frame, so propagate PTS = DTS + CTS rather than the raw DTS.
+		// Stripping CTS here was the upstream cause of the broadcast
+		// recording showing frames in decode order (visible as the
+		// playback "jumping back" on every B-frame): mediasoup carries
+		// only one timestamp per packet, and once we collapse PTS into
+		// DTS the egress side has no way to tell the two apart again.
+		//
+		// TODO(rtmp-ingest): leading-B / open-GOP edge case. The first
+		// frame anchor (s.video.StartTimestampMs) is set from the IDR's
+		// DTS. If a leading B-frame arrives whose PTS sits below the
+		// IDR's DTS (CompositionTimeMs < 0 producing ptsMs < anchor),
+		// `ptsMs - anchor` underflows in uint32 and the convertMsToClock
+		// implementation breaks the modular arithmetic ((ms*90000)/1000
+		// is non-linear on huge ms), yielding an incorrect pts90k for
+		// that one frame. Two fixes possible:
+		//   1. anchor on first PTS (ptsMs) instead of first DTS, AND
+		//   2. rewrite convertMsToClock as `ms * (clock/1000)` (clock
+		//      is a multiple of 1000 in all callers), preserving
+		//      modular subtraction through the conversion.
+		// Real-world publishers (OBS, FFmpeg defaults) use closed-GOP
+		// → CTS ≥ 0 → never triggers, so deferring until we see a
+		// publisher that does open-GOP / B-pyramid leading-B.
+		ptsMs := timestampMs + uint32(tag.CompositionTimeMs) //nolint:gosec // intentional modular addition; CTS is small
+		pts90k := convertMsToClock(ptsMs-s.video.StartTimestampMs, 90000)
+		if tag.CompositionTimeMs != 0 && !s.videoBFramesLogged {
+			s.videoBFramesLogged = true
+			s.logger.Info("rtmp ingest detected B-frames",
+				"codec", s.videoCodec.String(),
+				"dts_ms", timestampMs, "cts_ms", tag.CompositionTimeMs,
+				"pts_ms", ptsMs, "isKey", tag.IsKeyFrame)
+		}
 		packets, err := s.videoPk.Packetize(pts90k, tag.IsKeyFrame, tag.Data)
 		if err != nil {
 			return fmt.Errorf("packetize %s: %w", s.videoCodec, err)

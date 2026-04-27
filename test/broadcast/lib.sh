@@ -32,6 +32,13 @@
 : "${DST_RTMP_PORT:=11935}"
 : "${ANNOUNCED_IP:=127.0.0.1}"
 
+# RTMP_LISTEN is the bind address axonkit's RTMP push ingest listens on
+# (matches `axonkit -rtmp-listen ...`). Empty disables ingest, which is
+# what verify.sh / verify-avflow.sh want — they only need the broadcast
+# RTMP egress path. verify-rtmp.sh sets this to ":<port>" so ffmpeg can
+# push a real H.264+Opus stream into the room.
+: "${RTMP_LISTEN:=}"
+
 # Publisher / broadcast codec. H.264 is the classic FLV path; VP9 / AV1
 # exercise the Enhanced-RTMP (E-RTMP) writer. Each codec pins the
 # ffmpeg encoder + the mediasoup capability negotiation on both the
@@ -195,13 +202,13 @@ lib_start_axonkit() {
     # external broker dependency. -nats-storedir pins JetStream to a
     # path inside STATE_DIR, otherwise the embedded server would
     # create a stray ./.data/ in the repo root.
-    echo "[axonkit] starting on :$HTTP_PORT (worker=$WORKER_BIN, embedded nats storedir=$NATS_STORE)"
+    echo "[axonkit] starting on :$HTTP_PORT rtmp-listen='$RTMP_LISTEN' (worker=$WORKER_BIN, embedded nats storedir=$NATS_STORE)"
     "$BIN_AXONKIT" \
         -nats "" \
         -nats-storedir "$NATS_STORE" \
         -port "$HTTP_PORT" \
         -worker "$WORKER_BIN" \
-        -rtmp-listen "" \
+        -rtmp-listen "$RTMP_LISTEN" \
         -api-key "$API_KEY" \
         -api-secret "$API_SECRET" \
         -webrtc-listen-ip "0.0.0.0" \
@@ -569,8 +576,15 @@ lib_delete_broadcast() {
 # Recorder teardown and FLV assembly.
 # ---------------------------------------------------------------------------
 lib_stop_publishers_and_recorder() {
+    # Guard against PID=0 (uninitialised) and PID=1 (init): bash's `kill 0`
+    # signals the script's own process group, which would silently kill
+    # the verify run mid-teardown. Variants that don't use the canonical
+    # two-publisher fixture (e.g. verify-rtmp.sh) leave PUB_A_PID/PUB_B_PID
+    # at their default 0; those skips are intentional.
     for pid in "$PUB_A_PID" "$PUB_B_PID"; do
-        kill -TERM "$pid" 2>/dev/null || true
+        if [[ "$pid" -gt 1 ]]; then
+            kill -TERM "$pid" 2>/dev/null || true
+        fi
     done
     sleep 2
     if [[ -f "$RECORDER_LOOP_PID_FILE" ]]; then
