@@ -25,23 +25,47 @@ import "log/slog"
 // screen shows them in *decode* order: frames jump back to pts=134
 // after pts=200, which is exactly the visual symptom users see.
 //
-// # Lookahead algorithm (buffered mode)
+// # Sorted-PTS-pop algorithm (buffered mode)
 //
-// dtsReorder buffers a sliding window of `window` arrivals, then on
-// every subsequent arrival pops the FIFO head and assigns it a DTS
-// equal to `min(head.PTS, min(rest of window))`. The CTS is the
-// (PTS - DTS) skew — 0 when the head's own PTS is the smallest in
-// the window (the canonical case for monotonic input or when the
-// head is the next frame in display order), positive when a later
-// B-frame in the lookahead is going to display before the head.
+// dtsReorder buffers a sliding window of `window` arrivals, alongside
+// a sortedPTS slice that mirrors the queue's contents in ascending
+// PTS order. On every arrival past the warm-up window the FIFO head
+// pops and is assigned `DTS = sortedPTS.pop_front()` — i.e. the
+// smallest PTS still buffered. This is the same rule mp4 muxers use
+// to derive DTS from PTS ("DTS[i in decode order] = sorted_pts[i]")
+// and it produces a strictly-monotonic, fps-equidistant DTS series
+// in steady state. The CTS is then `head.PTS - DTS` — 0 in the
+// canonical case where head is the next-to-display frame (head.PTS
+// == sortedPTS[0]), and positive whenever a later B-frame in the
+// window is going to display before the head.
 //
-// A strict-monotonicity guard nudges DTS forward by one tick when
-// two consecutive emits would land on the same DTS (which happens
-// when a B-frame's PTS equals an earlier P-frame's chosen DTS or on
-// 90 kHz / ms rounding edges). The CTS is then clamped to ≥ 0; the
-// resulting one-tick (~11 µs) presentation-jitter is well below
-// human-perceptible thresholds and avoids triggering FFmpeg's MP4
-// muxer's PTS<DTS reject path.
+// Two safety nets backstop the result:
+//
+//   - CTS-clamp: if sortedPTS[0] ends up greater than head.PTS (head
+//     is itself the smallest still-buffered PTS but the sort lookup
+//     happens to return a different equal-value entry, or the queue
+//     just lost its only future frame), DTS clamps down to head.PTS
+//     so CTS = PTS - DTS stays ≥ 0. FLV's CompositionTime field is
+//     signed SI24 so negative CTS is in-spec, but mainstream players
+//     (ffmpeg's flv demuxer included) treat it as unsigned, so we
+//     keep the existing CTS≥0 contract.
+//
+//   - Strict-monotonicity guard: when the candidate DTS would equal
+//     or precede lastDTS (typical at a P→B cluster boundary, where
+//     the next B-frame's PTS equals the P-frame's DTS we just
+//     emitted), nudge DTS forward by one ms-equivalent tick
+//     (dtsReorderGuardTicks=90 at 90 kHz) so the FLV tag's
+//     ms-truncated header stays strictly increasing. The CTS is
+//     clamped to 0 on the same emit. In steady state this fires
+//     once per cluster boundary at most — a single +1 ms slip per
+//     cluster, well below human-perceptible thresholds.
+//
+// The previous "lookahead-min" implementation chose `min(head.PTS,
+// rest of window)` for every emit; on an N-B-frame cluster that
+// pinned all N+1 emits to the same rawDTS and forced N consecutive
+// +1 ms guards, producing N-element 1 ms DTS clusters in the FLV
+// timestamp series. The sorted-pop rule yields at most one +1 ms
+// nudge per cluster boundary regardless of cluster size.
 //
 // # Adaptive auto mode
 //
@@ -105,11 +129,12 @@ const dtsReorderAutoStableFrames = 60
 // 90 (= 1 ms) so the FLV tag's millisecond timestamp field stays
 // strictly increasing after the (ticks*1000/90000) integer
 // truncation the egress applies. A +1-tick guard would collapse
-// three consecutive emits whose lookahead picked the same rawDTS
-// into a single FLV millisecond — manifesting as duplicate DTS
-// rows in any downstream MP4 mux and tripping ffmpeg's "reference
-// picture missing" decoder path on B-frames whose recovery key
-// frame is hidden behind the duplicate-DTS cluster.
+// emits onto the same FLV millisecond — manifesting as duplicate
+// DTS rows in any downstream MP4 mux and tripping ffmpeg's
+// "reference picture missing" decoder path on B-frames whose
+// recovery key frame is hidden behind the duplicate-DTS cluster.
+// With the sorted-PTS-pop algorithm the guard fires at most once
+// per cluster boundary in steady state.
 const dtsReorderGuardTicks = 90
 
 // dtsReorderMode is internal: the rtmpPusher selects one when it
@@ -125,6 +150,22 @@ const (
 type dtsReorder struct {
 	cap   int
 	queue []dtsReorderEntry
+
+	// sortedPTS holds the 90 kHz PTS of every sample currently in
+	// queue, kept in ascending order. Push appends one PTS via
+	// insertSorted; emit pops sortedPTS[0] as the next DTS candidate
+	// (i.e. "the smallest PTS still buffered"). This is the
+	// equivalent of mp4 muxer's "DTS[i in decode order] =
+	// sorted_pts[i]" rule and yields a strictly-monotonic, fps-
+	// equidistant DTS series for every steady-state B-frame cluster.
+	//
+	// Invariant: len(sortedPTS) == len(queue) at all times outside an
+	// in-progress emit() call.
+	//
+	// Comparison is modular (int32 signed delta) so a 47.7-hour 90 kHz
+	// wrap never confuses the sort — the buffer width is bounded at
+	// cap*frame_duration ≈ 133 ms, dwarfed by the wrap period.
+	sortedPTS []uint32
 
 	mode dtsReorderMode
 
@@ -180,10 +221,26 @@ func newDTSReorderMode(window int, mode dtsReorderMode) *dtsReorder {
 		window = 1
 	}
 	return &dtsReorder{
-		cap:   window,
-		queue: make([]dtsReorderEntry, 0, window+1),
-		mode:  mode,
+		cap:       window,
+		queue:     make([]dtsReorderEntry, 0, window+1),
+		sortedPTS: make([]uint32, 0, window+1),
+		mode:      mode,
 	}
+}
+
+// insertSorted places v at its ascending position inside r.sortedPTS,
+// using modular int32 comparison so a 90 kHz timestamp wrap (every
+// 47.7 h) does not corrupt the order. The slice stays small (≤ cap+1
+// entries, in practice 4–8) so the linear scan beats any binary-
+// search overhead.
+func (r *dtsReorder) insertSorted(v uint32) {
+	idx := 0
+	for idx < len(r.sortedPTS) && int32(r.sortedPTS[idx]-v) < 0 { //nolint:gosec // modular comparison
+		idx++
+	}
+	r.sortedPTS = append(r.sortedPTS, 0)
+	copy(r.sortedPTS[idx+1:], r.sortedPTS[idx:])
+	r.sortedPTS[idx] = v
 }
 
 // SetLogger attaches a structured logger used for the buffered↔
@@ -226,6 +283,7 @@ func (r *dtsReorder) Push(s MediaSample) []dtsReorderEmit {
 		r.passthrough = false
 		r.stableCount = 0
 		r.queue = append(r.queue, dtsReorderEntry{pts90k: s.RTPTimestamp, sample: s})
+		r.insertSorted(s.RTPTimestamp)
 		if r.logger != nil {
 			r.logger.Info("dts reorder switched back to buffered",
 				"reason", "pts_regression",
@@ -248,6 +306,7 @@ func (r *dtsReorder) Push(s MediaSample) []dtsReorderEmit {
 
 	// Buffered path.
 	r.queue = append(r.queue, dtsReorderEntry{pts90k: s.RTPTimestamp, sample: s})
+	r.insertSorted(s.RTPTimestamp)
 	if len(r.queue) <= r.cap {
 		return nil
 	}
@@ -296,32 +355,49 @@ func (r *dtsReorder) directEmit(s MediaSample) dtsReorderEmit {
 	return dtsReorderEmit{sample: s, dts90k: dts, ctsMs: 0}
 }
 
-// emit pops the FIFO head and computes its (DTS, CTS). DTS is the
-// minimum of head.PTS and any remaining buffered PTS — small enough
-// that head's frame can decode immediately, but never smaller than
-// the previous emit's DTS (monotonicity guard). CTS = PTS - DTS,
-// clamped at 0.
+// emit pops the FIFO head and computes its (DTS, CTS).
+//
+// Algorithm: the next DTS is the smallest PTS still buffered (i.e.
+// sortedPTS[0]). This is the same rule mp4 muxers use to derive DTS
+// from PTS — "DTS[i in decode order] = sorted_pts[i]" — and it
+// produces a strictly-monotonic, fps-equidistant DTS series in steady
+// state. Two safety nets guard the result:
+//
+//  1. CTS-clamp: if the popped sortedPTS[0] is greater than head.PTS
+//     (head ran out of "future" frames whose PTS could lend it a
+//     smaller DTS), clamp DTS down to head.PTS so CTS = PTS - DTS
+//     stays ≥ 0. FLV's CompositionTime field is signed SI24 so the
+//     protocol layer would in principle accept a negative CTS, but
+//     mainstream players (ffmpeg's flv demuxer included) treat the
+//     field as unsigned and present the resulting frames at the wrong
+//     time, so we keep the existing CTS≥0 contract.
+//
+//  2. Strict-monotonicity guard: if the candidate DTS is ≤ lastDTS
+//     (typical at a P→B cluster boundary, where the B-frame's PTS
+//     equals the P-frame's DTS we just emitted), nudge DTS forward by
+//     dtsReorderGuardTicks (=90 at 90 kHz, i.e. one FLV millisecond)
+//     so the FLV-tag-header's ms-truncated timestamp remains strictly
+//     increasing. This single +1ms nudge replaces the legacy
+//     "lookahead-min + N ms-guards per cluster" output, where N was
+//     the number of B-frames in the cluster. Steady state now sees
+//     at most one +1ms nudge per cluster boundary.
 //
 // In auto mode this also drives the stability counter that decides
 // when to flip into passthrough.
 func (r *dtsReorder) emit() dtsReorderEmit {
 	head := r.queue[0]
 	r.queue = r.queue[1:]
-	rawDTS := head.pts90k
-	for _, e := range r.queue {
-		if int32(e.pts90k-rawDTS) < 0 { //nolint:gosec // modular comparison
-			rawDTS = e.pts90k
-		}
-	}
+	rawDTS := r.sortedPTS[0]
+	r.sortedPTS = r.sortedPTS[1:]
+
 	dts := rawDTS
+	clampedToHead := false
+	if int32(dts-head.pts90k) > 0 { //nolint:gosec // modular comparison
+		dts = head.pts90k
+		clampedToHead = true
+	}
+
 	guardApplied := false
-	// Guard step is one millisecond (dtsReorderGuardTicks=90 at
-	// 90 kHz) instead of a single tick so the downstream FLV tag's
-	// integer-millisecond timestamp stays strictly monotonic after
-	// the (ticks*1000/90000) truncation. A 1-tick guard collapses
-	// three consecutive lookahead-tied emits into the same FLV ms
-	// — see dts_reorder_test.go's TestEmitsAreStrictlyMonotonicInMs
-	// for the regression we're protecting against here.
 	if r.haveLastDTS && int32(dts-r.lastDTS) < dtsReorderGuardTicks { //nolint:gosec // modular comparison
 		dts = r.lastDTS + dtsReorderGuardTicks
 		guardApplied = true
@@ -333,21 +409,22 @@ func (r *dtsReorder) emit() dtsReorderEmit {
 
 	ctsTicks := int32(head.pts90k - dts) //nolint:gosec // bounded by window span
 	if ctsTicks < 0 {
-		// Monotonicity nudge can push DTS past head.PTS by one tick
-		// on duplicated-PTS edge cases. Clamping yields PTS=DTS for
-		// that single frame — correct decode order with at most one
-		// tick (~11 µs) of presentation jitter.
+		// Guard nudge can push DTS past head.PTS by one ms tick on
+		// the cluster-boundary case described above. Clamping
+		// yields PTS=DTS for that single frame — correct decode
+		// order with at most one millisecond of presentation
+		// jitter, which mainstream players absorb without artifact.
 		ctsTicks = 0
 	}
 	ctsMs := ctsTicks * 1000 / 90000
 
-	// Auto mode bookkeeping: a "trivial" emit is one where the
-	// lookahead chose head's own PTS (head was already the smallest
-	// in the window) AND the monotonicity guard didn't have to
-	// nudge. Anything else means reorder is actively useful.
+	// Auto mode bookkeeping: a "trivial" emit is one where neither
+	// safety net fired AND the chosen DTS equals head's own PTS.
+	// That combination means the buffer found no out-of-order frame
+	// in the window, so reorder added no value for this sample.
 	// Already-passthrough emits stop counting (the counter is moot).
 	if r.mode == dtsReorderModeAuto && !r.passthrough {
-		trivial := !guardApplied && rawDTS == head.pts90k && ctsMs == 0
+		trivial := !guardApplied && !clampedToHead && rawDTS == head.pts90k && ctsMs == 0
 		if trivial {
 			r.stableCount++
 			if r.stableCount >= dtsReorderAutoStableFrames {

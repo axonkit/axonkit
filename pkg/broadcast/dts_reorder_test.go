@@ -218,6 +218,56 @@ func TestDTSReorderEmitsAreStrictlyMonotonicInMs(t *testing.T) {
 	}
 }
 
+// TestDTSReorderClusteredOneMsGuardPerBoundary is the explicit
+// regression test for the sorted-PTS-pop algorithm's headline
+// improvement: in a steady-state IBBP B-cluster stream the +1 ms
+// monotonicity guard fires at most once per cluster boundary
+// (the P→B transition where the next B-frame's PTS equals the
+// P-frame's just-emitted DTS). The legacy lookahead-min algorithm
+// fired the guard on every B-frame in the cluster, producing N
+// consecutive 1 ms FLV tags per N-B-frame cluster — the exact
+// "continuous 1 ms DTS" symptom users observed in seg-003.mp4.
+//
+// Replay the same IBBPBBB pattern as TestDTSReorderEmitsAreStrictly...
+// (3 four-frame clusters of I/P + 3 B-frames each) and count the
+// 1 ms-step deltas between consecutive emits. Must be ≤ #clusters.
+func TestDTSReorderClusteredOneMsGuardPerBoundary(t *testing.T) {
+	// 13 frames = 4 clusters (the leading I + 3 IBBP-shaped clusters).
+	// Each B-cluster has one P→B boundary that may trip the guard.
+	ptsMs := []uint32{0, 133, 67, 33, 100, 267, 200, 167, 233, 400, 333, 300, 367}
+	const clusters = 3 // boundaries where the guard may fire
+
+	r := newDTSReorder(dtsReorderWindow)
+	emits := make([]dtsReorderEmit, 0, len(ptsMs))
+	for _, ms := range ptsMs {
+		s := MediaSample{
+			Kind:         SampleKindVideo,
+			Codec:        CodecH264,
+			RTPTimestamp: ms * 90,
+		}
+		emits = append(emits, r.Push(s)...)
+	}
+	emits = append(emits, r.Drain()...)
+
+	const clockHz = 90000
+	guardSteps := 0
+	for i := 1; i < len(emits); i++ {
+		prev := uint64(emits[i-1].dts90k) * 1000 / clockHz
+		curr := uint64(emits[i].dts90k) * 1000 / clockHz
+		if curr-prev == 1 {
+			guardSteps++
+		}
+	}
+	if guardSteps > clusters {
+		dtsMsSeries := make([]uint64, len(emits))
+		for i, e := range emits {
+			dtsMsSeries[i] = uint64(e.dts90k) * 1000 / clockHz
+		}
+		t.Fatalf("1 ms-step guards = %d, want ≤ %d (one per cluster boundary). DTS ms series: %v",
+			guardSteps, clusters, dtsMsSeries)
+	}
+}
+
 // TestDTSReorderAutoFlipsToPassthroughOnMonotonic feeds the auto-mode
 // buffer enough strictly-monotonic frames to trip the stable-streak
 // counter, then asserts that the buffer (a) drains its residual
