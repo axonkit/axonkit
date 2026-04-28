@@ -92,12 +92,20 @@ type DestinationStatus struct {
 //   - VideoDepack: returns the video depacketizer the switcher consults
 //     to fetch the codec configuration record (avcC / vpcC / av1C /
 //     hvcC) when synthesizing RTMP SeqHeader on every flip.
+//   - VideoCodec: the negotiated mix video codec (CodecH264 / CodecH265
+//     / CodecVP9 / CodecAV1 / CodecVP8). Broadcast hands it to each
+//     destinationPusher's ResetVideoHeader on every flip-to-mix so a
+//     WHIP pusher whose current PeerConnection was negotiated against
+//     a different codec can tear down and re-handshake against the
+//     incoming one. The mediasoup mix path snapshots the codec at
+//     newMixSource time; the pion-bypass path is always CodecH265.
 //   - RestartIce: optional ICE restart triggered by PATCH /whip with
 //     If-Match: *. Implementations that do not support restart return
 //     a non-nil error — the HTTP layer turns that into a 4xx.
 type mixIngress interface {
 	Close()
 	VideoDepack() videoDepacketizer
+	VideoCodec() Codec
 	RestartIce() (etag string, err error)
 }
 
@@ -150,6 +158,16 @@ type Broadcast struct {
 	mix      mixIngress
 	pushers  []destinationPusher
 	switcher *switcher
+	// liveCodec is the codec the bound live producer publishes
+	// (CodecH264 most of the time, the others when the upstream
+	// negotiated VP9 / AV1 / VP8). Snapshotted once at Start and
+	// passed to each destinationPusher.ResetVideoHeader on every
+	// flip-to-live so WHIP destinations can detect a class change
+	// from a non-H.264 mix and re-negotiate their PeerConnection.
+	// RTMP destinations ignore the value (they re-derive from each
+	// keyframe's avcC/hvcC). Read under mu like every other field
+	// here.
+	liveCodec Codec
 }
 
 // New constructs a Broadcast but does NOT start any goroutines or
@@ -262,7 +280,7 @@ func (b *Broadcast) Start() error {
 		return err
 	}
 
-	pushers, err := b.buildPushers()
+	pushers, err := b.buildPushers(videoCodec)
 	if err != nil {
 		return err
 	}
@@ -273,6 +291,7 @@ func (b *Broadcast) Start() error {
 	}
 
 	b.pushers = pushers
+	b.liveCodec = videoCodec
 
 	// Switcher owns the live/mix fan-in. It is created in live-active
 	// state with empty extradata hooks; bindLive / bindMix wire those
@@ -327,7 +346,16 @@ func (b *Broadcast) Start() error {
 // now, connection in background); so any URL-level error surfaces to
 // the POST response rather than spinning up a broadcast that never
 // sends a byte.
-func (b *Broadcast) buildPushers() ([]destinationPusher, error) {
+//
+// initialVideoCodec is the live producer's negotiated codec; WHIP
+// pushers use it to register the matching MimeType on their starting
+// MediaEngine + TrackLocalStaticRTP, so the very first SDP offer the
+// remote WHIP server sees describes the correct payload from the
+// outset (instead of always assuming H.264 and silently producing a
+// PT-vs-payload mismatch when live is VP9 / AV1 / VP8). RTMP pushers
+// ignore the value — they only need the FourCC at first-keyframe
+// time, which they read from MediaSample.Codec.
+func (b *Broadcast) buildPushers(initialVideoCodec Codec) ([]destinationPusher, error) {
 	pushers := make([]destinationPusher, 0, len(b.destinations))
 	for _, d := range b.destinations {
 		var (
@@ -345,7 +373,7 @@ func (b *Broadcast) buildPushers() ([]destinationPusher, error) {
 			}
 		case DestinationWHIP:
 			var wp *whipPusher
-			wp, err = newWHIPPusher(d.URL, b.logger.With("dst", d.URL))
+			wp, err = newWHIPPusher(d.URL, initialVideoCodec, b.logger.With("dst", d.URL))
 			if err == nil {
 				pp = &whipPusherAdapter{inner: wp}
 			}
@@ -412,10 +440,11 @@ func (b *Broadcast) onFlipToLive() {
 	b.mu.RLock()
 	pushers := b.pushers
 	live := b.live
+	codec := b.liveCodec
 	b.mu.RUnlock()
 	for _, p := range pushers {
 		p.FlushVideoReorder()
-		p.ResetVideoHeader()
+		p.ResetVideoHeader(codec)
 	}
 	if live != nil {
 		live.RequestKeyFrame()
@@ -440,10 +469,25 @@ func (b *Broadcast) onFlipToLive() {
 func (b *Broadcast) onFlipToMix() {
 	b.mu.RLock()
 	pushers := b.pushers
+	mix := b.mix
 	b.mu.RUnlock()
+	// Mix codec is sourced from the active mixIngress (mediasoup or
+	// pion-bypass). If mix has detached between the switcher's
+	// onFlipToMix observation and this call (mu is dropped between
+	// them), fall back to the live codec so WHIP destinations do
+	// not race a reconnect against an incoming flip-back-to-live.
+	codec := CodecUnknown
+	if mix != nil {
+		codec = mix.VideoCodec()
+	}
+	if codec == CodecUnknown {
+		b.mu.RLock()
+		codec = b.liveCodec
+		b.mu.RUnlock()
+	}
 	for _, p := range pushers {
 		p.FlushVideoReorder()
-		p.ResetVideoHeader()
+		p.ResetVideoHeader(codec)
 	}
 }
 

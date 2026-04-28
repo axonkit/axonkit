@@ -29,11 +29,21 @@ type destinationPusher interface {
 	WriteRTP(kind SampleKind, pkt *rtp.Packet)
 
 	// ResetVideoHeader asks the pusher to re-emit the video codec
-	// sequence header on its next keyframe. The switcher calls this
-	// on every source flip so the new source's SPS/PPS reach the
-	// receiver before its first IDR. WHIP pushers (raw RTP) are
-	// no-ops.
-	ResetVideoHeader()
+	// sequence header on its next keyframe and tells it the codec
+	// the new source will encode against. Broadcast calls this on
+	// every source flip.
+	//
+	// RTMP pushers ignore the codec argument: they re-derive the
+	// FourCC (avc1 / vp09 / av01 / hvc1) from each subsequent
+	// keyframe's configuration record on the fly. WHIP pushers
+	// compare it against the codec their RTCPeerConnection's SDP
+	// was negotiated against; a mismatch (e.g. flip from H.264 to
+	// H.265 mix) requires tearing down the PC, DELETEing the WHIP
+	// resource, and re-handshaking with the new codec — neither
+	// the WebRTC PT-to-codec mapping nor pion's TrackLocalStaticRTP
+	// capability can be mutated in place after offer/answer. A
+	// match is a no-op.
+	ResetVideoHeader(codec Codec)
 
 	// FlushVideoReorder drains any access units still parked in the
 	// per-pusher DTS-reorder lookahead window and immediately enqueues
@@ -103,7 +113,15 @@ func (a *rtmpPusherAdapter) WriteSample(s MediaSample, extradata []byte) {
 
 func (a *rtmpPusherAdapter) WriteRTP(SampleKind, *rtp.Packet) {}
 
-func (a *rtmpPusherAdapter) ResetVideoHeader() { a.inner.ResetVideoHeader() }
+// ResetVideoHeader on the RTMP path drops the "already sent" flag so
+// the next keyframe's avcC / hvcC / vpcC / av1C is re-emitted as a
+// fresh SeqHeader regardless of byte-equality with the previous one.
+// The codec argument is unused: rtmpPusher already learns the FourCC
+// from the next keyframe's MediaSample.Codec field, and the inner
+// pusher's class-change reconnect logic in EnsureVideoSeqHeader /
+// EnsureExVideoSeqHeader handles AVC↔E-RTMP boundaries on its own.
+// Kept in the signature only because destinationPusher promises it.
+func (a *rtmpPusherAdapter) ResetVideoHeader(Codec) { a.inner.ResetVideoHeader() }
 
 // FlushVideoReorder pushes the trailing window of the outgoing
 // source's H.264 / H.265 access units out of the DTS-reorder buffer
@@ -129,9 +147,19 @@ func (a *whipPusherAdapter) WriteRTP(kind SampleKind, pkt *rtp.Packet) {
 	a.inner.WriteRTP(kind, pkt)
 }
 
-// ResetVideoHeader is a no-op for WHIP: raw RTP passthrough does not
-// carry a codec sequence header. SPS/PPS arrive in-band on keyframes.
-func (a *whipPusherAdapter) ResetVideoHeader() {}
+// ResetVideoHeader on the WHIP path forwards the new source's codec
+// into the inner pusher's reconnect machine. If the codec class
+// matches the one the active PeerConnection was negotiated against
+// the call is silent; otherwise the pusher tears down the current
+// session (DELETE WHIP resource + close PC) and re-handshakes with a
+// MediaEngine + TrackLocalStaticRTP rebuilt for the new codec. The
+// hot-path WriteRTP stays drop-on-disconnect throughout the
+// reconnect window — that is the same drop-during-setup behaviour the
+// initial connect already exercises, so receivers do not see garbled
+// frames decoded against a stale SDP fmtp.
+func (a *whipPusherAdapter) ResetVideoHeader(codec Codec) {
+	a.inner.NoteVideoCodec(codec)
+}
 
 // FlushVideoReorder is a no-op for WHIP: raw RTP passthrough does
 // not buffer access units, so there is nothing to drain on a source

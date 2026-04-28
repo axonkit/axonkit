@@ -405,6 +405,12 @@ func (ms *h265MixSource) fireGone(reason string) {
 // VideoDepack implements mixIngress.VideoDepack.
 func (ms *h265MixSource) VideoDepack() videoDepacketizer { return ms.videoDepack }
 
+// VideoCodec returns the codec this bypass terminates. The pion-bypass
+// path is reachable only when the avflow offer's only video m= line is
+// H.265, so the answer is always CodecH265 — see Broadcast.attachMix
+// dispatching in broadcast.go.
+func (ms *h265MixSource) VideoCodec() Codec { return CodecH265 }
+
 // Answer returns the SDP answer the WHIP POST handler must echo back
 // to the publisher.
 func (ms *h265MixSource) Answer() string { return ms.answerSDP }

@@ -54,6 +54,12 @@ type mixSource struct {
 	videoDepack videoDepacketizer
 	audioDepack OpusDepacketizer
 
+	// videoCodec snapshots the negotiated mix video codec so the
+	// Broadcast can hand it to each destinationPusher on flip-to-
+	// mix without re-deriving from the producer's RTP parameters
+	// every time. Set once in newMixSource; never mutated.
+	videoCodec Codec
+
 	// onReady is fired exactly once, after the first video keyframe
 	// has been seen AND ICE is confirmed connected. The switcher
 	// uses it to mark mix ready.
@@ -157,6 +163,7 @@ func newMixSource(p mixSourceParams) (*mixSource, error) {
 		audioCons:       audioCons,
 		videoCons:       videoCons,
 		videoDepack:     depack,
+		videoCodec:      videoCodec,
 		sampleSink:      p.SampleSink,
 		packetSink:      p.PacketSink,
 		onReady:         p.OnReady,
@@ -322,6 +329,14 @@ func (ms *mixSource) fireGone(reason string) {
 // AV1) it needs to emit a fresh RTMP seq header on every mix → (mix
 // or live) flip.
 func (ms *mixSource) VideoDepack() videoDepacketizer { return ms.videoDepack }
+
+// VideoCodec returns the codec the mix WHIP session negotiated for its
+// video producer. Used by Broadcast.onFlipToMix to tell each destination
+// pusher the codec the next batch of mix samples will be encoded with;
+// WHIP destinations whose RTCPeerConnection was negotiated against a
+// different codec re-handshake their session, RTMP destinations ignore
+// the value (they re-derive the FourCC from each keyframe's avcC/hvcC).
+func (ms *mixSource) VideoCodec() Codec { return ms.videoCodec }
 
 // RestartIce implements mixIngress.RestartIce by delegating to the
 // underlying mediasoup WebRtcTransport, which generates fresh ICE
