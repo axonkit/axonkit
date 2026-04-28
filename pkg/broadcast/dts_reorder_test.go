@@ -166,6 +166,58 @@ func TestDTSReorderEqualPTSGuard(t *testing.T) {
 	}
 }
 
+// TestDTSReorderEmitsAreStrictlyMonotonicInMs is the regression test
+// for the FLV-millisecond DTS-collapse bug discovered in the
+// verify-rtmp.sh end-to-end run: the original guard nudged DTS
+// forward by one 90 kHz tick (~11 µs), which the egress's
+// ticks*1000/90000 ms truncation folded back into the same FLV
+// timestamp on three consecutive lookahead-tied emits — producing
+// duplicate-DTS rows in the recording and tripping ffmpeg's
+// "reference picture missing" / "mb_type too large" decoder paths
+// on B-frame clusters. The fix steps the guard by
+// dtsReorderGuardTicks (=90, one millisecond) so the ms-truncated
+// series stays strictly increasing.
+//
+// Replays the exact IBBPBBB pattern libx264 produced in the failing
+// run (3 consecutive lookahead ties on the first GOP) and asserts
+// no two emits land on the same FLV millisecond.
+func TestDTSReorderEmitsAreStrictlyMonotonicInMs(t *testing.T) {
+	// First-GOP PTS (ms) the failing run captured on
+	// `-bf 3 -b_strategy 1 -g 60` testsrc input. Decode order:
+	// I0 P133 B67 B33 B100 P267 B200 B167 B233 P400 B333 B300 B367.
+	ptsMs := []uint32{0, 133, 67, 33, 100, 267, 200, 167, 233, 400, 333, 300, 367}
+
+	r := newDTSReorder(dtsReorderWindow)
+	emits := make([]dtsReorderEmit, 0, len(ptsMs))
+	for _, ms := range ptsMs {
+		s := MediaSample{
+			Kind:         SampleKindVideo,
+			Codec:        CodecH264,
+			RTPTimestamp: ms * 90,
+		}
+		emits = append(emits, r.Push(s)...)
+	}
+	emits = append(emits, r.Drain()...)
+
+	if got, want := len(emits), len(ptsMs); got != want {
+		t.Fatalf("emit count = %d, want %d", got, want)
+	}
+
+	// Every emit's FLV-ms timestamp must be strictly greater than
+	// the previous emit's. This is exactly what the egress writes
+	// into the FLV tag header after timestampMs() truncates the
+	// 90 kHz tick to whole milliseconds.
+	const clockHz = 90000
+	for i := 1; i < len(emits); i++ {
+		prev := uint64(emits[i-1].dts90k) * 1000 / clockHz
+		curr := uint64(emits[i].dts90k) * 1000 / clockHz
+		if curr <= prev {
+			t.Errorf("emit[%d] FLV ts=%d ms <= emit[%d] FLV ts=%d ms (dts90k %d vs %d) — duplicate-DTS regression",
+				i, curr, i-1, prev, emits[i].dts90k, emits[i-1].dts90k)
+		}
+	}
+}
+
 // TestDTSReorderAutoFlipsToPassthroughOnMonotonic feeds the auto-mode
 // buffer enough strictly-monotonic frames to trip the stable-streak
 // counter, then asserts that the buffer (a) drains its residual

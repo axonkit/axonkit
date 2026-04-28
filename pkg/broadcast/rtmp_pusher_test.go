@@ -168,6 +168,279 @@ func TestEnsureExVideoSeqHeader_EmitOnFourCCChange(t *testing.T) {
 	}
 }
 
+// drainQueueLabels classifies every entry currently sitting in the
+// pusher's send queue into one of four labels: "reconnect" sentinel,
+// "avc-seq" (classic AVC SeqHeader), "exrtmp-seq" (any E-RTMP FourCC
+// SeqHeader), or "other" (frames, audio, …). Used by the codec-class
+// change tests below to assert *order*, which is what matters for the
+// "receiver opens a fresh segment with the new codec config first"
+// contract — drainSeqHeaderBodies only counts SeqHeader tags and
+// silently drops the sentinel.
+func drainQueueLabels(p *rtmpPusher) []string {
+	var out []string
+	for {
+		select {
+		case f := <-p.queue:
+			switch {
+			case f.reconnect:
+				out = append(out, "reconnect")
+			case f.kind == SampleKindVideo && len(f.body) >= 1 && f.body[0]&0x80 != 0:
+				if f.body[0]&0x0F == flvExVideoPacketSeqStart {
+					out = append(out, "exrtmp-seq")
+				} else {
+					out = append(out, "exrtmp-frame")
+				}
+			case f.kind == SampleKindVideo && len(f.body) >= 2 && f.body[1] == flvAVCPacketTypeSeqHeader:
+				out = append(out, "avc-seq")
+			case f.kind == SampleKindVideo && len(f.body) >= 2 && f.body[1] == flvAVCPacketTypeNALU:
+				out = append(out, "avc-nalu")
+			case f.kind == SampleKindAudio:
+				out = append(out, "audio")
+			default:
+				out = append(out, "other")
+			}
+		default:
+			return out
+		}
+	}
+}
+
+// TestEnsureVideoSeqHeader_ReconnectOnExRTMPToAVC pins the
+// E-RTMP-to-classic-AVC class-change reconnect path. After an H.265
+// SeqHeader has been emitted, switching the source to H.264 must
+// enqueue a reconnect sentinel BEFORE the new AVC SeqHeader so the
+// receiver opens a fresh recording segment whose first tag is the
+// classic AVC config — instead of seeing a mid-stream classic-AVC
+// SeqHeader the FLV demuxer would treat as a new input stream and
+// silently drop on `-c copy`. This is the bug verify-rtmp.sh hit
+// with MIX_CODEC=h265: only 303 H.264 frames in seg-001.flv, zero
+// E-RTMP H.265 tags, an 11.9 s video gap covering the entire mix
+// window because the recorder ffmpeg dropped the H.265 stream it
+// detected as input #2.
+func TestEnsureVideoSeqHeader_ReconnectOnExRTMPToAVC(t *testing.T) {
+	p := newTestPusher(t)
+	defer close(p.queue)
+
+	hvcc := []byte{0x01, 0x22, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x05}
+	avcc := []byte{0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x05, 0x67, 0x42, 0xC0, 0x1E, 0x99}
+
+	if !p.EnsureExVideoSeqHeader(flvExVideoFourCCH265, hvcc) {
+		t.Fatalf("first EnsureExVideoSeqHeader (h265): want true")
+	}
+	p.ResetVideoHeader()
+	if !p.EnsureVideoSeqHeader(avcc) {
+		t.Fatalf("second EnsureVideoSeqHeader (h264) after h265: want true")
+	}
+
+	got := drainQueueLabels(p)
+	want := []string{"exrtmp-seq", "reconnect", "avc-seq"}
+	if !equalStrings(got, want) {
+		t.Fatalf("queue order = %v, want %v (reconnect must split the two SeqHeader tags)", got, want)
+	}
+}
+
+// TestEnsureExVideoSeqHeader_ReconnectOnAVCToExRTMP is the inverse
+// path: H.264 → H.265 must enqueue the reconnect sentinel ahead of
+// the new HEVC SeqHeader. ffmpeg's recorder is symmetric — it treats
+// any classic↔E-RTMP transition as a new input stream — so both
+// directions need the same treatment.
+func TestEnsureExVideoSeqHeader_ReconnectOnAVCToExRTMP(t *testing.T) {
+	p := newTestPusher(t)
+	defer close(p.queue)
+
+	avcc := []byte{0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x05, 0x67, 0x42, 0xC0, 0x1E, 0x99}
+	hvcc := []byte{0x01, 0x22, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x05}
+
+	if !p.EnsureVideoSeqHeader(avcc) {
+		t.Fatalf("first EnsureVideoSeqHeader (h264): want true")
+	}
+	p.ResetVideoHeader()
+	if !p.EnsureExVideoSeqHeader(flvExVideoFourCCH265, hvcc) {
+		t.Fatalf("second EnsureExVideoSeqHeader (h265) after h264: want true")
+	}
+
+	got := drainQueueLabels(p)
+	want := []string{"avc-seq", "reconnect", "exrtmp-seq"}
+	if !equalStrings(got, want) {
+		t.Fatalf("queue order = %v, want %v (reconnect must split the two SeqHeader tags)", got, want)
+	}
+}
+
+// TestEnsureExVideoSeqHeader_ReconnectOnFourCCSwap covers two distinct
+// E-RTMP codecs in succession. Both are E-RTMP, but the recorder
+// re-binds its decoder on every FourCC change — VP9 → AV1 reuses the
+// same FLV layout but a different codec, so it counts as a class
+// change for our purposes too.
+func TestEnsureExVideoSeqHeader_ReconnectOnFourCCSwap(t *testing.T) {
+	p := newTestPusher(t)
+	defer close(p.queue)
+
+	config := []byte{0x00, 0x00, 0x82, 0x01, 0x01, 0x01, 0x00, 0x00}
+
+	if !p.EnsureExVideoSeqHeader(flvExVideoFourCCVP9, config) {
+		t.Fatalf("first EnsureExVideoSeqHeader (vp09): want true")
+	}
+	p.ResetVideoHeader()
+	if !p.EnsureExVideoSeqHeader(flvExVideoFourCCAV1, config) {
+		t.Fatalf("second EnsureExVideoSeqHeader (av01): want true")
+	}
+
+	got := drainQueueLabels(p)
+	want := []string{"exrtmp-seq", "reconnect", "exrtmp-seq"}
+	if !equalStrings(got, want) {
+		t.Fatalf("queue order = %v, want %v", got, want)
+	}
+}
+
+// TestEnsureVideoSeqHeader_NoReconnectOnSameClassConfigChange is the
+// negative control for the user's actual ask: an H.264 publisher
+// flipping between high-profile-with-B-frames and baseline-no-B-frames
+// (e.g. RTMP_LOW_LATENCY swap, or a same-codec mix overlay with a
+// different x264 preset) must NOT close the TCP session. The receiver
+// already reconfigures the AVC decoder via the in-band SeqHeader tag,
+// and a gratuitous reconnect would inflate flip latency by one TCP
+// handshake + the recorder's segment open delay for no observable
+// gain.
+func TestEnsureVideoSeqHeader_NoReconnectOnSameClassConfigChange(t *testing.T) {
+	p := newTestPusher(t)
+	defer close(p.queue)
+
+	// Both records are valid AVCDecoderConfigurationRecords; only
+	// the embedded SPS differs (high profile @ L3.0 vs main profile
+	// @ L3.0 — proxies for "B-frame profile" vs "no-B profile").
+	high := []byte{0x01, 0x64, 0x00, 0x1E, 0xFF, 0xE1, 0x00, 0x05, 0x67, 0x64, 0x00, 0x1E, 0x99}
+	main := []byte{0x01, 0x4D, 0x40, 0x1E, 0xFF, 0xE1, 0x00, 0x05, 0x67, 0x4D, 0x40, 0x1E, 0xAB}
+
+	if !p.EnsureVideoSeqHeader(high) {
+		t.Fatalf("first EnsureVideoSeqHeader: want true")
+	}
+	p.ResetVideoHeader()
+	if !p.EnsureVideoSeqHeader(main) {
+		t.Fatalf("second EnsureVideoSeqHeader (different SPS, same class): want true")
+	}
+
+	got := drainQueueLabels(p)
+	want := []string{"avc-seq", "avc-seq"}
+	if !equalStrings(got, want) {
+		t.Fatalf("queue order = %v, want %v (no reconnect for same-class config swap)", got, want)
+	}
+}
+
+// TestEnsureExVideoSeqHeader_NoReconnectOnSameFourCCConfigChange is
+// the E-RTMP equivalent of the H.264 same-class test: VP9 → VP9 with
+// different config bytes (e.g. profile 0 → profile 2 for HDR) must
+// stay in-band, no TCP reconnect.
+func TestEnsureExVideoSeqHeader_NoReconnectOnSameFourCCConfigChange(t *testing.T) {
+	p := newTestPusher(t)
+	defer close(p.queue)
+
+	cfgA := []byte{0x00, 0x00, 0x82, 0x01, 0x01, 0x01, 0x00, 0x00}
+	cfgB := []byte{0x00, 0x00, 0x82, 0x02, 0x02, 0x01, 0x00, 0x00}
+
+	if !p.EnsureExVideoSeqHeader(flvExVideoFourCCVP9, cfgA) {
+		t.Fatalf("first EnsureExVideoSeqHeader: want true")
+	}
+	p.ResetVideoHeader()
+	if !p.EnsureExVideoSeqHeader(flvExVideoFourCCVP9, cfgB) {
+		t.Fatalf("second EnsureExVideoSeqHeader (different config bytes, same FourCC): want true")
+	}
+
+	got := drainQueueLabels(p)
+	want := []string{"exrtmp-seq", "exrtmp-seq"}
+	if !equalStrings(got, want) {
+		t.Fatalf("queue order = %v, want %v (no reconnect for same-FourCC config swap)", got, want)
+	}
+}
+
+// TestEnsureVideoSeqHeader_NoReconnectOnFirstHeader pins the
+// "first SeqHeader of the pusher's lifetime is not a class change"
+// invariant. Without this check newRTMPPusher would synthesise a
+// reconnect on the very first keyframe, which is at best a wasted
+// dial and at worst breaks pushers whose first connection has not
+// even been established yet (the sentinel would sit in the queue
+// ahead of any real frame).
+func TestEnsureVideoSeqHeader_NoReconnectOnFirstHeader(t *testing.T) {
+	cases := []struct {
+		name string
+		emit func(p *rtmpPusher) bool
+	}{
+		{
+			name: "first-avc",
+			emit: func(p *rtmpPusher) bool {
+				return p.EnsureVideoSeqHeader([]byte{0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x01, 0x67})
+			},
+		},
+		{
+			name: "first-exrtmp-h265",
+			emit: func(p *rtmpPusher) bool {
+				return p.EnsureExVideoSeqHeader(flvExVideoFourCCH265, []byte{0x01, 0x22})
+			},
+		},
+		{
+			name: "first-exrtmp-vp9",
+			emit: func(p *rtmpPusher) bool {
+				return p.EnsureExVideoSeqHeader(flvExVideoFourCCVP9, []byte{0x00, 0x00})
+			},
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			p := newTestPusher(t)
+			defer close(p.queue)
+			if !c.emit(p) {
+				t.Fatalf("first SeqHeader emit: want true")
+			}
+			got := drainQueueLabels(p)
+			for _, lbl := range got {
+				if lbl == "reconnect" {
+					t.Fatalf("first-emit path enqueued unexpected reconnect sentinel: %v", got)
+				}
+			}
+		})
+	}
+}
+
+// TestRequestReconnectArmsAudioSeqHeader covers the audio half of
+// the reconnect contract: the sentinel arms audioHdrSent so the
+// first audio sample reaching the new RTMP session re-emits its
+// Opus codec config. Without this, recorder ffmpeg gets a naked
+// audio packet on the new TCP segment and either drops it or
+// silently disables audio decode for the new segment.
+func TestRequestReconnectArmsAudioSeqHeader(t *testing.T) {
+	p := newTestPusher(t)
+	defer close(p.queue)
+
+	if !p.EnsureAudioSeqHeader(2) {
+		t.Fatalf("first EnsureAudioSeqHeader: want true")
+	}
+	if p.EnsureAudioSeqHeader(2) {
+		t.Fatalf("second EnsureAudioSeqHeader without reset: want false (one-shot)")
+	}
+
+	p.requestReconnect("test")
+
+	if !p.EnsureAudioSeqHeader(2) {
+		t.Fatalf("post-reconnect EnsureAudioSeqHeader: want true (latch must rearm)")
+	}
+}
+
+// equalStrings is a tiny shim because test files in this package
+// historically avoid pulling in reflect for two-line slice
+// comparisons; the explicit loop is also easier to read in failure
+// messages.
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // TestDestinationDTSReorderModeDefault pins the public helper's
 // "absent → auto, true → always, false → never" mapping. Other code
 // in this package (and any API client doing pre-flight validation)
@@ -414,6 +687,139 @@ func TestWriteSampleH265_DTSReorderAlwaysBuffersWindow(t *testing.T) {
 	default:
 		t.Fatalf("expected one emit after window+1 samples, queue empty")
 	}
+}
+
+// TestFlushVideoReorderEmitsBeforeNextSeqHeader is the regression
+// test for the live↔mix flip ordering bug verify-rtmp.sh tripped on:
+// when the switcher flips sources, the trailing window of the
+// outgoing source's H.264 access units is still parked in the DTS-
+// reorder buffer. If we reset the SeqHeader latch and let the new
+// source's first keyframe enqueue its avcC tag before draining that
+// window, the FLV file ends up with
+//
+//	[SeqHeader new] [trailing-window-of-old-frames…] [keyframe new]
+//
+// and the receiver decodes the trailing frames against the wrong
+// codec config — producing the "reference count overflow" /
+// "modification_of_pic_nums_idc out of range" / "corrupted
+// macroblock" cascade. Broadcast.onFlipToMix / onFlipToLive call
+// FlushVideoReorder *before* ResetVideoHeader to fix this; this test
+// pins the ordering at the rtmpPusher layer so future refactors
+// can't silently regress it.
+func TestFlushVideoReorderEmitsBeforeNextSeqHeader(t *testing.T) {
+	p := newTestPusherOpts(t, rtmpPusherOptions{DTSReorderMode: DTSReorderAlways})
+	defer close(p.queue)
+
+	oldAVCC := []byte{0x01, 0x64, 0x00, 0x1E, 0xFF, 0xE1, 0x00, 0x05, 0x67, 0x64, 0x00, 0x1E, 0x99}
+	newAVCC := []byte{0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x05, 0x67, 0x42, 0xC0, 0x1E, 0xAB}
+
+	if !p.EnsureVideoSeqHeader(oldAVCC) {
+		t.Fatalf("first EnsureVideoSeqHeader: want true")
+	}
+
+	for i := 0; i < dtsReorderWindow; i++ {
+		p.WriteSample(MediaSample{
+			Kind:         SampleKindVideo,
+			Codec:        CodecH264,
+			RTPTimestamp: uint32(i) * 3000, //nolint:gosec // small bounded loop
+			IsKeyFrame:   i == 0,
+			Data:         []byte{byte(i + 0xA0)},
+		})
+	}
+	select {
+	case f := <-p.queue:
+		if f.body[1] != flvAVCPacketTypeSeqHeader {
+			t.Fatalf("expected only the initial SeqHeader in queue, got body[1]=0x%02x", f.body[1])
+		}
+	default:
+		t.Fatalf("expected initial SeqHeader to be queued")
+	}
+	select {
+	case f := <-p.queue:
+		t.Fatalf("buffered window must not emit yet, got kind=%v ts=%d", f.kind, f.timestampMs)
+	default:
+	}
+
+	p.flushVideoReorder()
+	p.ResetVideoHeader()
+	if !p.EnsureVideoSeqHeader(newAVCC) {
+		t.Fatalf("post-flush EnsureVideoSeqHeader with different bytes: want true")
+	}
+
+	gotKinds := make([]string, 0, dtsReorderWindow+1)
+	for {
+		select {
+		case f := <-p.queue:
+			if f.kind != SampleKindVideo {
+				continue
+			}
+			switch f.body[1] {
+			case flvAVCPacketTypeSeqHeader:
+				gotKinds = append(gotKinds, "seq")
+			case flvAVCPacketTypeNALU:
+				gotKinds = append(gotKinds, "nalu")
+			}
+		default:
+			goto done
+		}
+	}
+done:
+	wantKinds := []string{"nalu", "nalu", "nalu", "nalu", "seq"}
+	if len(gotKinds) != len(wantKinds) {
+		t.Fatalf("queue order = %v, want %v (drain emits before SeqHeader)", gotKinds, wantKinds)
+	}
+	for i := range wantKinds {
+		if gotKinds[i] != wantKinds[i] {
+			t.Fatalf("queue order = %v, want %v at index %d", gotKinds, wantKinds, i)
+		}
+	}
+}
+
+// TestRTMPPusherAdapterFlushVideoReorderRoutes pins the adapter's
+// FlushVideoReorder forwarding so Broadcast.onFlipTo* (which calls
+// the method through the destinationPusher interface) can't silently
+// stop reaching the inner buffer. Pure plumbing assertion.
+func TestRTMPPusherAdapterFlushVideoReorderRoutes(t *testing.T) {
+	p := newTestPusherOpts(t, rtmpPusherOptions{DTSReorderMode: DTSReorderAlways})
+	defer close(p.queue)
+	a := &rtmpPusherAdapter{inner: p}
+
+	for i := 0; i < dtsReorderWindow; i++ {
+		p.WriteSample(MediaSample{
+			Kind:         SampleKindVideo,
+			Codec:        CodecH264,
+			RTPTimestamp: uint32(i) * 3000, //nolint:gosec // small bounded loop
+			IsKeyFrame:   i == 0,
+			Data:         []byte{byte(i + 0xC0)},
+		})
+	}
+
+	a.FlushVideoReorder()
+
+	emitted := 0
+	for {
+		select {
+		case f := <-p.queue:
+			if f.kind == SampleKindVideo && f.body[1] == flvAVCPacketTypeNALU {
+				emitted++
+			}
+		default:
+			goto done
+		}
+	}
+done:
+	if emitted != dtsReorderWindow {
+		t.Fatalf("adapter FlushVideoReorder drained %d NALU tags, want %d", emitted, dtsReorderWindow)
+	}
+}
+
+// TestWHIPPusherAdapterFlushVideoReorderIsNoop guards the WHIP
+// branch's FlushVideoReorder no-op. The interface change must not
+// accidentally try to dereference a non-existent reorder buffer on
+// raw-RTP destinations.
+func TestWHIPPusherAdapterFlushVideoReorderIsNoop(t *testing.T) {
+	a := &whipPusherAdapter{}
+	a.FlushVideoReorder()
 }
 
 func boolPtr(b bool) *bool { return &b }

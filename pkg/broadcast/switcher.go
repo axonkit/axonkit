@@ -31,6 +31,18 @@ const defaultAudioTick = 960
 // monotonic across a source change.
 const defaultVideoTick = 3000
 
+// audioClockHz / videoClockHz are the RTP-clock rates the broadcast
+// is wired against. Audio is 48 kHz Opus on both ingest paths (RTMP
+// E-RTMP "Opus" FourCC and WHIP). Video is 90 kHz, the canonical
+// PT/clock for H.264/H.265/AV1/VP9 in RTP. Used to convert hwm into a
+// shared millisecond reference at flip time so the audio rebaser and
+// the video rebaser anchor against the same wall-clock instant — see
+// alignAnchorMs and switcher.flipSampleRebasers.
+const (
+	audioClockHz uint32 = 48_000
+	videoClockHz uint32 = 90_000
+)
+
 // rebaser turns a noisy per-source RTP-clock into a continuous output
 // clock that preserves the input clock's intra-source PTS shape —
 // crucially including the per-frame backward steps a B-frame source
@@ -74,6 +86,11 @@ type rebaser struct {
 	// source's first sample arrives. Audio uses 960 (one Opus
 	// ptime), video 3000 (~33 ms at 90 kHz).
 	catchup uint32
+	// clockHz is the RTP-clock frequency for this rebaser (48 kHz
+	// for audio, 90 kHz for video). Used by hwmMs / alignAnchorMs
+	// to translate hwm to/from milliseconds so audio and video
+	// rebasers can share a flip anchor across different clocks.
+	clockHz uint32
 }
 
 // rewrite returns the output TS for an incoming sample. Output is
@@ -123,6 +140,60 @@ func (r *rebaser) rewrite(inTS uint32) uint32 {
 // onSourceFlip invalidates the current source base so the next sample
 // becomes the "first sample after a flip" (catchup tick applied).
 func (r *rebaser) onSourceFlip() { r.hasBase = false }
+
+// hwmMs reports the rebaser's high-water-mark output timestamp
+// expressed in milliseconds, so peers running on a different RTP
+// clock can compare. Returns 0 if the rebaser has not been
+// initialized or clockHz is unset (defensive — newSwitcher always
+// sets it). Truncates toward zero on the divide; that is intentional,
+// see alignAnchorMs for how we recover from the truncation when the
+// caller is ahead of the peer.
+func (r *rebaser) hwmMs() int64 {
+	if !r.initialized || r.clockHz == 0 {
+		return 0
+	}
+	return int64(r.hwm) * 1000 / int64(r.clockHz)
+}
+
+// alignAnchorMs adopts a shared output-clock anchor (in milliseconds)
+// computed from another rebaser's hwm. Used at flip time so audio
+// and video both anchor against the same wall-clock instant — without
+// this, the two rebasers' independent hwm values diverge whenever
+// the audio and video ingest pipelines have different end-to-end
+// latencies (typical: video buffers 1–2 s of B-frame reorder while
+// audio stays near real-time), which surfaces as the post-flip mix
+// audio appearing seconds AFTER the post-flip mix video on the
+// recording.
+//
+// We never roll hwm BACKWARDS — if our own hwm is already past the
+// proposed anchor (we are the "leading" kind), the call is a no-op.
+// On the trailing kind we update hwm; the next first-after-flip
+// sample then takes the catchup branch (hasBase is false because
+// onSourceFlip set it) and emits at hwm + catchup.
+func (r *rebaser) alignAnchorMs(ms int64) {
+	if r.clockHz == 0 || ms <= 0 {
+		return
+	}
+	target := uint32(ms * int64(r.clockHz) / 1000) //nolint:gosec // bounded by hwm range
+	if !r.initialized {
+		// Never-used rebaser, but the peer kind has already
+		// pushed its hwm out to ms. Adopt the peer's anchor
+		// and mark this rebaser initialized — the next sample
+		// (if any) will take the catchup branch in rewrite
+		// (hasBase=false) and emit at target + catchup so
+		// audio resumes near video's wall-clock position
+		// instead of restarting from output 0. This matters
+		// when the prior segment carried only one kind (e.g.
+		// a video-only mix overlay) and the flip-back live
+		// stream brings the missing kind back in.
+		r.initialized = true
+		r.hwm = target
+		return
+	}
+	if int32(target-r.hwm) > 0 { //nolint:gosec // modular comparison
+		r.hwm = target
+	}
+}
 
 // switcher owns the "which source is active, and where is its clock?"
 // decision. Every sample and packet goes through here before reaching
@@ -190,10 +261,10 @@ func newSwitcher(logger *slog.Logger) *switcher {
 	return &switcher{
 		logger:      logger,
 		state:       sourceLiveActive,
-		audioSample: rebaser{catchup: defaultAudioTick},
-		videoSample: rebaser{catchup: defaultVideoTick},
-		audioPacket: rebaser{catchup: defaultAudioTick},
-		videoPacket: rebaser{catchup: defaultVideoTick},
+		audioSample: rebaser{catchup: defaultAudioTick, clockHz: audioClockHz},
+		videoSample: rebaser{catchup: defaultVideoTick, clockHz: videoClockHz},
+		audioPacket: rebaser{catchup: defaultAudioTick, clockHz: audioClockHz},
+		videoPacket: rebaser{catchup: defaultVideoTick, clockHz: videoClockHz},
 	}
 }
 
@@ -246,6 +317,41 @@ func (s *switcher) terminate() {
 	s.mu.Lock()
 	s.terminated = true
 	s.mu.Unlock()
+}
+
+// flipSampleRebasers resets the audio+video sample rebasers to their
+// "first sample after flip" state AND aligns them on a shared
+// millisecond anchor (max of the two pre-flip hwm values). The
+// trailing kind catches up to the leading kind so the next first
+// audio sample and first video sample emerge with output PTS that
+// reflect the same wall-clock instant — rather than each kind
+// independently advancing past its own per-pipeline hwm, which
+// produced a 1-2 second A/V offset at the live↔mix flip when the
+// video ingest pipeline (RTMP B-frame reorder + ffmpeg encoder
+// buildup) lagged the audio ingest by exactly that amount.
+func (s *switcher) flipSampleRebasers() {
+	s.audioSample.onSourceFlip()
+	s.videoSample.onSourceFlip()
+	anchor := s.audioSample.hwmMs()
+	if vMs := s.videoSample.hwmMs(); vMs > anchor {
+		anchor = vMs
+	}
+	s.audioSample.alignAnchorMs(anchor)
+	s.videoSample.alignAnchorMs(anchor)
+}
+
+// flipPacketRebasers does the same for the WHIP-egress packet path.
+// Packet rebasers feed raw RTP into whipPusher (the WHEP/WHIP fan-out
+// destination) and the same A/V anchor divergence applies there too.
+func (s *switcher) flipPacketRebasers() {
+	s.audioPacket.onSourceFlip()
+	s.videoPacket.onSourceFlip()
+	anchor := s.audioPacket.hwmMs()
+	if vMs := s.videoPacket.hwmMs(); vMs > anchor {
+		anchor = vMs
+	}
+	s.audioPacket.alignAnchorMs(anchor)
+	s.videoPacket.alignAnchorMs(anchor)
 }
 
 // activeSource reports the current active source for Status()
@@ -424,14 +530,15 @@ func (s *switcher) tryFlipToMixOnAudio() bool {
 		return false
 	}
 	s.state = sourceMixActive
-	s.audioSample.onSourceFlip()
-	s.audioPacket.onSourceFlip()
-	// Video rebasers are flipped inside tryFlipToMixOnKeyframe when
-	// the first mix IDR arrives — but if audio wins the race we
-	// flip them here too so the first video sample/packet is
-	// treated as first-after-switch.
-	s.videoSample.onSourceFlip()
-	s.videoPacket.onSourceFlip()
+	// Both kinds flip together with a shared millisecond anchor
+	// (see flipSampleRebasers). Even though only audio "won" the
+	// race, the video rebaser must be flipped here too — otherwise
+	// the next live video sample (already in flight when the audio
+	// flip happened) would land BEFORE the new sample anchor and
+	// the mix's first video frame would slot in at the audio-led
+	// position with no catchup applied.
+	s.flipSampleRebasers()
+	s.flipPacketRebasers()
 	hook := s.onFlipToMix
 	s.mu.Unlock()
 	if hook != nil {
@@ -458,10 +565,8 @@ func (s *switcher) tryFlipToMixOnKeyframe() bool {
 		return false
 	}
 	s.state = sourceMixActive
-	s.videoSample.onSourceFlip()
-	s.videoPacket.onSourceFlip()
-	s.audioSample.onSourceFlip()
-	s.audioPacket.onSourceFlip()
+	s.flipSampleRebasers()
+	s.flipPacketRebasers()
 	hook := s.onFlipToMix
 	s.mu.Unlock()
 	if hook != nil {
@@ -488,10 +593,8 @@ func (s *switcher) flipToLive(reason string) {
 	}
 	s.state = sourceLiveActive
 	s.mixReady = false
-	s.audioSample.onSourceFlip()
-	s.audioPacket.onSourceFlip()
-	s.videoSample.onSourceFlip()
-	s.videoPacket.onSourceFlip()
+	s.flipSampleRebasers()
+	s.flipPacketRebasers()
 	hook := s.onFlipToLive
 	s.mu.Unlock()
 	if hook != nil {

@@ -100,6 +100,18 @@ const dtsReorderWindow = 4
 // at all will trip this counter back to zero well within 60 frames.
 const dtsReorderAutoStableFrames = 60
 
+// dtsReorderGuardTicks is the minimum 90 kHz tick spacing the
+// monotonicity guard inserts between consecutive emits. Sized to
+// 90 (= 1 ms) so the FLV tag's millisecond timestamp field stays
+// strictly increasing after the (ticks*1000/90000) integer
+// truncation the egress applies. A +1-tick guard would collapse
+// three consecutive emits whose lookahead picked the same rawDTS
+// into a single FLV millisecond — manifesting as duplicate DTS
+// rows in any downstream MP4 mux and tripping ffmpeg's "reference
+// picture missing" decoder path on B-frames whose recovery key
+// frame is hidden behind the duplicate-DTS cluster.
+const dtsReorderGuardTicks = 90
+
 // dtsReorderMode is internal: the rtmpPusher selects one when it
 // constructs the buffer. The public Destination.DTSReorder pointer
 // maps onto these values via Destination.DTSReorderMode.
@@ -268,14 +280,14 @@ func (r *dtsReorder) Drain() []dtsReorderEmit {
 
 // directEmit produces a passthrough emit for s: DTS is the sample's
 // PTS unless the strict-monotonicity guard needs to nudge it forward
-// by one tick, and CTS is always 0 (no B-frame, no reorder happening).
-// Maintained as a separate path from emit() so passthrough enjoys
-// real zero-latency operation: no append into r.queue, no lookahead
-// loop, no auto-mode counter math.
+// by one ms-equivalent (dtsReorderGuardTicks), and CTS is always 0
+// (no B-frame, no reorder happening). Maintained as a separate path
+// from emit() so passthrough enjoys real zero-latency operation: no
+// append into r.queue, no lookahead loop, no auto-mode counter math.
 func (r *dtsReorder) directEmit(s MediaSample) dtsReorderEmit {
 	dts := s.RTPTimestamp
-	if r.haveLastDTS && int32(dts-r.lastDTS) <= 0 { //nolint:gosec // modular comparison
-		dts = r.lastDTS + 1
+	if r.haveLastDTS && int32(dts-r.lastDTS) < dtsReorderGuardTicks { //nolint:gosec // modular comparison
+		dts = r.lastDTS + dtsReorderGuardTicks
 	}
 	r.lastDTS = dts
 	r.haveLastDTS = true
@@ -303,8 +315,15 @@ func (r *dtsReorder) emit() dtsReorderEmit {
 	}
 	dts := rawDTS
 	guardApplied := false
-	if r.haveLastDTS && int32(dts-r.lastDTS) <= 0 { //nolint:gosec // modular comparison
-		dts = r.lastDTS + 1
+	// Guard step is one millisecond (dtsReorderGuardTicks=90 at
+	// 90 kHz) instead of a single tick so the downstream FLV tag's
+	// integer-millisecond timestamp stays strictly monotonic after
+	// the (ticks*1000/90000) truncation. A 1-tick guard collapses
+	// three consecutive lookahead-tied emits into the same FLV ms
+	// — see dts_reorder_test.go's TestEmitsAreStrictlyMonotonicInMs
+	// for the regression we're protecting against here.
+	if r.haveLastDTS && int32(dts-r.lastDTS) < dtsReorderGuardTicks { //nolint:gosec // modular comparison
+		dts = r.lastDTS + dtsReorderGuardTicks
 		guardApplied = true
 	}
 	r.lastDTS = dts

@@ -397,16 +397,24 @@ func (b *Broadcast) fanOutPacket(kind SampleKind, pkt *rtp.Packet) {
 	}
 }
 
-// onFlipToLive is the switcher's "we are back on live" hook. Reset
-// every pusher's video seq header so the live SPS/PPS land before the
-// next keyframe, and ask the live consumer for a fresh IDR so the
-// wait-for-keyframe window on the output side is short.
+// onFlipToLive is the switcher's "we are back on live" hook. Drain
+// the trailing window of mix's frames out of every pusher's DTS-
+// reorder buffer first, then reset each pusher's video seq header
+// so the new source's SPS/PPS land ahead of its first IDR, and ask
+// the live consumer for a fresh IDR so the wait-for-keyframe window
+// on the output side is short. The drain-before-reset order matters:
+// the buffered mix frames must reach the FLV ahead of live's
+// SeqHeader tag — otherwise the receiver applies live's avcC to
+// trailing mix frames whose codec config is different and the
+// recording develops the same "reference count overflow" cascade as
+// the mix-flip path described on onFlipToMix.
 func (b *Broadcast) onFlipToLive() {
 	b.mu.RLock()
 	pushers := b.pushers
 	live := b.live
 	b.mu.RUnlock()
 	for _, p := range pushers {
+		p.FlushVideoReorder()
 		p.ResetVideoHeader()
 	}
 	if live != nil {
@@ -414,15 +422,27 @@ func (b *Broadcast) onFlipToLive() {
 	}
 }
 
-// onFlipToMix is the switcher's "we are now on mix" hook. Reset video
-// headers so avflow's SPS/PPS go out; the switcher itself gated the
-// flip on an already-arrived mix keyframe so no extra nudge is
-// needed on the mix side.
+// onFlipToMix is the switcher's "we are now on mix" hook. Drain the
+// trailing window of live's frames out of every pusher's DTS-reorder
+// buffer FIRST so they reach the FLV ahead of mix's SeqHeader tag,
+// then reset each pusher's video seq header so mix's SPS/PPS go out
+// before its first keyframe. Without the drain step the SeqHeader
+// (mix avcC, e.g. baseline profile + max_num_ref_frames=1) lands in
+// the FLV file ahead of 1–4 trailing high-profile B-frames from the
+// outgoing live source — the receiver re-configures its decoder for
+// the new avcC and then immediately tries to decode those B-frames
+// against it, producing the "reference count overflow" /
+// "modification_of_pic_nums_idc out of range" / "corrupted
+// macroblock" cascade verify-rtmp.sh's strict gate caught.
+//
+// The switcher itself gated the flip on an already-arrived mix
+// keyframe so no extra nudge is needed on the mix side.
 func (b *Broadcast) onFlipToMix() {
 	b.mu.RLock()
 	pushers := b.pushers
 	b.mu.RUnlock()
 	for _, p := range pushers {
+		p.FlushVideoReorder()
 		p.ResetVideoHeader()
 	}
 }

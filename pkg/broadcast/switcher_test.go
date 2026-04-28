@@ -154,6 +154,125 @@ func TestSwitcher_FlipBackToLive(t *testing.T) {
 	}
 }
 
+// TestSwitcher_FlipSharesAVAnchor reproduces the A/V desync bug we
+// hit on verify-rtmp.sh's mid-stream live→mix flip: when the audio
+// ingest pipeline runs ahead of the video ingest pipeline (audio
+// hwm > video hwm, typical because B-frame reorder + ffmpeg's
+// encoder buildup adds 1–2 s to video while audio stays near
+// real-time), each per-kind rebaser used to anchor the post-flip
+// source against ITS OWN hwm. The mix's first audio sample then
+// landed ~1.5 s after the mix's first video sample, even though
+// they came in back-to-back from the mix ingest.
+//
+// After the fix the audio rebaser's hwm should be propagated into
+// the video rebaser at flip time (and vice versa), so the trailing
+// kind catches up to the leading kind and both first-after-flip
+// samples emerge with output PTS that line up in milliseconds.
+func TestSwitcher_FlipSharesAVAnchor(t *testing.T) {
+	sw, sink := newTestSwitcher()
+
+	// Drive the live audio rebaser ~5 s into the future. 5 s @
+	// 48 kHz = 240 000 ticks; we feed two consecutive Opus packets
+	// so the hwm advances past 5 s.
+	sw.feedSample(SourceLive, MediaSample{Kind: SampleKindAudio, Codec: CodecOpus, RTPTimestamp: 1_000_000})
+	sw.feedSample(SourceLive, MediaSample{Kind: SampleKindAudio, Codec: CodecOpus, RTPTimestamp: 1_240_000})
+	audioOutHWM := sink.samples[len(sink.samples)-1].RTPTimestamp
+	if audioOutHWM == 0 {
+		t.Fatalf("setup: live audio hwm did not advance, got %d", audioOutHWM)
+	}
+	audioOutMs := uint32(int64(audioOutHWM) * 1000 / int64(audioClockHz))
+
+	// Drive the live video rebaser ~3.9 s into the future — this
+	// is the verify-rtmp.sh shape where video lags audio by
+	// ~1.1 s due to B-frame reorder + encoder buildup. 3.9 s @
+	// 90 kHz = 351 000 ticks.
+	sw.feedSample(SourceLive, MediaSample{Kind: SampleKindVideo, Codec: CodecH264, RTPTimestamp: 50_000_000, IsKeyFrame: true})
+	sw.feedSample(SourceLive, MediaSample{Kind: SampleKindVideo, Codec: CodecH264, RTPTimestamp: 50_351_000})
+	videoOutHWM := sink.samples[len(sink.samples)-1].RTPTimestamp
+	videoOutMs := uint32(int64(videoOutHWM) * 1000 / int64(videoClockHz))
+	if audioOutMs <= videoOutMs+500 {
+		t.Fatalf("setup: expected audio leading video by >500 ms, got audio=%dms video=%dms", audioOutMs, videoOutMs)
+	}
+
+	// Mix arrives, switcher flips live → mix on the first mix
+	// keyframe.
+	sw.markMixReady()
+	sw.feedSample(SourceMix, MediaSample{Kind: SampleKindVideo, Codec: CodecH264, RTPTimestamp: 90_000_000, IsKeyFrame: true})
+	if sw.activeSource() != SourceMix {
+		t.Fatalf("expected mix-active after keyframe flip")
+	}
+	mixVideoFirstTS := sink.samples[len(sink.samples)-1].RTPTimestamp
+	mixVideoFirstMs := uint32(int64(mixVideoFirstTS) * 1000 / int64(videoClockHz))
+
+	// First mix audio sample arrives next.
+	sw.feedSample(SourceMix, MediaSample{Kind: SampleKindAudio, Codec: CodecOpus, RTPTimestamp: 7_000_000})
+	mixAudioFirstTS := sink.samples[len(sink.samples)-1].RTPTimestamp
+	mixAudioFirstMs := uint32(int64(mixAudioFirstTS) * 1000 / int64(audioClockHz))
+
+	// Pre-fix: mix audio first frame would have been audioHWM +
+	// audioCatchup (~5020ms) and mix video first frame would have
+	// been videoHWM + videoCatchup (~3933ms) — a 1+ second skew.
+	// Post-fix the trailing video rebaser is rolled up to audio's
+	// hwm before catchup, so both first-after-flip frames land
+	// within one audio + one video tick of audio's hwm.
+	const tolMs = 50 // covers the 20ms audio + 33ms video catchup spread
+	skewMs := int64(mixAudioFirstMs) - int64(mixVideoFirstMs)
+	if skewMs < 0 {
+		skewMs = -skewMs
+	}
+	if skewMs > tolMs {
+		t.Errorf("post-flip A/V anchor skew = %dms (audio=%dms video=%dms), want ≤ %dms",
+			skewMs, mixAudioFirstMs, mixVideoFirstMs, tolMs)
+	}
+
+	// And neither kind should have rolled BACKWARDS past its own
+	// pre-flip hwm — a buggy implementation that pinned both to
+	// the trailing kind's hwm would do exactly that on audio.
+	if int32(mixAudioFirstTS-audioOutHWM) <= 0 {
+		t.Errorf("mix audio first TS %d not strictly past pre-flip audio hwm %d",
+			mixAudioFirstTS, audioOutHWM)
+	}
+	if int32(mixVideoFirstTS-videoOutHWM) <= 0 {
+		t.Errorf("mix video first TS %d not strictly past pre-flip video hwm %d",
+			mixVideoFirstTS, videoOutHWM)
+	}
+}
+
+// TestSwitcher_FlipBackPreservesLeadingKind covers the symmetric
+// case: when video LEADS audio (e.g. mix had only video), the
+// shared anchor must roll audio FORWARD without rolling video back.
+func TestSwitcher_FlipBackPreservesLeadingKind(t *testing.T) {
+	sw, sink := newTestSwitcher()
+	sw.markMixReady()
+
+	// Mix sends only video, hwm grows in video clock domain
+	// without touching audio. After the flip back to live, an
+	// incoming audio sample should be aligned to video's
+	// (millisecond) anchor so it doesn't replay 1+ second behind.
+	sw.feedSample(SourceMix, MediaSample{Kind: SampleKindVideo, Codec: CodecH264, RTPTimestamp: 100_000, IsKeyFrame: true})
+	sw.feedSample(SourceMix, MediaSample{Kind: SampleKindVideo, Codec: CodecH264, RTPTimestamp: 460_000}) // ~4 s later
+	videoHWM := sink.samples[len(sink.samples)-1].RTPTimestamp
+	videoHWMMs := uint32(int64(videoHWM) * 1000 / int64(videoClockHz))
+
+	sw.flipToLive("test")
+
+	// First live audio sample after the flip-back. Its output
+	// timestamp converted to ms must land near videoHWMMs (within
+	// one audio catchup tick = 20 ms), NOT at 0+catchup which is
+	// what an unaligned audio rebaser would emit because the
+	// audio rebaser was never used during the mix segment.
+	sw.feedSample(SourceLive, MediaSample{Kind: SampleKindAudio, Codec: CodecOpus, RTPTimestamp: 999_999})
+	audioFirstTS := sink.samples[len(sink.samples)-1].RTPTimestamp
+	audioFirstMs := uint32(int64(audioFirstTS) * 1000 / int64(audioClockHz))
+
+	// Aligned audio should be inside [videoHWMMs, videoHWMMs+50ms].
+	skewMs := int64(audioFirstMs) - int64(videoHWMMs)
+	if skewMs < 0 || skewMs > 50 {
+		t.Errorf("flip-back audio anchor = %dms, video hwm = %dms (skew=%dms), want skew in [0,50]",
+			audioFirstMs, videoHWMMs, skewMs)
+	}
+}
+
 func TestSwitcher_PacketTimestampsRewritten(t *testing.T) {
 	sw, sink := newTestSwitcher()
 

@@ -42,6 +42,7 @@ import (
 
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
+	"github.com/pion/webrtc/v4/pkg/media/h265reader"
 	"github.com/pion/webrtc/v4/pkg/media/ivfreader"
 	"github.com/pion/webrtc/v4/pkg/media/oggreader"
 )
@@ -51,8 +52,10 @@ func main() {
 		url         = flag.String("url", "", "WHIP endpoint URL (POST target)")
 		token       = flag.String("token", "", "Bearer token for Authorization header")
 		videoPath   = flag.String("video-ivf", "", "Path to IVF file (VP8/VP9/AV1) providing video")
+		h265Path    = flag.String("video-h265", "", "Path to raw HEVC Annex-B file providing video (used when -video-codec h265)")
+		h265FPS     = flag.Float64("video-h265-fps", 30, "Frame rate to pace HEVC samples at (used with -video-h265)")
 		audioPath   = flag.String("audio-ogg", "", "Path to Ogg/Opus file providing audio")
-		videoCodec  = flag.String("video-codec", "vp9", "Video codec hint: h264 | vp9 | av1 (must match IVF FourCC)")
+		videoCodec  = flag.String("video-codec", "vp9", "Video codec hint: h264 | vp8 | vp9 | av1 | h265 (must match the input container)")
 		duration    = flag.Duration("duration", 0, "Stop after this duration (0 = run until EOF or signal)")
 		extraHeader = flag.String("extra-header", "", "Optional single extra HTTP header 'Name: Value' to send on POST/DELETE")
 	)
@@ -61,8 +64,27 @@ func main() {
 	if *url == "" {
 		log.Fatalf("whipsim: -url is required")
 	}
-	if *videoPath == "" || *audioPath == "" {
-		log.Fatalf("whipsim: -video-ivf and -audio-ogg are required")
+	if *audioPath == "" {
+		log.Fatalf("whipsim: -audio-ogg is required")
+	}
+	// Video input is codec-dependent: h265 reads raw Annex-B, everything
+	// else reads IVF. Validate exactly one source is provided so a flag
+	// typo doesn't silently fall through to "open empty IVF" → no video.
+	switch strings.ToLower(*videoCodec) {
+	case "h265":
+		if *h265Path == "" {
+			log.Fatalf("whipsim: -video-h265 is required when -video-codec=h265")
+		}
+		if *videoPath != "" {
+			log.Fatalf("whipsim: -video-ivf is incompatible with -video-codec=h265 (use -video-h265)")
+		}
+	default:
+		if *videoPath == "" {
+			log.Fatalf("whipsim: -video-ivf is required for -video-codec=%s", *videoCodec)
+		}
+		if *h265Path != "" {
+			log.Fatalf("whipsim: -video-h265 is only valid with -video-codec=h265")
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -87,16 +109,47 @@ func main() {
 		}()
 	}
 
-	if err := run(ctx, *url, *token, *videoPath, *audioPath, *videoCodec, *extraHeader); err != nil {
+	if err := run(ctx, runConfig{
+		whipURL:     *url,
+		token:       *token,
+		videoPath:   *videoPath,
+		h265Path:    *h265Path,
+		h265FPS:     *h265FPS,
+		audioPath:   *audioPath,
+		videoCodec:  *videoCodec,
+		extraHeader: *extraHeader,
+	}); err != nil {
 		log.Fatalf("whipsim: %v", err)
 	}
+}
+
+// runConfig groups run()'s parameters: the orchestrator already needs
+// 7+ inputs and adding more positional arguments per codec invites
+// silent argument-order bugs at the call site.
+type runConfig struct {
+	whipURL     string
+	token       string
+	videoPath   string
+	h265Path    string
+	h265FPS     float64
+	audioPath   string
+	videoCodec  string
+	extraHeader string
 }
 
 // run orchestrates the peer-connection lifecycle: build tracks for the
 // chosen codec, post the offer to the WHIP endpoint, stream media from
 // disk until ctx is done, then DELETE the session. It blocks until
 // ctx.Done() is observed so callers can `wait` on the process.
-func run(ctx context.Context, whipURL, token, videoPath, audioPath, videoCodec, extraHeader string) error {
+func run(ctx context.Context, cfg runConfig) error {
+	whipURL := cfg.whipURL
+	token := cfg.token
+	videoPath := cfg.videoPath
+	h265Path := cfg.h265Path
+	h265FPS := cfg.h265FPS
+	audioPath := cfg.audioPath
+	videoCodec := cfg.videoCodec
+	extraHeader := cfg.extraHeader
 	mime, clockRate, err := codecMime(videoCodec)
 	if err != nil {
 		return err
@@ -180,8 +233,15 @@ func run(ctx context.Context, whipURL, token, videoPath, audioPath, videoCodec, 
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		if err := pumpVideo(ctx, videoPath, videoTrack); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("whipsim: video pump stopped: %v", err)
+		var pumpErr error
+		switch strings.ToLower(videoCodec) {
+		case "h265":
+			pumpErr = pumpH265(ctx, h265Path, h265FPS, videoTrack)
+		default:
+			pumpErr = pumpVideo(ctx, videoPath, videoTrack)
+		}
+		if pumpErr != nil && !errors.Is(pumpErr, context.Canceled) {
+			log.Printf("whipsim: video pump stopped: %v", pumpErr)
 		}
 	}()
 	go func() {
@@ -204,12 +264,14 @@ func run(ctx context.Context, whipURL, token, videoPath, audioPath, videoCodec, 
 }
 
 // codecMime maps the human-readable -video-codec flag to pion's MIME
-// constants. ClockRate is always 90 kHz for our three supported video
-// codecs; the helper returns it anyway so callers don't hard-code.
+// constants. ClockRate is always 90 kHz for our supported video codecs;
+// the helper returns it anyway so callers don't hard-code.
 func codecMime(codec string) (string, uint32, error) {
 	switch strings.ToLower(codec) {
 	case "h264":
 		return webrtc.MimeTypeH264, 90000, nil
+	case "h265":
+		return webrtc.MimeTypeH265, 90000, nil
 	case "vp8":
 		return webrtc.MimeTypeVP8, 90000, nil
 	case "vp9":
@@ -217,7 +279,7 @@ func codecMime(codec string) (string, uint32, error) {
 	case "av1":
 		return webrtc.MimeTypeAV1, 90000, nil
 	default:
-		return "", 0, fmt.Errorf("unsupported video codec %q (want h264|vp8|vp9|av1)", codec)
+		return "", 0, fmt.Errorf("unsupported video codec %q (want h264|h265|vp8|vp9|av1)", codec)
 	}
 }
 
@@ -246,6 +308,21 @@ func registerCodecs(m *webrtc.MediaEngine, videoCodec string) error {
 				SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
 			},
 			PayloadType: 102,
+		}, webrtc.RTPCodecTypeVideo)
+	case "h265":
+		// PT 116 mirrors h265BypassH265PT in axonkit/pkg/broadcast/source_mix_h265.go.
+		// Picking the same value isn't strictly required (axonkit's
+		// bypass negotiates whatever the offer carries), but matching
+		// keeps wireshark traces lined up with axonkit's own offers
+		// when the two run side-by-side. SDPFmtpLine is left empty —
+		// pion will emit the bare rtpmap, which is what the bypass
+		// expects (it doesn't gate on profile-id).
+		return m.RegisterCodec(webrtc.RTPCodecParameters{
+			RTPCodecCapability: webrtc.RTPCodecCapability{
+				MimeType:  webrtc.MimeTypeH265,
+				ClockRate: 90000,
+			},
+			PayloadType: 116,
 		}, webrtc.RTPCodecTypeVideo)
 	case "vp8":
 		return m.RegisterCodec(webrtc.RTPCodecParameters{
@@ -430,6 +507,141 @@ func pumpVideo(ctx context.Context, path string, track *webrtc.TrackLocalStaticS
 			return ctx.Err()
 		case <-ticker.C:
 		}
+	}
+}
+
+// pumpH265 streams an HEVC Annex-B bitstream as pion media.Samples,
+// pacing access units at the requested frame rate. Unlike VP9/AV1
+// (where IVF gives us a clean "one frame per record" boundary) raw
+// HEVC interleaves parameter sets (VPS/SPS/PPS), AUDs, prefix-SEIs and
+// VCL slices into a single byte stream; we use pion's h265reader to
+// crack the bitstream into NALs and group them into access units the
+// way RFC 7798 expects: every NAL up to (but not including) the next
+// VCL slice belongs to the *next* access unit, so non-VCL NALs
+// (parameter sets, AUDs, prefix-SEIs) get prepended to the upcoming
+// frame, and concatenated VCL slices of the same picture stay glued.
+//
+// The picture-boundary heuristic is "any new VCL NAL starts a new
+// picture". HEVC actually allows multiple VCL NALs per picture
+// (slice segments), but ffmpeg in the verify pipeline encodes one
+// slice per picture (no -slices flag), so this simple rule is enough
+// for the broadcast verify scripts and matches what the avflow Chrome
+// path produces in production.
+func pumpH265(ctx context.Context, path string, fps float64, track *webrtc.TrackLocalStaticSample) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open h265: %w", err)
+	}
+	defer f.Close()
+
+	reader, err := h265reader.NewReader(f)
+	if err != nil {
+		return fmt.Errorf("h265 reader: %w", err)
+	}
+
+	if fps <= 0 {
+		fps = 30
+	}
+	frameDuration := time.Duration(float64(time.Second) / fps)
+	log.Printf("whipsim: h265 video pump fps=%.2f frame-duration=%s", fps, frameDuration)
+
+	const startCode = "\x00\x00\x00\x01"
+	var (
+		pending     bytes.Buffer
+		hasVCL      bool
+		framesSent  int
+		ticker      = time.NewTicker(frameDuration)
+		flushSample = func() error {
+			if pending.Len() == 0 {
+				return nil
+			}
+			au := make([]byte, pending.Len())
+			copy(au, pending.Bytes())
+			pending.Reset()
+			hasVCL = false
+			if framesSent == 0 {
+				log.Printf("whipsim: h265 first access unit emitted (size=%d)", len(au))
+			}
+			framesSent++
+			if err := track.WriteSample(media.Sample{
+				Data:     au,
+				Duration: frameDuration,
+			}); err != nil {
+				return fmt.Errorf("write h265 sample: %w", err)
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-ticker.C:
+			}
+			return nil
+		}
+	)
+	defer ticker.Stop()
+
+	for {
+		nal, err := reader.NextNAL()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("h265 parse: %w", err)
+		}
+		isVCL := isH265VCL(nal.NalUnitType)
+		// Access-unit boundary detection. Per ITU-T H.265 §7.4.2.4.4
+		// an AU is led by VPS/SPS/PPS/AUD/PrefixSEI, then carries one
+		// or more VCL slices, then optionally trailing non-VCL NALs
+		// (SuffixSEI/EOS/EOB/FD). We flush whenever we already buffered
+		// at least one VCL and the *next* NAL is itself a VCL or one
+		// of the AU-leading non-VCL types — this correctly handles
+		// libx265 -repeat-headers (which emits VPS/SPS/PPS in front of
+		// every IDR) without mis-attaching them to the previous AU.
+		// Trailing non-VCL types (SuffixSEI etc.) stay glued to the
+		// current AU.
+		if hasVCL && (isVCL || isH265AUStart(nal.NalUnitType)) {
+			if err := flushSample(); err != nil {
+				return err
+			}
+		}
+		pending.WriteString(startCode)
+		pending.Write(nal.Data)
+		if isVCL {
+			hasVCL = true
+		}
+	}
+	// Trailing access unit (last picture in the stream).
+	if hasVCL {
+		if err := flushSample(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// isH265VCL reports whether a NAL unit type is a VCL (video coding
+// layer) slice — i.e., picture data. Per ITU-T H.265 Table 7-1, NAL
+// types 0..31 are VCL; non-VCL types start at 32 (VPS) and run up to
+// 63. The h265reader package's NalUnitType enum mirrors these values.
+func isH265VCL(t h265reader.NalUnitType) bool {
+	return t <= 31
+}
+
+// isH265AUStart reports whether a non-VCL NAL type is an "AU-leading"
+// NAL — one that may legally precede a picture's VCL slices and
+// therefore signals the start of a new access unit when seen after
+// another picture's VCL slice. Trailing non-VCL types (SuffixSEI,
+// EOS, EOB, FD) stay attached to the *previous* picture, so they
+// must NOT trigger a flush.
+func isH265AUStart(t h265reader.NalUnitType) bool {
+	switch t {
+	case h265reader.NalUnitTypeVps,
+		h265reader.NalUnitTypeSps,
+		h265reader.NalUnitTypePps,
+		h265reader.NalUnitTypeAud,
+		h265reader.NalUnitTypePrefixSei:
+		return true
+	default:
+		return false
 	}
 }
 

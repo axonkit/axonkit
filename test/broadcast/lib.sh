@@ -323,6 +323,16 @@ _lib_video_encode_args() {
             # doesn't silently re-introduce reorder latency.
             echo "-c:v libx264 -preset ultrafast -tune zerolatency -profile:v main -bf 0 -pix_fmt yuv420p -g 30 -r 30"
             ;;
+        h265)
+            # libx265 in real-time mode. WebRTC H.265 (RFC 7798) again
+            # has no defined picture-reordering mechanism so B-frames
+            # are off via -bf 0 plus libx265's own -x265-params bframes=0
+            # (libx265 ignores ffmpeg's -bf and only honours the param
+            # bag). repeat-headers=1 emits VPS/SPS/PPS in front of every
+            # IDR, which the axonkit H265 bypass relies on to bootstrap
+            # late subscribers (avflow Chrome does the same).
+            echo "-c:v libx265 -preset ultrafast -tune zerolatency -bf 0 -pix_fmt yuv420p -g 30 -r 30 -x265-params bframes=0:repeat-headers=1:keyint=30:min-keyint=30:scenecut=0"
+            ;;
         vp8)
             # libvpx in real-time mode. -deadline realtime + -cpu-used 4
             # match what WebRTC's libvpx encoder does in browsers, and
@@ -416,6 +426,47 @@ _lib_whip_publish_whipsim() {
     echo $!
 }
 
+# _lib_whip_publish_whipsim_h265 pushes via whipsim using a raw HEVC
+# Annex-B FIFO instead of IVF. ffmpeg's IVF muxer hard-rejects H.265,
+# and whipsim's IVF reader expects VP8/VP9/AV1 FourCCs — so for H.265
+# we hand whipsim the raw bitstream and let its h265reader-based pump
+# split NAL units into access units. The audio leg is identical to
+# _lib_whip_publish_whipsim. Echoes the whipsim pid for tracking.
+_lib_whip_publish_whipsim_h265() {
+    local color=$1 tone=$2 token=$3 logfile=$4 label=$5 url=$6
+    local venc
+    venc=$(_lib_video_encode_args) || return 1
+    local vfifo="$STATE_DIR/${label}.h265"
+    local afifo="$STATE_DIR/${label}.ogg"
+    rm -f "$vfifo" "$afifo"
+    mkfifo "$vfifo" "$afifo"
+
+    # ffmpeg encodes HEVC straight to Annex-B (`-f hevc`) and Opus to
+    # Ogg with one packet per page (-page_duration 20000) so whipsim
+    # can stream packets at 20 ms cadence (see _lib_whip_publish_whipsim
+    # for the same constraint).
+    ffmpeg -hide_banner -loglevel warning -nostats -y -re \
+        -f lavfi -i "$color,format=yuv420p" \
+        -f lavfi -i "$tone" \
+        -map 0:v $venc -f hevc "$vfifo" \
+        -map 1:a -c:a libopus -b:a 64k -ar 48000 -ac 2 \
+        -page_duration 20000 -f ogg "$afifo" \
+        >"${logfile}.ffmpeg" 2>&1 &
+    local fpid=$!
+    lib_track_pid "$fpid"
+
+    "$REPO_ROOT/bin/whipsim" \
+        -url "$url" \
+        -token "$token" \
+        -video-h265 "$vfifo" \
+        -video-h265-fps 30 \
+        -audio-ogg "$afifo" \
+        -video-codec h265 \
+        -duration 10m \
+        >"$logfile" 2>&1 &
+    echo $!
+}
+
 # _lib_whip_publish is the codec-aware dispatcher used by the room
 # publishers (userA/userB). The mix-leg publisher in verify.sh calls
 # the concrete helpers directly because it uses a different URL.
@@ -424,6 +475,13 @@ _lib_whip_publish() {
     case "$VIDEO_CODEC" in
         h264)
             _lib_whip_publish_ffmpeg "$color" "$tone" "$token" "$logfile"
+            ;;
+        h265)
+            # ffmpeg's -f whip muxer is hard-coded to H.264, and its
+            # IVF muxer rejects H.265 — so H.265 ingest goes through
+            # whipsim with a raw Annex-B feed.
+            _lib_whip_publish_whipsim_h265 "$color" "$tone" "$token" "$logfile" "$label" \
+                "$BASE_URL/whip/$ROOM"
             ;;
         vp8|vp9|av1)
             # ffmpeg's -f whip muxer is hard-coded to H.264, so VP8 / VP9

@@ -3,6 +3,7 @@ package broadcast
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -25,7 +26,26 @@ type rtmpFrame struct {
 	// are offset from an arbitrary origin.
 	timestampMs uint32
 	body        []byte
+	// reconnect, when true, marks this entry as a reconnect sentinel
+	// rather than a real FLV tag. pump returns errReconnectRequested
+	// at the moment it dequeues the sentinel; runLoop treats that as
+	// an intentional disconnect (no retry-budget hit) and dials a
+	// fresh RTMP session for the queue tail. The sentinel is queued
+	// by requestReconnect on a video codec *class* change (classic
+	// AVC ↔ E-RTMP FourCC) so the receiver opens a new recording
+	// segment whose first tag is a fresh codec-config record. Same-
+	// class config swaps (different SPS/PPS bytes within H.264, e.g.
+	// high-profile-with-B-frames ↔ baseline-no-B-frames) do NOT
+	// trigger this — the in-band SeqHeader tag suffices, and a
+	// gratuitous reconnect would only inflate flip latency.
+	reconnect bool
 }
+
+// errReconnectRequested is the sentinel pump returns when it dequeues
+// a reconnect-marker frame. runLoop intercepts it and dials a fresh
+// session without consuming the failure-retry budget; any other error
+// from pump retains the original "publish failed" semantics.
+var errReconnectRequested = errors.New("rtmp pusher: reconnect requested by codec class change")
 
 // rtmpPusher is one outbound RTMP push target. It buffers FLV tags
 // internally, opens the RTMP connection lazily on the first Enqueue,
@@ -262,6 +282,17 @@ func (p *rtmpPusher) LastError() string {
 // emitted header — preventing a mid-stream SeqHeader tag that would
 // otherwise cause ffmpeg (and similar RTMP demuxers) to drop the TCP
 // connection even though the codec config hasn't changed.
+//
+// Codec *class* changes (a previous header used an E-RTMP FourCC and
+// the new one is classic AVC) trigger requestReconnect ahead of the
+// new tag: ffmpeg's FLV demuxer treats classic-AVC-after-FourCC as a
+// brand-new input stream and silently drops the tags on `-c copy`,
+// leaving a video gap in the recording. Forcing a TCP reconnect makes
+// the receiver open a fresh segment whose first tag is the new codec
+// config — same effect every other RTMP recorder gets via natural
+// connection turnover. Same-class config swaps (different SPS/PPS
+// bytes within classic AVC, e.g. high-profile-B ↔ baseline-no-B) flow
+// through the in-band SeqHeader tag without a reconnect.
 func (p *rtmpPusher) EnsureVideoSeqHeader(avcc []byte) bool {
 	if len(avcc) == 0 {
 		return false
@@ -274,9 +305,19 @@ func (p *rtmpPusher) EnsureVideoSeqHeader(avcc []byte) bool {
 		p.videoSeqMu.Unlock()
 		return false
 	}
+	// Class change criterion: a previous SeqHeader was emitted (so
+	// videoSeqBody is non-empty) AND it carried a FourCC (so the
+	// receiver's current codec is non-AVC). The first SeqHeader of
+	// the pusher's lifetime (videoSeqBody empty) is never a class
+	// change — there is no prior class to differ from.
+	classChanged := len(p.videoSeqBody) > 0 && p.videoSeqFourCC != ""
+	prevFourCC := p.videoSeqFourCC
 	p.videoSeqBody = append(p.videoSeqBody[:0], avcc...)
 	p.videoSeqFourCC = ""
 	p.videoSeqMu.Unlock()
+	if classChanged {
+		p.requestReconnect("classic AVC follows E-RTMP " + prevFourCC)
+	}
 	p.enqueue(&rtmpFrame{
 		kind:        SampleKindVideo,
 		timestampMs: 0,
@@ -287,11 +328,14 @@ func (p *rtmpPusher) EnsureVideoSeqHeader(avcc []byte) bool {
 
 // EnsureExVideoSeqHeader is the E-RTMP counterpart of
 // EnsureVideoSeqHeader: used for codecs that live in the enhanced-RTMP
-// video tag layout (VP9 + AV1 today). The caller supplies a FourCC
-// plus the codec configuration record (VPCodecConfigurationRecord /
-// AV1CodecConfigurationRecord); this method only guards the "send
-// once per source" contract and skips the enqueue when both the
-// FourCC and config bytes match the previously emitted header.
+// video tag layout (VP9 / AV1 / H.265 today). The caller supplies a
+// FourCC plus the codec configuration record (VPCodecConfigurationRecord
+// / AV1CodecConfigurationRecord / HEVCDecoderConfigurationRecord); this
+// method guards the "send once per source" contract, skips the enqueue
+// when both the FourCC and config bytes match the previously emitted
+// header, and triggers a forced reconnect when the FourCC class
+// changes (classic AVC → E-RTMP, or one E-RTMP FourCC → another). See
+// EnsureVideoSeqHeader for why same-class config swaps stay in-band.
 func (p *rtmpPusher) EnsureExVideoSeqHeader(fourCC string, config []byte) bool {
 	if len(fourCC) != 4 || len(config) == 0 {
 		return false
@@ -304,9 +348,24 @@ func (p *rtmpPusher) EnsureExVideoSeqHeader(fourCC string, config []byte) bool {
 		p.videoSeqMu.Unlock()
 		return false
 	}
+	// Class change criterion: a previous SeqHeader was emitted (so
+	// videoSeqBody is non-empty) AND its FourCC differs from the
+	// incoming one. Classic-AVC carries "" in videoSeqFourCC, so a
+	// classic-AVC → E-RTMP flip lands here as a class change. Two
+	// distinct E-RTMP codecs (e.g. VP9 → AV1) also count, since
+	// every receiver re-binds its decoder on FourCC change.
+	classChanged := len(p.videoSeqBody) > 0 && p.videoSeqFourCC != fourCC
+	prevFourCC := p.videoSeqFourCC
 	p.videoSeqBody = append(p.videoSeqBody[:0], config...)
 	p.videoSeqFourCC = fourCC
 	p.videoSeqMu.Unlock()
+	if classChanged {
+		from := prevFourCC
+		if from == "" {
+			from = "classic AVC"
+		}
+		p.requestReconnect("E-RTMP " + fourCC + " follows " + from)
+	}
 	p.enqueue(&rtmpFrame{
 		kind:        SampleKindVideo,
 		timestampMs: 0,
@@ -337,6 +396,43 @@ func (p *rtmpPusher) EnsureAudioSeqHeader(channels uint8) bool {
 // the TCP connection open. Differing bytes → a fresh SeqHeader tag
 // is enqueued before the next keyframe.
 func (p *rtmpPusher) ResetVideoHeader() { p.videoHdrSent.Store(false) }
+
+// requestReconnect enqueues a reconnect sentinel into the send queue
+// and arms the audio-seq-header latch so the new RTMP session opens
+// with a fresh Opus config tag. Called from Ensure(Ex)VideoSeqHeader
+// on a video codec class change.
+//
+// Why audio also resets here: EnsureAudioSeqHeader is a one-shot per
+// pusher lifetime, but RTMP receivers expect the codec config in the
+// first audio tag of *each* TCP session. Without this reset the first
+// audio packet on the post-reconnect session would land naked, and
+// recorder ffmpeg would either drop it or silently disable audio
+// decode for the new segment. Resetting BEFORE enqueueing the
+// sentinel means audio samples that arrive on the hot path between
+// here and pump's sentinel pickup also re-emit their SeqHeader
+// (CAS-guarded so exactly one fires), which then naturally lands
+// after the sentinel in queue order.
+//
+// Hot-path budget: this runs at the live↔mix flip rate (~once per
+// phase boundary, not per frame). The non-blocking enqueue keeps the
+// path O(1); a queue-full path is instrumented but doesn't block.
+func (p *rtmpPusher) requestReconnect(reason string) {
+	p.logger.Info("rtmp pusher: forcing reconnect for codec class change",
+		"reason", reason)
+	p.audioHdrSent.Store(false)
+	sentinel := &rtmpFrame{reconnect: true}
+	select {
+	case p.queue <- sentinel:
+	default:
+		// Queue full → frames are already being dropped, so the
+		// receiver was about to break anyway. Bump the dropped
+		// counter for operator visibility but skip the segment
+		// boundary; pump stays on the existing session and the
+		// next codec change re-arms us.
+		p.dropped.Add(1)
+		p.logger.Warn("rtmp pusher: queue full while requesting reconnect; segment boundary skipped")
+	}
+}
 
 // WriteSample encodes one MediaSample into an FLV tag and enqueues it
 // for send. Drops the sample (with a counter bump) if the send queue
@@ -483,14 +579,34 @@ func (p *rtmpPusher) timestampMs(kind SampleKind, ts uint32) uint32 {
 // runLoop is the background goroutine: connect → publish → drain queue
 // → retry on error. Exits once the queue is closed or the context is
 // canceled.
+//
+// Two distinct exit paths from connectAndDrain:
+//   - errReconnectRequested (sentinel): an intentional disconnect
+//     triggered by a video codec class change. Loops back to dial a
+//     fresh RTMP session WITHOUT spending the failure-retry budget,
+//     so a healthy run can flip live↔mix any number of times.
+//   - any other non-nil error: a real publish failure (TCP reset,
+//     handshake failed, peer dropped, etc.). Records the error,
+//     waits rtmpRetryInterval, and counts toward rtmpMaxRetries.
 func (p *rtmpPusher) runLoop(ctx context.Context) {
 	defer close(p.done)
 
-	for retries := 0; retries <= rtmpMaxRetries; retries++ {
+	retries := 0
+	for retries <= rtmpMaxRetries {
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		if err := p.connectAndDrain(ctx); err != nil {
+		err := p.connectAndDrain(ctx)
+		switch {
+		case err == nil:
+			// Clean exit (queue closed).
+			return
+		case errors.Is(err, errReconnectRequested):
+			p.connected.Store(false)
+			p.logger.Info("rtmp pusher: reconnecting after codec class change")
+			// Intentional disconnect: do NOT bump retries.
+			continue
+		default:
 			p.recordErr(err)
 			p.connected.Store(false)
 			p.logger.Error("rtmp publish failed",
@@ -501,10 +617,8 @@ func (p *rtmpPusher) runLoop(ctx context.Context) {
 				return
 			case <-time.After(rtmpRetryInterval):
 			}
-			continue
+			retries++
 		}
-		// Clean exit (queue closed).
-		return
 	}
 	p.logger.Error("rtmp pusher gave up after retries")
 }
@@ -540,8 +654,11 @@ func (p *rtmpPusher) connectAndDrain(ctx context.Context) error {
 }
 
 // pump reads from the queue and forwards every frame to the RTMP
-// stream. Returns nil when the queue closes (clean shutdown), an error
-// for any send failure so the caller can retry the connection.
+// stream. Returns nil when the queue closes (clean shutdown),
+// errReconnectRequested when it dequeues a reconnect sentinel (so
+// runLoop redials with a fresh TCP session without consuming the
+// failure-retry budget), or a wrapped error for any send failure so
+// the caller can retry the connection on the regular backoff path.
 func (p *rtmpPusher) pump(ctx context.Context, stream *gortmp.Stream) error {
 	for {
 		select {
@@ -550,6 +667,9 @@ func (p *rtmpPusher) pump(ctx context.Context, stream *gortmp.Stream) error {
 		case f, ok := <-p.queue:
 			if !ok {
 				return nil
+			}
+			if f.reconnect {
+				return errReconnectRequested
 			}
 			if err := writeFLVFrame(stream, f); err != nil {
 				return fmt.Errorf("write frame: %w", err)

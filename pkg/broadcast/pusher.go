@@ -34,6 +34,21 @@ type destinationPusher interface {
 	// receiver before its first IDR. WHIP pushers (raw RTP) are
 	// no-ops.
 	ResetVideoHeader()
+
+	// FlushVideoReorder drains any access units still parked in the
+	// per-pusher DTS-reorder lookahead window and immediately enqueues
+	// their FLV tags. The switcher calls this on every source flip
+	// BEFORE ResetVideoHeader so the trailing window of the OUTGOING
+	// source's frames lands ahead of the new source's SeqHeader tag.
+	// Without this drain step the SeqHeader for the incoming source
+	// (e.g. baseline-profile mix) appears in the FLV file ahead of
+	// 1–4 buffered frames from the outgoing source (high-profile
+	// live), and the receiver decodes those trailing frames against
+	// the wrong codec config — producing the "reference count
+	// overflow" / "corrupted macroblock" cascade we saw on phase A
+	// of verify-rtmp.sh. WHIP pushers (raw RTP, no reorder buffer)
+	// are no-ops.
+	FlushVideoReorder()
 }
 
 // rtmpPusherAdapter wraps rtmpPusher to match destinationPusher. It
@@ -90,6 +105,13 @@ func (a *rtmpPusherAdapter) WriteRTP(SampleKind, *rtp.Packet) {}
 
 func (a *rtmpPusherAdapter) ResetVideoHeader() { a.inner.ResetVideoHeader() }
 
+// FlushVideoReorder pushes the trailing window of the outgoing
+// source's H.264 / H.265 access units out of the DTS-reorder buffer
+// and into the FLV send queue. Called by Broadcast on every source
+// flip ahead of ResetVideoHeader so the SeqHeader for the incoming
+// source does not race ahead of the outgoing source's last frames.
+func (a *rtmpPusherAdapter) FlushVideoReorder() { a.inner.flushVideoReorder() }
+
 // whipPusherAdapter wraps whipPusher to match destinationPusher.
 type whipPusherAdapter struct {
 	inner *whipPusher
@@ -110,3 +132,9 @@ func (a *whipPusherAdapter) WriteRTP(kind SampleKind, pkt *rtp.Packet) {
 // ResetVideoHeader is a no-op for WHIP: raw RTP passthrough does not
 // carry a codec sequence header. SPS/PPS arrive in-band on keyframes.
 func (a *whipPusherAdapter) ResetVideoHeader() {}
+
+// FlushVideoReorder is a no-op for WHIP: raw RTP passthrough does
+// not buffer access units, so there is nothing to drain on a source
+// flip. SPS/PPS travel in-band on every IDR and the receiver re-
+// configures its decoder without help from the egress.
+func (a *whipPusherAdapter) FlushVideoReorder() {}
