@@ -16,12 +16,10 @@ type fakeSink struct {
 		kind SampleKind
 		ts   uint32
 	}
-	lastExtradataLen int
 }
 
 func (f *fakeSink) emitSample(s MediaSample, extradata []byte) {
 	f.samples = append(f.samples, s)
-	f.lastExtradataLen = len(extradata)
 }
 func (f *fakeSink) emitPacket(kind SampleKind, pkt *rtp.Packet) {
 	f.packets = append(f.packets, struct {

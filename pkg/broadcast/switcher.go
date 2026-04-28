@@ -96,12 +96,8 @@ type rebaser struct {
 // rewrite returns the output TS for an incoming sample. Output is
 // monotonic *across* source flips (driven by hwm + catchup) but is
 // allowed to step backwards *within* a source whenever the input PTS
-// does — exactly the case for an H.264 B-frame whose presentation
-// timestamp precedes the prior P-frame in arrival order. The previous
-// implementation collapsed this into a strictly-monotonic sequence by
-// treating any backward delta as 32-bit wraparound, which silently
-// erased the CompositionTime offset the egress dts-reorder buffer
-// needs to rebuild a playable recording.
+// does. That preserves the CompositionTime offset the egress
+// dts-reorder buffer needs for B-frame recordings.
 func (r *rebaser) rewrite(inTS uint32) uint32 {
 	if !r.initialized {
 		r.initialized = true
@@ -218,16 +214,9 @@ type switcher struct {
 	mixReady bool
 
 	// Sample and packet paths each have their own per-kind rebaser.
-	// They are intentionally NOT shared: liveSource feeds a single
-	// RTP packet into packetSink(feedPacket) AND — after the
-	// depacketizer assembles a sample — into sampleSink(feedSample).
-	// If we shared one rebaser, feedPacket would rewrite
-	// pkt.Timestamp in place, the depack would carry the rebased TS
-	// into sample.RTPTimestamp, and feedSample would try to rebase
-	// an already-rebased value against the original srcBase — a
-	// uint32 underflow that produced hours of bogus FLV timestamps
-	// in early verify-broadcast runs. Splitting gives each sink its
-	// own monotonic output clock.
+	// Do not share them: packet forwarding and depacketized samples
+	// both pass through the switcher, and a shared rebaser would rebase
+	// sample timestamps that were already rewritten on the packet path.
 	audioSample rebaser
 	videoSample rebaser
 	audioPacket rebaser
@@ -392,15 +381,9 @@ func (s *switcher) feedSample(src SourceKind, sample MediaSample) {
 // apply the same source gating as feedSample and produce a *copy* of
 // pkt with the rewritten output-clock timestamp.
 //
-// Crucially: we do NOT mutate the caller's pkt.Timestamp. The same
-// *rtp.Packet pointer is then fed into the source's depacketizer by
-// the caller (liveSource.handleVideo / mixSource.handleVideo), and
-// the depacketizer stamps its assembled MediaSample with
-// pkt.Timestamp. If we rewrote pkt in place the downstream
-// sampleSink path would receive already-rebased timestamps and try
-// to rebase them again against the sample rebaser's baseline — the
-// uint32 underflow bug that produced FLV streams with hours of
-// virtual duration and broke the verify-broadcast color probes.
+// We do not mutate the caller's pkt.Timestamp: the same packet may feed
+// a depacketizer, and samples need the original timestamp before they
+// pass through their own rebaser.
 func (s *switcher) feedPacket(src SourceKind, kind SampleKind, pkt *rtp.Packet) {
 	s.mu.RLock()
 	if s.terminated {
@@ -411,7 +394,7 @@ func (s *switcher) feedPacket(src SourceKind, kind SampleKind, pkt *rtp.Packet) 
 	mixReady := s.mixReady
 	s.mu.RUnlock()
 
-	if !s.sourceEmits(src, kind, state, mixReady, pkt.Marker, false) {
+	if !s.sourceEmits(src, kind, state, mixReady) {
 		return
 	}
 	var r *rebaser
@@ -442,8 +425,6 @@ func (s *switcher) sourceEmits(
 	kind SampleKind,
 	state switchState,
 	mixReady bool,
-	_ bool, // marker (unused)
-	_ bool, // isKeyframe (unused at this level)
 ) bool {
 	activeIsMix := state == sourceMixActive
 	switch src {

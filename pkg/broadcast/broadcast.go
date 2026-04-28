@@ -110,15 +110,12 @@ type mixIngress interface {
 }
 
 // Broadcast is the runtime object for one "push room user → N sinks"
-// task. A Broadcast owns a mediasoup Router-dedicated DirectTransport
-// pair (one for live, one for mix — created lazily in later milestones
-// when those sources are actually wired up) and an optional mix WHIP
-// session.
+// task. It owns the live source, optional mix ingress, outbound
+// pushers, and the switcher that fans the active source into them.
 //
 // Concurrency: all mutable fields are guarded by mu. Hot-path RTP
-// forwarding goes through the Switcher (next milestone) which owns its
-// own locking; the Broadcast-level mu only protects control-plane
-// state transitions (start/terminate/mix-connect/mix-disconnect).
+// forwarding goes through switcher, which owns its own locking; the
+// Broadcast-level mu only protects control-plane transitions.
 type Broadcast struct {
 	id           string
 	room         string
@@ -250,11 +247,9 @@ func (b *Broadcast) Status() Status {
 }
 
 // Start validates the live identity is currently publishing and
-// prepares the broadcast for forwarding. It creates the outbound
-// pushers first (so connection errors fail the POST), then wires the
-// live source's DirectTransport + Consumers and starts dispatching
-// RTP. The mix path is wired separately via POST /rtc/broadcast/{id}/whip
-// in a later milestone.
+// prepares the broadcast for forwarding. It creates outbound pushers,
+// wires the live DirectTransport + Consumers, and installs the switcher;
+// mix ingress is attached later via POST /rtc/broadcast/{id}/whip.
 //
 // Errors:
 //   - ErrRoomNotFound:          room does not exist on this node
@@ -505,12 +500,9 @@ func (b *Broadcast) Terminate() {
 }
 
 // terminate is the single "stop everything" path. Idempotent: a
-// second call is a no-op. Ordering mirrors existing WHIP teardown:
-// stop the source (so no more samples arrive), then the pushers (so
-// downstream sees a clean EOS rather than a half-written tag), then
-// drop the broadcast from the manager registry via the onTerminate
-// callback. Mix ingest (milestone 4) is torn down before the live
-// source so avflow receives a clean WHEP DELETE too.
+// second call is a no-op. The switcher stops first, then mix and live
+// sources, then pushers; finally the manager callback removes the
+// broadcast from the registry.
 func (b *Broadcast) terminate(reason TerminationReason) {
 	b.mu.Lock()
 	if b.terminated {
@@ -714,7 +706,7 @@ func (b *Broadcast) DetachMix() error {
 // PatchMixICE handles PATCH /rtc/broadcast/{id}/whip. Only If-Match: *
 // (ICE restart) is supported; trickle-ICE is accepted but ignored.
 // Returns the new IceUfrag on restart, or the existing one otherwise.
-func (b *Broadcast) PatchMixICE(ifMatch, _ string) (string, error) {
+func (b *Broadcast) PatchMixICE(ifMatch string) (string, error) {
 	b.mu.RLock()
 	mix := b.mix
 	etag := b.mixETag
@@ -783,6 +775,7 @@ func (b *Broadcast) handleMixGone(reason string) {
 	b.mix = nil
 	b.mixConnected = false
 	b.mixETag = ""
+	b.mixIceState = ""
 	b.mu.Unlock()
 
 	if sw != nil {

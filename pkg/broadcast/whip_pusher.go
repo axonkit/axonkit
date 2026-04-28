@@ -88,7 +88,6 @@ type whipPusher struct {
 	started   atomic.Bool
 	connected atomic.Bool
 	bytesOut  atomic.Uint64
-	dropped   atomic.Uint64
 	lastErr   atomic.Pointer[string]
 	done      chan struct{}
 	// reconnectCh is a buffered=1 nudge: NoteVideoCodec writes to it
@@ -231,7 +230,6 @@ func (p *whipPusher) WriteRTP(kind SampleKind, pkt *rtp.Packet) {
 	// reconnect window — receivers never decode mismatched payload
 	// against a stale SDP fmtp.
 	if !p.connected.Load() {
-		p.dropped.Add(1)
 		return
 	}
 	// Snapshot the active tracks under pcMu so a concurrent

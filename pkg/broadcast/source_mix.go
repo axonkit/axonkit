@@ -34,11 +34,6 @@ type mixSource struct {
 	// transport is the WHIP WebRtcTransport that ingested the mix.
 	// Owned by the Broadcast once attached; closed on Detach/Close.
 	transport *mediasoup.Transport
-	// producers are the mediasoup producers published by avflow.
-	// Audio + video; exactly the two we expect from the mix.
-	audioProducer *mediasoup.Producer
-	videoProducer *mediasoup.Producer
-
 	// directTransport carries the Consumer pair that feeds our
 	// depacketizers. A dedicated DirectTransport in the same router
 	// is required to get raw RTP via Consumer.OnRtp.
@@ -80,7 +75,6 @@ type mixSource struct {
 	packetSink packetSink
 
 	mu             sync.Mutex
-	iceState       mediasoup.IceState
 	disconnectedAt time.Time
 	iceConnected   bool
 	stopCh         chan struct{}
@@ -157,8 +151,6 @@ func newMixSource(p mixSourceParams) (*mixSource, error) {
 	ms := &mixSource{
 		logger:          p.Logger,
 		transport:       p.Transport,
-		audioProducer:   p.AudioProducer,
-		videoProducer:   p.VideoProducer,
 		directTransport: dt,
 		audioCons:       audioCons,
 		videoCons:       videoCons,
@@ -209,7 +201,6 @@ func (ms *mixSource) handleIceState(state mediasoup.IceState) {
 		ms.onIceState(state)
 	}
 	ms.mu.Lock()
-	ms.iceState = state
 	switch state {
 	case mediasoup.IceStateConnected, mediasoup.IceStateCompleted:
 		ms.disconnectedAt = time.Time{}

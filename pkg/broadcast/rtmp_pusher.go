@@ -66,7 +66,6 @@ var errReconnectRequested = errors.New("rtmp pusher: reconnect requested by code
 // + Stop, which can be called from the RTP hot path concurrently with
 // the background goroutine (the internal channel does the hand-off).
 type rtmpPusher struct {
-	url    string
 	parsed *rtmpURL
 	logger *slog.Logger
 
@@ -106,23 +105,9 @@ type rtmpPusher struct {
 	videoSeqBody   []byte
 	videoSeqFourCC string // "" for classic AVC, fourCC (e.g. "vp09") for E-RTMP
 
-	// videoReorder rebuilds the FLV (DTS, CTS) pair from a stream of
-	// PTS-only H.264 / H.265 access units. SFU producers typically
-	// disable B-frames so the buffer adds no latency in steady
-	// state, but an RTMP-ingest live source forwarded through here
-	// can carry B-frames whose PTS sequence in arrival order is
-	// non-monotonic; without the reorder the recipient's MP4 would
-	// have PTS == DTS over a B-frame bitstream and play frames in
-	// decode order.
-	//
-	// The buffer is codec-agnostic: it operates on MediaSample
-	// timestamps and lets enqueueVideoReorderEmit fan out to the
-	// codec-specific FLV builder (classic AVC tag for H.264, E-RTMP
-	// CodedFrames+SI24 tag for H.265).
-	//
-	// Nil when the destination opts out of reorder (see
-	// rtmpPusherOptions.DTSReorder); WriteSample then takes the
-	// direct path that maps PTS → DTS and writes CTS=0.
+	// videoReorder rebuilds FLV (DTS, CTS) for PTS-only H.264 / H.265
+	// samples. Nil means the destination opted into the direct path
+	// (PTS→DTS, CTS=0).
 	//
 	// Access is single-producer (mediasoup OnRtp callbacks are
 	// serialized per-consumer) but Stop runs from a different
@@ -170,7 +155,6 @@ func newRTMPPusher(destURL string, logger *slog.Logger, opts rtmpPusherOptions) 
 		logger = slog.Default()
 	}
 	p := &rtmpPusher{
-		url:    destURL,
 		parsed: parsed,
 		logger: logger.With("sink", "rtmp", "url", destURL,
 			"dts_reorder", reorderModeLabel(opts.DTSReorderMode)),

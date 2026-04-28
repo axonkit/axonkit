@@ -57,8 +57,8 @@ func (c Codec) IsVideo() bool {
 
 // MediaSample is one encoded access unit ready to be muxed out. It is
 // the hand-off format between the source-specific depacketizers
-// (source_live.go, source_mix.go in later milestones) and the outbound
-// pushers (rtmp_pusher.go, whip_pusher.go).
+// (source_live.go, source_mix.go, source_mix_h265.go) and the outbound
+// pushers.
 //
 // One MediaSample ≈ one video frame OR one Opus audio frame. The
 // RTP timestamp is carried verbatim so pushers can translate into

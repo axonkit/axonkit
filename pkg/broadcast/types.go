@@ -30,39 +30,16 @@ type Destination struct {
 	Type DestinationType `json:"type"`
 	URL  string          `json:"url"`
 
-	// DTSReorder controls the (DTS, CTS) reconstruction buffer on
-	// the egress side of this destination, applied to H.264 and
-	// H.265 video samples. Pointer-typed so the JSON form
-	// distinguishes the three usable settings:
+	// DTSReorder controls the H.264/H.265 egress DTS/CTS reconstruction
+	// buffer. Pointer-typed so JSON can distinguish the three settings:
 	//
 	//   nil    → auto (default).
 	//   true   → always reorder.
 	//   false  → always direct (no buffer; CTS=0 + PTS→DTS).
 	//
-	// In auto mode the egress starts in reorder-buffer mode and
-	// monitors the input PTS sequence: once it has emitted enough
-	// consecutive frames whose CTS came out as zero (i.e. the head
-	// of the lookahead window was already the smallest PTS in the
-	// window — the canonical "no reorder happening" signal), it
-	// flips to direct passthrough so latency-sensitive pipelines do
-	// not pay the buffering tax. If a later PTS regression is
-	// observed the egress flips back into buffered mode at one
-	// frame of jitter cost.
-	//
-	// Set to true to pin reorder on regardless of observed input
-	// (useful for recording pipelines where ~133 ms of buffering
-	// is fine and you want to avoid the rare flip-back jitter).
-	// Set to false to pin it off when the upstream is guaranteed
-	// B-frame-free (typical for WebRTC SFU producers and avflow
-	// mixes) and you want zero buffer latency.
-	//
-	// Has no effect on VP9 / AV1 destinations: those codecs travel
-	// through the Enhanced-RTMP CodedFramesX tag, which has no
-	// CompositionTime field, so the egress always passes them
-	// through unchanged regardless of this setting. H.265 uses the
-	// CodedFrames (PacketType=1) tag with an SI24 CTS field, the
-	// HEVC analog of the classic AVC tag — same reorder policy
-	// applies.
+	// Auto starts buffered, switches to passthrough after a stable
+	// B-frame-free run, and switches back on PTS regression. VP9 / AV1
+	// ignore this because their E-RTMP CodedFramesX tags carry no CTS.
 	DTSReorder *bool `json:"dts_reorder,omitempty"`
 }
 

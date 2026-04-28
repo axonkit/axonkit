@@ -24,7 +24,7 @@ func TestDTSReorderIBBPStream(t *testing.T) {
 	ptsMs := []uint32{0, 132, 33, 66, 99, 264, 165, 198, 231}
 	pictTypes := []byte{'I', 'P', 'B', 'B', 'B', 'P', 'B', 'B', 'B'}
 
-	r := newDTSReorder(dtsReorderWindow)
+	r := newDTSReorderMode(dtsReorderWindow, dtsReorderModeAlways)
 	emits := make([]dtsReorderEmit, 0, len(ptsMs))
 	for _, ms := range ptsMs {
 		s := MediaSample{
@@ -46,9 +46,8 @@ func TestDTSReorderIBBPStream(t *testing.T) {
 			t.Errorf("emit[%d].pts = %d, want %d", i, e.sample.RTPTimestamp, ptsMs[i]*90)
 		}
 		// CTS must always be ≥ 0 (PTS ≥ DTS) — the property that
-		// distinguishes the new algorithm from the legacy lookahead
-		// + sorted-pop approach which produced negative CTS on
-		// IPBB-style streams.
+		// distinguishes the sorted-pop path from regressions that
+		// would produce negative CTS on IPBB-style streams.
 		if e.ctsMs < 0 {
 			t.Errorf("emit[%d] (%c) cts=%d ms, expected ≥ 0",
 				i, pictTypes[i], e.ctsMs)
@@ -74,14 +73,12 @@ func TestDTSReorderIBBPStream(t *testing.T) {
 
 // TestDTSReorderIPBBStream covers the libx264 -bf 3 -b_strategy 1
 // adaptive output we observe on the testsrc input, which settles on
-// max_b_frames=2 (IPBB cycles). The legacy "FIFO + sorted pop_min"
-// reorder produced CTS=-33 here because P (decoded second) consumed
-// the smallest unassigned PTS before the B frames could claim it.
-// The new algorithm must yield CTS ≥ 0 for every frame.
+// max_b_frames=2 (IPBB cycles). The reorder path must yield CTS ≥ 0
+// for every frame.
 func TestDTSReorderIPBBStream(t *testing.T) {
 	ptsMs := []uint32{67, 200, 134, 167, 334, 267, 300, 467, 400, 434, 600}
 
-	r := newDTSReorder(dtsReorderWindow)
+	r := newDTSReorderMode(dtsReorderWindow, dtsReorderModeAlways)
 	emits := make([]dtsReorderEmit, 0, len(ptsMs))
 	for _, ms := range ptsMs {
 		s := MediaSample{
@@ -122,7 +119,7 @@ func TestDTSReorderIPBBStream(t *testing.T) {
 // strictly-monotonic PTS stream must yield CTS=0 throughout (the
 // head's own PTS is always the smallest in any lookahead window).
 func TestDTSReorderNoBFrames(t *testing.T) {
-	r := newDTSReorder(dtsReorderWindow)
+	r := newDTSReorderMode(dtsReorderWindow, dtsReorderModeAlways)
 	const frames = 16
 	emits := make([]dtsReorderEmit, 0, frames)
 	for i := uint32(0); i < frames; i++ {
@@ -150,7 +147,7 @@ func TestDTSReorderNoBFrames(t *testing.T) {
 // for ms-rounding edge cases. Two frames with the same 90 kHz
 // timestamp must yield two different DTS values one tick apart.
 func TestDTSReorderEqualPTSGuard(t *testing.T) {
-	r := newDTSReorder(2)
+	r := newDTSReorderMode(2, dtsReorderModeAlways)
 	emits := make([]dtsReorderEmit, 0, 4)
 	pts := []uint32{1000, 1000, 2000, 3000}
 	for _, p := range pts {
@@ -187,7 +184,7 @@ func TestDTSReorderEmitsAreStrictlyMonotonicInMs(t *testing.T) {
 	// I0 P133 B67 B33 B100 P267 B200 B167 B233 P400 B333 B300 B367.
 	ptsMs := []uint32{0, 133, 67, 33, 100, 267, 200, 167, 233, 400, 333, 300, 367}
 
-	r := newDTSReorder(dtsReorderWindow)
+	r := newDTSReorderMode(dtsReorderWindow, dtsReorderModeAlways)
 	emits := make([]dtsReorderEmit, 0, len(ptsMs))
 	for _, ms := range ptsMs {
 		s := MediaSample{
@@ -223,10 +220,8 @@ func TestDTSReorderEmitsAreStrictlyMonotonicInMs(t *testing.T) {
 // improvement: in a steady-state IBBP B-cluster stream the +1 ms
 // monotonicity guard fires at most once per cluster boundary
 // (the P→B transition where the next B-frame's PTS equals the
-// P-frame's just-emitted DTS). The legacy lookahead-min algorithm
-// fired the guard on every B-frame in the cluster, producing N
-// consecutive 1 ms FLV tags per N-B-frame cluster — the exact
-// "continuous 1 ms DTS" symptom users observed in seg-003.mp4.
+// P-frame's just-emitted DTS). This prevents the continuous 1 ms DTS
+// clusters that previously showed up in B-frame recordings.
 //
 // Replay the same IBBPBBB pattern as TestDTSReorderEmitsAreStrictly...
 // (3 four-frame clusters of I/P + 3 B-frames each) and count the
@@ -237,7 +232,7 @@ func TestDTSReorderClusteredOneMsGuardPerBoundary(t *testing.T) {
 	ptsMs := []uint32{0, 133, 67, 33, 100, 267, 200, 167, 233, 400, 333, 300, 367}
 	const clusters = 3 // boundaries where the guard may fire
 
-	r := newDTSReorder(dtsReorderWindow)
+	r := newDTSReorderMode(dtsReorderWindow, dtsReorderModeAlways)
 	emits := make([]dtsReorderEmit, 0, len(ptsMs))
 	for _, ms := range ptsMs {
 		s := MediaSample{

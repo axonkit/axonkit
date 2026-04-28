@@ -53,7 +53,6 @@ type h265MixSource struct {
 	packetSink packetSink
 
 	mu             sync.Mutex
-	iceState       string
 	disconnectedAt time.Time
 	iceConnected   bool
 	stopCh         chan struct{}
@@ -318,7 +317,6 @@ func (ms *h265MixSource) handleIceState(state webrtc.ICEConnectionState) {
 		ms.onIceState(str)
 	}
 	ms.mu.Lock()
-	ms.iceState = str
 	switch state {
 	case webrtc.ICEConnectionStateConnected, webrtc.ICEConnectionStateCompleted:
 		ms.disconnectedAt = time.Time{}

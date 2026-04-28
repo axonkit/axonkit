@@ -39,13 +39,8 @@ func buildAVCSeqHeaderTag(avcc []byte) []byte {
 //
 //	[FrameType<<4 | CodecID] [AVCPacketType=1] [CTS SI24 BE] [AVCC access unit]
 //
-// ctsMs is the (PTS-DTS) offset in milliseconds. For SFU passthrough
-// of WebRTC producers without B-frames the value is always 0; when
-// the live source is an RTMP ingest that used B-frames the egress
-// reorder buffer (rtmp_pusher.go) computes a non-zero CTS so the FLV
-// (and any downstream MP4 mux) preserves the publisher's display
-// order. Writing CTS=0 in that case is what manifested as "frames
-// jumping back" in recordings of B-frame H.264 streams.
+// ctsMs is the PTS-DTS offset in milliseconds, computed by the RTMP
+// pusher's reorder path when B-frames are present.
 func buildAVCFrameTag(isKey bool, ctsMs int32, avccAccessUnit []byte) []byte {
 	out := make([]byte, 5+len(avccAccessUnit))
 	if isKey {

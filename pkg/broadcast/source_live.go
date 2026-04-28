@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 
 	"github.com/axonkit/axonkit/pkg/proto"
@@ -12,10 +13,8 @@ import (
 	"github.com/pion/rtp"
 )
 
-// sampleSink is the callback contract between a source and whatever
-// consumes samples downstream. In milestone 2 that is directly the
-// RTMP pusher; milestone 5 replaces this with Switcher.feedLive /
-// Switcher.feedMix so two sources can fan into one set of pushers.
+// sampleSink is the callback contract between a source and the
+// downstream switcher/pusher pipeline.
 type sampleSink func(s MediaSample)
 
 // packetSink hands off raw RTP packets to pushers that forward them
@@ -250,10 +249,8 @@ func (ls *liveSource) producerGone(kind string) {
 // the producer's negotiated codec. Non-video / unknown codecs yield an
 // error so callers fail cleanly rather than silently dropping frames.
 //
-// CodecH265 is accepted here (not by producerVideoCodec) because
-// mediasoup-go cannot expose an H.265 producer to begin with — see
-// pkg/media/caps.go. The future pion-based mix WHIP ingress instead
-// constructs a depacketizer directly via this factory.
+// CodecH265 is accepted here for the pion-based mix WHIP ingress; live
+// mediasoup producers cannot surface H.265 through producerVideoCodec.
 func newVideoDepacketizer(codec Codec) (videoDepacketizer, error) {
 	switch codec {
 	case CodecH264:
@@ -331,11 +328,8 @@ func isOpusProducer(p *mediasoup.Producer) bool {
 // codec MIME onto the broadcast Codec enum. Returns CodecUnknown if
 // none of the supported codecs are present.
 //
-// H.265 is intentionally absent: pkg/media/caps.go cannot register
-// it (mediasoup-go would fail Router validation), so a producer that
-// somehow surfaced H.265 here would be a bug. The H.265 path enters
-// the broadcast pipeline through the future pion-terminated mix WHIP
-// ingress, which builds the depacketizer directly.
+// H.265 is intentionally absent: pkg/media/caps.go cannot register it,
+// so H.265 enters through the pion-terminated mix WHIP path instead.
 func producerVideoCodec(p *mediasoup.Producer) Codec {
 	rp := p.RtpParameters()
 	if rp == nil {
@@ -360,21 +354,5 @@ func producerVideoCodec(p *mediasoup.Producer) Codec {
 // "audio/opus", WebRTC SDPs sometimes use "audio/OPUS", and we want to
 // match regardless.
 func mimeTypeIs(got, want string) bool {
-	if len(got) != len(want) {
-		return false
-	}
-	for i := 0; i < len(got); i++ {
-		a := got[i]
-		b := want[i]
-		if a >= 'A' && a <= 'Z' {
-			a += 'a' - 'A'
-		}
-		if b >= 'A' && b <= 'Z' {
-			b += 'a' - 'A'
-		}
-		if a != b {
-			return false
-		}
-	}
-	return true
+	return strings.EqualFold(got, want)
 }

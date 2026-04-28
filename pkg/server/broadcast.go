@@ -138,9 +138,9 @@ func (s *HTTPServer) handleBroadcastMixPatch(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	ifMatch := r.Header.Get("If-Match")
-	raw, _ := io.ReadAll(r.Body)
+	_, _ = io.Copy(io.Discard, r.Body)
 	_ = r.Body.Close()
-	etag, err := b.PatchMixICE(ifMatch, string(raw))
+	etag, err := b.PatchMixICE(ifMatch)
 	if err != nil {
 		writeBroadcastError(w, err)
 		return
