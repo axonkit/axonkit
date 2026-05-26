@@ -31,7 +31,7 @@ import (
 // pins codec MimeType to the SDP-negotiated PT at offer/answer time
 // and pion's TrackLocalStaticRTP capability is immutable after
 // creation. There is no in-band escape hatch: once the SDP is
-// finalised, every RTP packet the receiver decodes is interpreted
+// finalized, every RTP packet the receiver decodes is interpreted
 // against that PT's fmtp string.
 //
 // So a flip from H.264 live to H.265 mix (or any other class change)
@@ -46,7 +46,7 @@ import (
 // different codec enqueues a reconnect request that the runLoop drains
 // at the next opportunity. WriteRTP gates on `connected`, so during
 // the ~1–3 s reconnect window packets are silently dropped — the same
-// behaviour the very first connect already exercises.
+// behavior the very first connect already exercises.
 //
 // # Lifecycle and concurrency
 //
@@ -226,7 +226,7 @@ func (p *whipPusher) WriteRTP(kind SampleKind, pkt *rtp.Packet) {
 	// Dropping packets during setup is fine: the remote's decoder
 	// starts from our first key frame, and our upstream Consumer
 	// keeps requesting IDRs for the first second anyway. The same
-	// drop-while-disconnected behaviour covers the codec-change
+	// drop-while-disconnected behavior covers the codec-change
 	// reconnect window — receivers never decode mismatched payload
 	// against a stale SDP fmtp.
 	if !p.connected.Load() {
@@ -297,7 +297,7 @@ func (p *whipPusher) runLoop() {
 		p.logger.Info("whip pusher connected", "codec", codec, "resource", p.resourceURL)
 
 		// Idle: WriteRTP is driving traffic. Block until either
-		// (a) ctx is cancelled (Stop), or (b) a codec change
+		// (a) ctx is canceled (Stop), or (b) a codec change
 		// nudges the reconnect channel.
 		select {
 		case <-p.reconnectCh:
@@ -540,12 +540,12 @@ func (p *whipPusher) recordErr(err error) {
 // right ballpark to interop with the avflow / axonkit WHIP receivers
 // we ship against.
 func registerWHIPVideoCodec(me *webrtc.MediaEngine, codec Codec) error {
-	cap, err := whipMediaEngineCapability(codec)
+	codecCap, err := whipMediaEngineCapability(codec)
 	if err != nil {
 		return err
 	}
 	return me.RegisterCodec(webrtc.RTPCodecParameters{
-		RTPCodecCapability: cap,
+		RTPCodecCapability: codecCap,
 		PayloadType:        whipVideoPayloadType,
 	}, webrtc.RTPCodecTypeVideo)
 }

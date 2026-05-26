@@ -354,7 +354,7 @@ func TestEnsureExVideoSeqHeader_NoReconnectOnSameFourCCConfigChange(t *testing.T
 
 // TestEnsureVideoSeqHeader_NoReconnectOnFirstHeader pins the
 // "first SeqHeader of the pusher's lifetime is not a class change"
-// invariant. Without this check newRTMPPusher would synthesise a
+// invariant. Without this check newRTMPPusher would synthesize a
 // reconnect on the very first keyframe, which is at best a wasted
 // dial and at worst breaks pushers whose first connection has not
 // even been established yet (the sentinel would sit in the queue

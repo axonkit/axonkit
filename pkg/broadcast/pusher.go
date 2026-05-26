@@ -154,7 +154,7 @@ func (a *whipPusherAdapter) WriteRTP(kind SampleKind, pkt *rtp.Packet) {
 // session (DELETE WHIP resource + close PC) and re-handshakes with a
 // MediaEngine + TrackLocalStaticRTP rebuilt for the new codec. The
 // hot-path WriteRTP stays drop-on-disconnect throughout the
-// reconnect window — that is the same drop-during-setup behaviour the
+// reconnect window — that is the same drop-during-setup behavior the
 // initial connect already exercises, so receivers do not see garbled
 // frames decoded against a stale SDP fmtp.
 func (a *whipPusherAdapter) ResetVideoHeader(codec Codec) {

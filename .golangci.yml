@@ -1,67 +1,50 @@
-run:
-  timeout: 5m
+version: "2"
 
 linters:
   enable:
-    - govet
-    - staticcheck
-    - unused
-    - gosimple
-    - ineffassign
-    - typecheck
+    - gocritic
     - misspell
-    - gofmt
+    - nolintlint
     - revive
     - unconvert
-    - gocritic
-    - nolintlint
   disable:
     - errcheck
-
-linters-settings:
-  govet:
-    enable-all: true
-    disable:
-      - fieldalignment
-      - shadow
-  revive:
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+        - shadow
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+      disabled-checks:
+        - unnamedResult
+        - exitAfterDefer
+    misspell:
+      locale: US
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+        - name: var-naming
+          disabled: true
+  exclusions:
     rules:
-      - name: blank-imports
-      - name: context-as-argument
-      - name: dot-imports
-      - name: error-return
-      - name: error-strings
-      - name: exported
-        disabled: true
-      - name: increment-decrement
-      - name: var-naming
-        disabled: true
-      - name: range
-      - name: receiver-naming
-      - name: time-naming
-      - name: unexported-return
-      - name: indent-error-flow
-      - name: errorf
-  gocritic:
-    enabled-tags:
-      - diagnostic
-      - style
-    disabled-checks:
-      - unnamedResult
-      - exitAfterDefer
-  misspell:
-    locale: US
+      # staticcheck's SA5011 doesn't model (*testing.T).Fatal /
+      # Fatalf / FailNow as terminating (they call runtime.Goexit
+      # internally). In tests the `if x == nil { t.Fatal(...) }; x.Foo`
+      # pattern is idiomatic, so silence the check only for _test.go.
+      - path: _test\.go
+        linters:
+          - staticcheck
+        text: SA5011
 
 issues:
-  exclude-use-default: false
   max-issues-per-linter: 0
   max-same-issues: 0
-  exclude-rules:
-    # staticcheck's SA5011 doesn't model (*testing.T).Fatal /
-    # Fatalf / FailNow as terminating (they call runtime.Goexit
-    # internally). In tests the `if x == nil { t.Fatal(...) }; x.Foo`
-    # pattern is idiomatic, so silence the check only for _test.go.
-    - path: _test\.go
-      linters:
-        - staticcheck
-      text: "SA5011"
+
+formatters:
+  enable:
+    - gofmt

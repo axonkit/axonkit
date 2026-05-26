@@ -141,10 +141,7 @@ func (m *Manager[K, V]) loop() {
 			m.mu.Lock()
 			now := time.Now().UnixNano()
 			// Process all expired items
-			for {
-				if m.pq.Len() == 0 {
-					break
-				}
+			for m.pq.Len() > 0 {
 				item := m.pq[0]
 				if item.Priority > now {
 					break
