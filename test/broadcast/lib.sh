@@ -256,7 +256,7 @@ _lib_mint_token() {
 }
 
 # Mint a subscribe-only token for a non-publishing participant (used by
-# avflow's rtc_room source so its presence doesn't loop back into the
+# avflow's axonkit source so its presence doesn't loop back into the
 # mix).
 lib_mint_subscriber_token() {
     local identity=$1

@@ -18,7 +18,7 @@
 #   3. Start avflow in HTTP-only mode so Chrome is warmed up by the
 #      time we submit a job.
 #   4. After the live warm-up, POST a job to avflow's /jobs API whose
-#      pipeline is rtc_room[userA,userB] → video_mixer(grid) +
+#      pipeline is axonkit[userA,userB] → video_mixer(grid) +
 #      audio_mixer → whip_push into the broadcast's mix ingest. The
 #      switcher flips to mix.
 #   5. DELETE the avflow job then DELETE /rtc/broadcast/{id}/whip so
@@ -79,7 +79,7 @@ fi
 lib_start_axonkit
 lib_mint_tokens
 
-# avflow's rtc_room source joins axonkit as a regular subscribe-only
+# avflow's axonkit source joins axonkit as a regular subscribe-only
 # participant. It needs canSubscribe; canPublish stays off so avflow's
 # presence never gets mirrored back into its own composite.
 TOKEN_AVFLOW_ROOM=$(lib_mint_subscriber_token "avflow-mixer")
@@ -128,7 +128,7 @@ fi
 # Submit the mixing job -------------------------------------------------------
 #
 # Pipeline:
-#   rtc_room[userA,userB] --> video_mixer(grid 2-col) --> whip_push -> axonkit
+#   axonkit[userA,userB] --> video_mixer(grid 2-col) --> whip_push -> axonkit
 #                          \-> audio_mixer          --/
 #
 # Forcing videoCodec=h264 in the whip_push encoding config makes
@@ -142,7 +142,7 @@ cat >"$JOB_JSON" <<EOF
   "sources": [
     {
       "name": "room",
-      "type": "rtc_room",
+      "type": "axonkit",
       "config": {
         "serverUrl": "$BASE_URL",
         "token": "$TOKEN_AVFLOW_ROOM",
