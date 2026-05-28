@@ -1,7 +1,7 @@
 package proto
 
 import (
-	"github.com/axonkit/protocol/signal"
+	"github.com/axonkit/axonkit/pkg/signal"
 )
 
 // RPC method constants for datachannel communication.
