@@ -650,7 +650,9 @@ func (t *PublishedTrack) checkCodecRegressionReversal() {
 			break
 		}
 	}
-	// Also consider remote nodes that need backup codec
+	// Also consider remote nodes that need backup codec, and subscribers
+	// still queued for the backup pipe — both keep the shared backup
+	// stream alive even though no local backup consumer is registered yet.
 	if !hasBackupConsumer {
 		for _, rs := range t.remoteSubscriptions {
 			if rs.HasBackupSub {
@@ -658,6 +660,9 @@ func (t *PublishedTrack) checkCodecRegressionReversal() {
 				break
 			}
 		}
+	}
+	if !hasBackupConsumer && len(t.pendingBackupSubs) > 0 {
+		hasBackupConsumer = true
 	}
 	wasRegressed := t.regressed
 	t.mu.Unlock()
@@ -671,6 +676,30 @@ func (t *PublishedTrack) checkCodecRegressionReversal() {
 		t.sendCodecQualityNotification(true, false)
 	} else if !hasBackupConsumer && t.backupProducer != nil {
 		t.sendCodecQualityNotification(true, false)
+	}
+
+	if !hasBackupConsumer {
+		t.releaseBackupStream()
+	}
+}
+
+// releaseBackupStream drops the once-per-track FIB refcount on the shared
+// backup pipe and clears the cached backup state so a later backup
+// subscriber re-establishes it from scratch. No-op when no backup pipe was
+// ensured (backupSid empty) or for local-origin backups (ReleaseStream is a
+// no-op there). Idempotent: the backupSid clear guards against double release.
+func (t *PublishedTrack) releaseBackupStream() {
+	t.mu.Lock()
+	sid := t.backupSid
+	t.backupProducer = nil
+	t.backupSid = ""
+	t.backupRequested = false
+	t.mu.Unlock()
+	if sid == "" {
+		return
+	}
+	if t.publisher != nil && t.publisher.room != nil && t.publisher.room.cascade.ReleaseStream != nil {
+		t.publisher.room.cascade.ReleaseStream(sid)
 	}
 }
 
@@ -697,9 +726,15 @@ func (t *DataPublishedTrack) ToProto() *proto.DataTrackInfo {
 
 // Subscription holds a media subscription and its signaling metadata.
 type Subscription struct {
-	sid           string
-	trackSid      string
-	publisherSid  string
+	sid          string
+	trackSid     string
+	publisherSid string
+	// streamSid is the FIB stream this consumer holds a refcount on and
+	// must release on close. It is track.sid for the primary path; it is
+	// empty for backup consumers, whose shared backup pipe is released
+	// once-per-track in checkCodecRegressionReversal instead of per
+	// consumer (the backup stream is ensured once, not per subscriber).
+	streamSid     string
 	consumer      *mediasoup.Consumer
 	pausedByLastN bool
 }
@@ -1207,11 +1242,25 @@ func (p *Participant) RestoreRoomPermission() {
 	}
 }
 
+// HasSubscription reports whether this participant already subscribes to
+// the given track. The subscriptions map is keyed by consumer/subscription
+// SID, so the lookup must match on Subscription.trackSid rather than index
+// the map by trackSid directly.
 func (p *Participant) HasSubscription(trackSid string) bool {
+	return p.subscriptionSidByTrack(trackSid) != ""
+}
+
+// subscriptionSidByTrack returns the subscription SID for the given track
+// SID, or "" when there is no such subscription.
+func (p *Participant) subscriptionSidByTrack(trackSid string) string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	_, ok := p.subscriptions[trackSid]
-	return ok
+	for sid, sub := range p.subscriptions {
+		if sub.trackSid == trackSid {
+			return sid
+		}
+	}
+	return ""
 }
 
 func (p *Participant) State() proto.ParticipantInfo_State {
@@ -1929,7 +1978,9 @@ func (p *Participant) Subscribe(track *PublishedTrack, publisher *Participant) e
 		track.mu.Unlock()
 	}
 
-	return p.finishSubscribe(track, publisher, consumer)
+	// Primary path: this consumer holds the track.sid pipe ref (a no-op
+	// for local-origin tracks, a FIB refcount for remote-piped ones).
+	return p.finishSubscribe(track, publisher, consumer, track.sid)
 }
 
 // subscribeWithBackupFallback handles the case where the primary codec is
@@ -2103,19 +2154,26 @@ func (p *Participant) consumeFromBackup(
 		track.mu.Unlock()
 	}
 
-	return p.finishSubscribe(track, publisher, consumer)
+	// Backup path: the shared backup pipe is ensured once-per-track (see
+	// runRemoteBackupDrain) and released in checkCodecRegressionReversal,
+	// so this consumer must NOT release it per-close — pass "".
+	return p.finishSubscribe(track, publisher, consumer, "")
 }
 
 // finishSubscribe completes subscription setup: RPC to client, resume, callbacks.
+// streamSid is the FIB stream this consumer holds a refcount on (track.sid on
+// the primary path, "" for backup consumers — see Subscription.streamSid).
 func (p *Participant) finishSubscribe(
 	track *PublishedTrack,
 	publisher *Participant,
 	consumer *mediasoup.Consumer,
+	streamSid string,
 ) error {
 	sub := &Subscription{
 		sid:          consumer.Id(),
 		trackSid:     track.sid,
 		publisherSid: publisher.sid,
+		streamSid:    streamSid,
 		consumer:     consumer,
 	}
 
@@ -2167,8 +2225,12 @@ func (p *Participant) finishSubscribe(
 			track.mu.Unlock()
 		}
 
-		if p.room != nil && p.room.cascade.ReleaseStream != nil {
-			p.room.cascade.ReleaseStream(track.sid)
+		// Release only the stream this consumer actually ensured. Backup
+		// consumers carry streamSid=="" because their shared backup pipe
+		// is refcounted once-per-track and released in
+		// checkCodecRegressionReversal, not here.
+		if sub.streamSid != "" && p.room != nil && p.room.cascade.ReleaseStream != nil {
+			p.room.cascade.ReleaseStream(sub.streamSid)
 		}
 
 		if !closed {
@@ -2368,6 +2430,18 @@ func (p *Participant) CloseSubscription(subSid string) error {
 	return nil
 }
 
+// CloseSubscriptionByTrack closes the subscription to the given track SID.
+// Callers that only know the track SID (group rewiring, cross-room teardown)
+// must go through here: CloseSubscription expects the subscription SID, which
+// is the consumer ID, not the track SID.
+func (p *Participant) CloseSubscriptionByTrack(trackSid string) error {
+	subSid := p.subscriptionSidByTrack(trackSid)
+	if subSid == "" {
+		return fmt.Errorf("no subscription for track: %s", trackSid)
+	}
+	return p.CloseSubscription(subSid)
+}
+
 func (p *Participant) CloseDataSubscription(dataSub string) error {
 	p.mu.Lock()
 	sub, ok := p.dataSubscriptions[dataSub]
@@ -2425,6 +2499,8 @@ func (p *Participant) Request(method string, body any) (*proto.Message, error) {
 	select {
 	case resp := <-ch:
 		return resp, nil
+	case <-p.done:
+		return nil, fmt.Errorf("participant closed before RPC response: %s (logId=%s)", method, logId)
 	case <-time.After(5 * time.Second):
 		return nil, fmt.Errorf("RPC timeout: %s (logId=%s)", method, logId)
 	}
@@ -2523,7 +2599,14 @@ func (p *Participant) handleIncomingMessage(payload []byte) {
 		ch, ok := p.pendingRPC[msg.LogId]
 		p.mu.RUnlock()
 		if ok {
-			ch <- msg
+			// Non-blocking: the channel is buffered (cap 1) and the
+			// waiting Request reads exactly once. A non-blocking send
+			// also avoids racing Close, which never touches these
+			// channels (the waiter unblocks via p.done instead).
+			select {
+			case ch <- msg:
+			default:
+			}
 		}
 		return
 	}
@@ -2780,9 +2863,10 @@ func (p *Participant) Close(reason proto.DisconnectReason) {
 	}
 	p.iceDisconnectedSet = nil
 
-	for _, ch := range p.pendingRPC {
-		close(ch)
-	}
+	// Drop pending RPC waiters from the map but do NOT close their
+	// channels: a response may be delivered concurrently on the signal
+	// goroutine, and closing here would race that send into a panic.
+	// Waiters unblock via the p.done case in Request below.
 	p.pendingRPC = make(map[string]chan *proto.Message)
 
 	// Snapshot published tracks to clean up outside the lock.

@@ -466,6 +466,75 @@ func TestParticipant_CloseSubscription_NotFound(t *testing.T) {
 	}
 }
 
+func TestParticipant_HasSubscription_ByTrackSid(t *testing.T) {
+	p := newTestParticipant("alice")
+	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
+
+	// subscriptions is keyed by consumer/subscription SID, not track SID.
+	p.mu.Lock()
+	p.subscriptions["consumer-xyz"] = &Subscription{sid: "consumer-xyz", trackSid: "track-1"}
+	p.mu.Unlock()
+
+	if !p.HasSubscription("track-1") {
+		t.Fatal("expected HasSubscription(track-1) to be true")
+	}
+	// The consumer/subscription SID must not be mistaken for a track SID.
+	if p.HasSubscription("consumer-xyz") {
+		t.Fatal("expected HasSubscription(consumer-xyz) to be false")
+	}
+	if p.HasSubscription("track-missing") {
+		t.Fatal("expected HasSubscription(track-missing) to be false")
+	}
+}
+
+func TestParticipant_SubscriptionSidByTrack(t *testing.T) {
+	p := newTestParticipant("alice")
+	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
+
+	p.mu.Lock()
+	p.subscriptions["cid-1"] = &Subscription{sid: "cid-1", trackSid: "track-a"}
+	p.subscriptions["cid-2"] = &Subscription{sid: "cid-2", trackSid: "track-b"}
+	p.mu.Unlock()
+
+	if got := p.subscriptionSidByTrack("track-b"); got != "cid-2" {
+		t.Fatalf("expected cid-2, got %q", got)
+	}
+	if got := p.subscriptionSidByTrack("track-missing"); got != "" {
+		t.Fatalf("expected empty subscription SID, got %q", got)
+	}
+}
+
+func TestParticipant_CloseSubscriptionByTrack_NotFound(t *testing.T) {
+	p := newTestParticipant("alice")
+	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)
+
+	if err := p.CloseSubscriptionByTrack("track-missing"); err == nil {
+		t.Fatal("expected error for missing track subscription")
+	}
+}
+
+// TestParticipant_CloseDoesNotClosePendingRPC guards the fix for the
+// send-on-closed panic: Close must drop pending RPC waiters from the map
+// without closing their channels, so a response delivered concurrently on
+// the signal goroutine can never send on a closed channel.
+func TestParticipant_CloseDoesNotClosePendingRPC(t *testing.T) {
+	p := newTestParticipant("alice")
+
+	ch := make(chan *proto.Message, 1)
+	p.mu.Lock()
+	p.pendingRPC["log-1"] = ch
+	p.mu.Unlock()
+
+	p.Close(proto.DisconnectReason_CLIENT_INITIATED)
+
+	// A closed channel would panic on send; an open one accepts it.
+	select {
+	case ch <- &proto.Message{}:
+	default:
+		t.Fatal("expected the pending RPC channel to remain open after Close")
+	}
+}
+
 func TestParticipant_CloseDataSubscription_NotFound(t *testing.T) {
 	p := newTestParticipant("alice")
 	defer p.Close(proto.DisconnectReason_CLIENT_INITIATED)

@@ -54,10 +54,16 @@ const (
 // emitted, while the within-source PTS reordering is left untouched
 // for downstream dts-reorder logic to recover the (DTS, CTS) pair.
 //
-// Not thread-safe — the switcher serializes access by delivering audio
-// and video on separate goroutines (one consumer per kind) and holding
-// no lock between rebase and emit.
+// Concurrency: rewrite runs on the per-kind consumer goroutine without
+// the switcher lock, while a source flip rewrites BOTH kinds' rebasers
+// from whichever goroutine won the flip race (see flipSampleRebasers).
+// That cross-kind write would otherwise race rewrite, so every method
+// that touches the mutable fields below takes mu. The lock is
+// uncontended on the steady-state hot path (one goroutine per rebaser)
+// and only contends during a flip.
 type rebaser struct {
+	mu sync.Mutex
+
 	// initialized is true once the rebaser has seen any sample at
 	// all. Distinct from hasBase so the very first sample produces
 	// output 0 instead of catchup.
@@ -99,6 +105,8 @@ type rebaser struct {
 // does. That preserves the CompositionTime offset the egress
 // dts-reorder buffer needs for B-frame recordings.
 func (r *rebaser) rewrite(inTS uint32) uint32 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if !r.initialized {
 		r.initialized = true
 		r.hasBase = true
@@ -135,7 +143,11 @@ func (r *rebaser) rewrite(inTS uint32) uint32 {
 
 // onSourceFlip invalidates the current source base so the next sample
 // becomes the "first sample after a flip" (catchup tick applied).
-func (r *rebaser) onSourceFlip() { r.hasBase = false }
+func (r *rebaser) onSourceFlip() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.hasBase = false
+}
 
 // hwmMs reports the rebaser's high-water-mark output timestamp
 // expressed in milliseconds, so peers running on a different RTP
@@ -145,6 +157,8 @@ func (r *rebaser) onSourceFlip() { r.hasBase = false }
 // see alignAnchorMs for how we recover from the truncation when the
 // caller is ahead of the peer.
 func (r *rebaser) hwmMs() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if !r.initialized || r.clockHz == 0 {
 		return 0
 	}
@@ -167,6 +181,8 @@ func (r *rebaser) hwmMs() int64 {
 // sample then takes the catchup branch (hasBase is false because
 // onSourceFlip set it) and emits at hwm + catchup.
 func (r *rebaser) alignAnchorMs(ms int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.clockHz == 0 || ms <= 0 {
 		return
 	}

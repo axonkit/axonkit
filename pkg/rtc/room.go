@@ -974,6 +974,13 @@ func (r *Room) FindPublishedTrack(trackSid string) *PublishedTrack {
 			return t
 		}
 	}
+	// Fall back to a remote track piped onto this node (cross-room /
+	// cross-node): it lives in storeTracks, not under any local
+	// participant. mt.track is non-nil only once resolveRemoteTrack has
+	// materialized the pipe.
+	if mt := r.storeTracks[trackSid]; mt != nil && mt.track != nil {
+		return mt.track
+	}
 	return nil
 }
 
@@ -988,6 +995,11 @@ func (r *Room) FindPublishedTrackAndPublisher(trackSid string) (*PublishedTrack,
 		if t != nil {
 			return t, p
 		}
+	}
+	// Remote piped track: the publisher is the router stub recorded on
+	// the materialized PublishedTrack (see resolveRemoteTrack).
+	if mt := r.storeTracks[trackSid]; mt != nil && mt.track != nil {
+		return mt.track, mt.track.publisher
 	}
 	return nil, nil
 }
@@ -1925,7 +1937,7 @@ func (r *Room) rewireSubscriptions(target *Participant) {
 		}(info)
 	}
 	for _, trackSid := range toUnsubscribe {
-		go target.CloseSubscription(trackSid)
+		go target.CloseSubscriptionByTrack(trackSid)
 	}
 }
 
@@ -1972,7 +1984,7 @@ func (r *Room) rewireRemoteParticipantSubscriptions(remoteSid, remoteGroupId str
 					_ = subscriber.Subscribe(track, pub)
 				}(sub, t.info)
 			} else if !shouldSub && sub.HasSubscription(t.sid) {
-				go sub.CloseSubscription(t.sid)
+				go sub.CloseSubscriptionByTrack(t.sid)
 			}
 		}
 	}
@@ -2019,12 +2031,12 @@ func (r *Room) ensureCrossSubscription(a, b *Participant) {
 func (r *Room) removeCrossSubscription(a, b *Participant) {
 	for _, track := range b.GetPublishedTracks() {
 		if a.HasSubscription(track.sid) {
-			go a.CloseSubscription(track.sid)
+			go a.CloseSubscriptionByTrack(track.sid)
 		}
 	}
 	for _, track := range a.GetPublishedTracks() {
 		if b.HasSubscription(track.sid) {
-			go b.CloseSubscription(track.sid)
+			go b.CloseSubscriptionByTrack(track.sid)
 		}
 	}
 }

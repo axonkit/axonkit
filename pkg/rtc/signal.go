@@ -571,16 +571,7 @@ func (p *Participant) handleSubscriptionUnsubscribe(msg *proto.Message) (any, in
 		return nil, proto.StatusBadRequest, fmt.Sprintf("invalid request: %s", err)
 	}
 
-	p.mu.RLock()
-	var targetSubSid string
-	for sid, sub := range p.subscriptions {
-		if sub.trackSid == req.TrackSid {
-			targetSubSid = sid
-			break
-		}
-	}
-	p.mu.RUnlock()
-
+	targetSubSid := p.subscriptionSidByTrack(req.TrackSid)
 	if targetSubSid == "" {
 		return nil, proto.StatusNotFound, fmt.Sprintf("no subscription for track: %s", req.TrackSid)
 	}

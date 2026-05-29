@@ -345,6 +345,95 @@ func TestPublishedTrack_CheckCodecRegressionReversal_NoBackupConsumers_WasRegres
 	}
 }
 
+func TestPublishedTrack_CheckCodecRegressionReversal_ReleasesBackupStream(t *testing.T) {
+	cfg := defaultRoomConfig()
+	cfg.AutoSubscribe = false
+	room := NewRoom(RoomParams{
+		Sid: "room-rel-backup", Name: "rel-backup", Config: cfg, CreationTime: time.Now(),
+	})
+	var released []string
+	room.cascade = CascadeCallbacks{
+		ReleaseStream: func(sid string) { released = append(released, sid) },
+	}
+	pub := NewParticipant(ParticipantParams{
+		Sid: "pub-rel-backup", Identity: "pub",
+		Grants: &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
+	})
+	if err := room.AddParticipant(pub); err != nil {
+		t.Fatalf("AddParticipant: %v", err)
+	}
+
+	track := &PublishedTrack{
+		sid:             "track-rel-backup",
+		kind:            "video",
+		videoCodec:      "vp9",
+		backupCodec:     "vp8",
+		backupConsumers: map[string]string{}, // no backup consumers remain
+		backupSid:       "backup-stream-1",
+		publisher:       pub,
+	}
+
+	track.checkCodecRegressionReversal()
+
+	if len(released) != 1 || released[0] != "backup-stream-1" {
+		t.Fatalf("expected the shared backup stream released once, got %v", released)
+	}
+	track.mu.Lock()
+	clearedSid := track.backupSid
+	track.mu.Unlock()
+	if clearedSid != "" {
+		t.Fatalf("expected backupSid cleared after release, got %q", clearedSid)
+	}
+
+	// Idempotent: a second pass must not double-release the FIB refcount.
+	track.checkCodecRegressionReversal()
+	if len(released) != 1 {
+		t.Fatalf("expected no double release, got %v", released)
+	}
+}
+
+func TestPublishedTrack_CheckCodecRegressionReversal_KeepsBackupForPending(t *testing.T) {
+	cfg := defaultRoomConfig()
+	cfg.AutoSubscribe = false
+	room := NewRoom(RoomParams{
+		Sid: "room-pending-backup", Name: "pending-backup", Config: cfg, CreationTime: time.Now(),
+	})
+	var released []string
+	room.cascade = CascadeCallbacks{
+		ReleaseStream: func(sid string) { released = append(released, sid) },
+	}
+	pub := NewParticipant(ParticipantParams{
+		Sid: "pub-pending-backup", Identity: "pub",
+		Grants: &proto.ClaimGrants{Room: &proto.RoomGrant{Join: true}},
+	})
+	if err := room.AddParticipant(pub); err != nil {
+		t.Fatalf("AddParticipant: %v", err)
+	}
+
+	track := &PublishedTrack{
+		sid:               "track-pending-backup",
+		kind:              "video",
+		videoCodec:        "vp9",
+		backupCodec:       "vp8",
+		backupConsumers:   map[string]string{},
+		backupSid:         "backup-stream-2",
+		pendingBackupSubs: []*pendingBackupSub{{}},
+		publisher:         pub,
+	}
+
+	track.checkCodecRegressionReversal()
+
+	if len(released) != 0 {
+		t.Fatalf("must not release the backup stream while subscribers are still queued, got %v", released)
+	}
+	track.mu.Lock()
+	sid := track.backupSid
+	track.mu.Unlock()
+	if sid != "backup-stream-2" {
+		t.Fatalf("expected backupSid preserved while pending, got %q", sid)
+	}
+}
+
 func TestPublishedTrack_CheckCodecRegressionReversal_RemoteSub(t *testing.T) {
 	pub := newTestParticipant("pub-remote-sub")
 	defer pub.Close(proto.DisconnectReason_CLIENT_INITIATED)

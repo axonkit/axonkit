@@ -2,6 +2,7 @@ package broadcast
 
 import (
 	"log/slog"
+	"sync"
 	"testing"
 
 	"github.com/pion/rtp"
@@ -39,6 +40,44 @@ func newTestSwitcher() (*switcher, *fakeSink) {
 	sw.bindLive(func() []byte { return []byte("LIVEAVCC") })
 	sw.bindMix(func() []byte { return []byte("MIXAVCC") })
 	return sw, sink
+}
+
+// TestRebaser_ConcurrentRewriteAndFlip exercises the cross-kind access
+// pattern that a source flip creates: while each kind's rewrite runs on
+// its own consumer goroutine, a flip rewrites BOTH kinds' rebasers from
+// the goroutine that won the flip. Run with -race to catch a regression
+// in the rebaser locking.
+func TestRebaser_ConcurrentRewriteAndFlip(t *testing.T) {
+	sw := newSwitcher(slog.Default())
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	rewriteLoop := func(sample, packet *rebaser, step uint32) {
+		defer wg.Done()
+		var ts uint32
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			sample.rewrite(ts)
+			packet.rewrite(ts)
+			ts += step
+		}
+	}
+
+	wg.Add(2)
+	go rewriteLoop(&sw.audioSample, &sw.audioPacket, defaultAudioTick)
+	go rewriteLoop(&sw.videoSample, &sw.videoPacket, defaultVideoTick)
+
+	for range 2000 {
+		sw.flipSampleRebasers()
+		sw.flipPacketRebasers()
+	}
+	close(stop)
+	wg.Wait()
 }
 
 func TestSwitcher_LiveOnly_TimestampsRebasedFromZero(t *testing.T) {

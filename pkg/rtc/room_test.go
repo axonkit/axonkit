@@ -687,6 +687,40 @@ func TestRoom_CascadeCallbacks_Advertise(t *testing.T) {
 	}
 }
 
+func TestRoom_FindPublishedTrack_RemotePiped(t *testing.T) {
+	cfg := defaultRoomConfig()
+	r := NewRoom(RoomParams{
+		Sid:          "room-find-remote",
+		Name:         "find-remote",
+		Config:       cfg,
+		CreationTime: time.Now(),
+	})
+
+	stub := &Participant{sid: "remote-pub"}
+	remoteTrack := &PublishedTrack{sid: "remote-track-1", publisher: stub}
+	r.mu.Lock()
+	r.storeTracks["remote-track-1"] = &storeTrackEntry{
+		info:  &proto.TrackInfo{Sid: "remote-track-1", ParticipantSid: "remote-pub"},
+		track: remoteTrack,
+	}
+	// Not-yet-materialized entry: info only, no local pipe yet.
+	r.storeTracks["pending-track"] = &storeTrackEntry{
+		info: &proto.TrackInfo{Sid: "pending-track"},
+	}
+	r.mu.Unlock()
+
+	if got := r.FindPublishedTrack("remote-track-1"); got != remoteTrack {
+		t.Fatal("expected FindPublishedTrack to return the remote piped track")
+	}
+	gotT, gotP := r.FindPublishedTrackAndPublisher("remote-track-1")
+	if gotT != remoteTrack || gotP != stub {
+		t.Fatal("expected FindPublishedTrackAndPublisher to return remote track + stub publisher")
+	}
+	if r.FindPublishedTrack("pending-track") != nil {
+		t.Fatal("expected nil for a remote track that has not been piped locally yet")
+	}
+}
+
 func TestRoom_TestHelpers(t *testing.T) {
 	cfg := defaultRoomConfig()
 	r := NewRoom(RoomParams{
