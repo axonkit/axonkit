@@ -43,6 +43,13 @@ func NewRouterPipe(source *mediasoup.Router) *RouterPipe {
 // helper.
 func (r *RouterPipe) Source() *mediasoup.Router { return r.source }
 
+// pipeEndpoint is the slice of Producer and DataProducer the cache needs:
+// the piped id plus a close hook to evict the entry.
+type pipeEndpoint interface {
+	Id() string
+	OnClose(listener func(context.Context)) func()
+}
+
 // ProducerTo pipes srcProducerId from the source router into dest and
 // returns the piped producer ID on dest. If source and dest are the same
 // router the original id is returned with no side effects.
@@ -53,12 +60,11 @@ func (r *RouterPipe) ProducerTo(srcProducerId string, dest *mediasoup.Router) (s
 			Router:     dest,
 			ListenInfo: loopbackListenInfo,
 		})
-	}, func(res *mediasoup.PipeToRouterResult) (string, func(func(context.Context)), error) {
+	}, func(res *mediasoup.PipeToRouterResult) (pipeEndpoint, error) {
 		if res.PipeProducer == nil {
-			return "", nil, fmt.Errorf("PipeToRouter returned no PipeProducer")
+			return nil, fmt.Errorf("PipeToRouter returned no PipeProducer")
 		}
-		id := res.PipeProducer.Id()
-		return id, func(listener func(context.Context)) { res.PipeProducer.OnClose(listener) }, nil
+		return res.PipeProducer, nil
 	})
 }
 
@@ -70,12 +76,11 @@ func (r *RouterPipe) DataProducerTo(srcDataProducerId string, dest *mediasoup.Ro
 			Router:         dest,
 			ListenInfo:     loopbackListenInfo,
 		})
-	}, func(res *mediasoup.PipeToRouterResult) (string, func(func(context.Context)), error) {
+	}, func(res *mediasoup.PipeToRouterResult) (pipeEndpoint, error) {
 		if res.PipeDataProducer == nil {
-			return "", nil, fmt.Errorf("PipeToRouter returned no PipeDataProducer")
+			return nil, fmt.Errorf("PipeToRouter returned no PipeDataProducer")
 		}
-		id := res.PipeDataProducer.Id()
-		return id, func(listener func(context.Context)) { res.PipeDataProducer.OnClose(listener) }, nil
+		return res.PipeDataProducer, nil
 	})
 }
 
@@ -91,12 +96,12 @@ var loopbackListenInfo = mediasoup.TransportListenInfo{
 // on same-router destinations, serves from cache, otherwise coalesces
 // concurrent pipe builds and installs an OnClose hook to evict the entry.
 // The two kind-specific callbacks handle the PipeToRouterOptions build and
-// the result unpacking (producer id + OnClose registrar).
+// the result unpacking (piped endpoint).
 func (r *RouterPipe) run(
 	prefix, srcId string,
 	dest *mediasoup.Router,
 	build func() (*mediasoup.PipeToRouterResult, error),
-	unpack func(*mediasoup.PipeToRouterResult) (string, func(func(context.Context)), error),
+	unpack func(*mediasoup.PipeToRouterResult) (pipeEndpoint, error),
 ) (string, error) {
 	if r == nil || r.source == nil {
 		return "", fmt.Errorf("router pipe has no source")
@@ -119,16 +124,15 @@ func (r *RouterPipe) run(
 		if err != nil {
 			return "", err
 		}
-		id, onClose, err := unpack(res)
+		ep, err := unpack(res)
 		if err != nil {
 			return "", err
 		}
+		id := ep.Id()
 		r.put(key, id)
-		if onClose != nil {
-			onClose(func(context.Context) {
-				r.drop(key, id)
-			})
-		}
+		ep.OnClose(func(context.Context) {
+			r.drop(key, id)
+		})
 		return id, nil
 	})
 	if err != nil {
