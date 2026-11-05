@@ -322,10 +322,14 @@ func (s *Service) CreateWHEP(opts CreateWHEPOptions) (*CreateWHEPResult, error) 
 		// on the wire. Wire and answer SDP therefore share the offer's
 		// values — no post-hoc SDP remapping needed.
 		consumer, err := transport.Consume(&mediasoup.ConsumerOptions{
-			ProducerId:    producerID,
-			RtpParameters: pm.RtpParameters,
-			Paused:        false,
-			Mid:           pm.Mid,
+			ProducerId: producerID,
+			// TODO: re-enable once https://github.com/versatica/mediasoup/pull/1783
+			// (consumer-side RtpParameters override) is merged and mediasoup-go
+			// picks up the field. Until then Consume negotiates from the
+			// router's RtpCapabilities instead of the offer's parameters.
+			// RtpParameters: pm.RtpParameters,
+			Paused: false,
+			Mid:    pm.Mid,
 		})
 		if err != nil {
 			sess.Close()
