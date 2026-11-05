@@ -649,10 +649,6 @@ func (s *HTTPServer) createTransports(router *mediasoup.Router, webRtcServer *me
 		EnableTcp:    true,
 		PreferUdp:    true,
 		EnableSctp:   true,
-		NumSctpStreams: &mediasoup.NumSctpStreams{
-			OS:  1024,
-			MIS: 1024,
-		},
 	}
 
 	send, err = router.CreateWebRtcTransport(webRtcOpts)

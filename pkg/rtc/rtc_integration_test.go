@@ -56,10 +56,6 @@ func createWebRtcTransport(t *testing.T, router *mediasoup.Router) *mediasoup.Tr
 			{Ip: "127.0.0.1", Protocol: mediasoup.TransportProtocolUDP},
 		},
 		EnableSctp: true,
-		NumSctpStreams: &mediasoup.NumSctpStreams{
-			OS:  1024,
-			MIS: 1024,
-		},
 	})
 	if err != nil {
 		t.Fatalf("CreateWebRtcTransport: %v", err)

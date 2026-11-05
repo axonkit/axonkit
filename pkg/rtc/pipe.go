@@ -58,7 +58,7 @@ func (r *RouterPipe) ProducerTo(srcProducerId string, dest *mediasoup.Router) (s
 			return "", nil, fmt.Errorf("PipeToRouter returned no PipeProducer")
 		}
 		id := res.PipeProducer.Id()
-		return id, res.PipeProducer.OnClose, nil
+		return id, func(listener func(context.Context)) { res.PipeProducer.OnClose(listener) }, nil
 	})
 }
 
@@ -75,7 +75,7 @@ func (r *RouterPipe) DataProducerTo(srcDataProducerId string, dest *mediasoup.Ro
 			return "", nil, fmt.Errorf("PipeToRouter returned no PipeDataProducer")
 		}
 		id := res.PipeDataProducer.Id()
-		return id, res.PipeDataProducer.OnClose, nil
+		return id, func(listener func(context.Context)) { res.PipeDataProducer.OnClose(listener) }, nil
 	})
 }
 

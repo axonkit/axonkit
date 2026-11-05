@@ -3,7 +3,7 @@ module github.com/axonkit/axonkit
 go 1.25.6
 
 require (
-	github.com/jiyeyuran/mediasoup-go/v2 v2.4.1
+	github.com/jiyeyuran/mediasoup-go/v2 v2.7.1
 	github.com/nats-io/nats-server/v2 v2.12.4
 	github.com/nats-io/nats.go v1.48.0
 	github.com/pion/interceptor v0.1.44

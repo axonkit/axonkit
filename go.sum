@@ -16,8 +16,8 @@ github.com/hashicorp/errwrap v1.1.0 h1:OxrOeh75EUXMY8TBjag2fzXGZ40LB6IKw45YeGUDY
 github.com/hashicorp/errwrap v1.1.0/go.mod h1:YH+1FKiLXxHSkmPseP+kNlulaMuP3n2brvKWEqk/Jc4=
 github.com/hashicorp/go-multierror v1.1.0 h1:B9UzwGQJehnUY1yNrnwREHc3fGbC2xefo8g4TbElacI=
 github.com/hashicorp/go-multierror v1.1.0/go.mod h1:spPvp8C1qA32ftKqdAHm4hHTbPw+vmowP0z+KUhOZdA=
-github.com/jiyeyuran/mediasoup-go/v2 v2.4.1 h1:Yed8EKzX6DqoPeUmPaXpTnRqizO1HZFfuPYjQdy+5Ww=
-github.com/jiyeyuran/mediasoup-go/v2 v2.4.1/go.mod h1:EjVP5KPYmdrB7bIiA58eg6chzEv/pvY82DeNLmOjB7c=
+github.com/jiyeyuran/mediasoup-go/v2 v2.7.1 h1:hWm2iyKIIFN+188CqqHzcec/qtfzXh6HBI45QpoO644=
+github.com/jiyeyuran/mediasoup-go/v2 v2.7.1/go.mod h1:EjVP5KPYmdrB7bIiA58eg6chzEv/pvY82DeNLmOjB7c=
 github.com/klauspost/compress v1.18.3 h1:9PJRvfbmTabkOX8moIpXPbMMbYN60bWImDDU7L+/6zw=
 github.com/klauspost/compress v1.18.3/go.mod h1:R0h/fSBs8DE4ENlcrlib3PsXS61voFxhIs2DeRhCvJ4=
 github.com/minio/highwayhash v1.0.4-0.20251030100505-070ab1a87a76 h1:KGuD/pM2JpL9FAYvBrnBBeENKZNh6eNtjqytV6TYjnk=
