@@ -657,6 +657,11 @@ func (p *Participant) handleMessageRelay(msg *proto.Message) {
 	p.room.StoreMessage(&m)
 }
 
+// isAdmin reports whether the participant carries the room admin grant.
+func (p *Participant) isAdmin() bool {
+	return p.grants != nil && p.grants.Room != nil && p.grants.Room.Admin
+}
+
 func (p *Participant) handleMessageDelete(msg *proto.Message) (any, int, string) {
 	if p.room == nil {
 		return nil, proto.StatusBadRequest, "not in a room"
@@ -667,8 +672,12 @@ func (p *Participant) handleMessageDelete(msg *proto.Message) (any, int, string)
 		return nil, proto.StatusBadRequest, "invalid request body"
 	}
 
-	if !p.room.DeleteMessage(req.ID, p.sid) {
+	found, allowed := p.room.DeleteMessage(req.ID, p.sid, p.isAdmin())
+	if !found {
 		return nil, proto.StatusNotFound, "message not found"
+	}
+	if !allowed {
+		return nil, proto.StatusForbidden, "only the sender or a room admin may delete a message"
 	}
 
 	return nil, proto.StatusOK, ""
@@ -684,6 +693,11 @@ func (p *Participant) handleMessageDeleteByType(msg *proto.Message) (any, int, s
 		return nil, proto.StatusBadRequest, "invalid request body"
 	}
 
+	// Bulk deletion affects every participant's messages: admin only.
+	if !p.isAdmin() {
+		return nil, proto.StatusForbidden, "admin grant required"
+	}
+
 	p.room.DeleteMessagesByType(req.Type)
 
 	return nil, proto.StatusOK, ""
@@ -693,14 +707,26 @@ func (p *Participant) handleMessageDeleteByType(msg *proto.Message) (any, int, s
 // Room Shared State
 // ============================================================
 
+// maxStateValueBytes caps the size of a shared-state value to prevent abuse.
+const maxStateValueBytes = 16 * 1024
+
 func (p *Participant) handleStateUpdate(msg *proto.Message) (any, int, string) {
 	if p.room == nil {
 		return nil, proto.StatusBadRequest, "not in a room"
 	}
 
+	// Shared state is room-wide authoritative data: admin only.
+	if !p.isAdmin() {
+		return nil, proto.StatusForbidden, "admin grant required"
+	}
+
 	var req proto.StateUpdateRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
 		return nil, proto.StatusBadRequest, "invalid request body"
+	}
+
+	if len(req.Value) > maxStateValueBytes {
+		return nil, proto.StatusBadRequest, "state value exceeds 16KB limit"
 	}
 
 	p.room.UpdateState(req.Key, req.Value, p.sid, p.identity)
@@ -710,6 +736,10 @@ func (p *Participant) handleStateUpdate(msg *proto.Message) (any, int, string) {
 func (p *Participant) handleStateDelete(msg *proto.Message) (any, int, string) {
 	if p.room == nil {
 		return nil, proto.StatusBadRequest, "not in a room"
+	}
+
+	if !p.isAdmin() {
+		return nil, proto.StatusForbidden, "admin grant required"
 	}
 
 	var req proto.StateDeleteRequest

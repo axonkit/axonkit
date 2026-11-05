@@ -1259,23 +1259,27 @@ func (r *Room) evictOldMessages() {
 	r.runAsync(func() { r.roomStore.DeleteMessagesByIDs(ids) })
 }
 
-// DeleteMessage removes a single message by ID. Returns true if found.
-func (r *Room) DeleteMessage(id, participantSid string) bool {
+// DeleteMessage marks a message deleted. Only the message sender or a
+// caller with the room admin grant may delete it. Returns whether the
+// message was found and whether the caller was allowed to delete it.
+func (r *Room) DeleteMessage(id, participantSid string, isAdmin bool) (found, allowed bool) {
 	r.mu.Lock()
-	found := false
 	for _, m := range r.messages {
 		if m.ID == id {
-			m.Deleted = true
 			found = true
+			allowed = isAdmin || m.ParticipantSid == participantSid
+			if allowed {
+				m.Deleted = true
+			}
 			break
 		}
 	}
 	r.mu.Unlock()
 
-	if found {
+	if found && allowed {
 		r.runAsync(func() { r.roomStore.DeleteMessage(id) })
 	}
-	return found
+	return found, allowed
 }
 
 // DeleteMessagesByType removes all messages of a given type and returns their IDs.
