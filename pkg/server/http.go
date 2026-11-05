@@ -374,7 +374,16 @@ func (s *HTTPServer) handleJoinLocal(w http.ResponseWriter, req *proto.JoinReque
 		return
 	}
 
-	if req.Room == nil || req.Room.Name == "" {
+	// The room name in the request is authoritative. When omitted, fall
+	// back to the room grant in the verified token so tokens stay
+	// self-contained. Anonymous joins must still pass an explicit name.
+	if req.Room == nil {
+		req.Room = &proto.CreateRoomRequest{}
+	}
+	if req.Room.Name == "" && claims.Grants != nil && claims.Grants.Room != nil {
+		req.Room.Name = claims.Grants.Room.Name
+	}
+	if req.Room.Name == "" {
 		writeJSON(w, http.StatusBadRequest, proto.ErrorResponse{
 			Code: proto.ErrCodeInvalidRequest, Error: "room name required"})
 		return
