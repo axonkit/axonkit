@@ -11,7 +11,7 @@ func TestParseStreamKey(t *testing.T) {
 		wantHasTok bool
 	}{
 		{
-			name:       "bare room (anonymous publish)",
+			name:       "bare room (no token)",
 			in:         "demo",
 			wantRoom:   "demo",
 			wantToken:  "",
@@ -32,7 +32,7 @@ func TestParseStreamKey(t *testing.T) {
 			wantHasTok: true,
 		},
 		{
-			name:       "empty token query still treated as anonymous",
+			name:       "empty token query yields no token",
 			in:         "demo?token=",
 			wantRoom:   "demo",
 			wantToken:  "",

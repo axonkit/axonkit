@@ -182,7 +182,7 @@ func (s *HTTPServer) handleWHIPPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	claims, errResp := s.authorizeAdmin(r, roomName, "whip_")
+	claims, errResp := s.authorizeAdmin(r, roomName)
 	if errResp != nil {
 		errResp.write(w)
 		return
@@ -209,7 +209,7 @@ func (s *HTTPServer) handleWHEPPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if _, errResp := s.authorizeAdmin(r, roomName, "whip_"); errResp != nil {
+	if _, errResp := s.authorizeAdmin(r, roomName); errResp != nil {
 		errResp.write(w)
 		return
 	}
@@ -305,7 +305,7 @@ func (s *HTTPServer) handleWHEPDelete(w http.ResponseWriter, r *http.Request) {
 // Returns ok=false after writing the error response.
 func (s *HTTPServer) readPatchRequest(w http.ResponseWriter, r *http.Request) (roomName, id, ifMatch, body string, ok bool) {
 	roomName = r.PathValue("room")
-	if _, errResp := s.authorizeAdmin(r, roomName, "whip_"); errResp != nil {
+	if _, errResp := s.authorizeAdmin(r, roomName); errResp != nil {
 		errResp.write(w)
 		return "", "", "", "", false
 	}
@@ -319,7 +319,7 @@ func (s *HTTPServer) readPatchRequest(w http.ResponseWriter, r *http.Request) (r
 // readDeleteRequest is the DELETE counterpart of readPatchRequest.
 func (s *HTTPServer) readDeleteRequest(w http.ResponseWriter, r *http.Request) (roomName, id string, ok bool) {
 	roomName = r.PathValue("room")
-	if _, errResp := s.authorizeAdmin(r, roomName, "whip_"); errResp != nil {
+	if _, errResp := s.authorizeAdmin(r, roomName); errResp != nil {
 		errResp.write(w)
 		return "", "", false
 	}

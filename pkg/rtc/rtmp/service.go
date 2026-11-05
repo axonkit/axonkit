@@ -56,14 +56,9 @@ type ServiceParams struct {
 	// misconfiguration early.
 	Listen string
 
-	// Verifier validates JWT stream-key tokens. May be nil when
-	// AllowAnonymous is true.
+	// Verifier validates JWT stream-key tokens. Required; publishing
+	// without a token is rejected.
 	Verifier *auth.TokenVerifier
-
-	// AllowAnonymous relaxes token requirements. Matches the HTTP
-	// server's AllowAnonymous so operators can run a single switch for
-	// all ingest paths.
-	AllowAnonymous bool
 
 	// Hooks wires per-connection callbacks. Logger on the hooks is
 	// replaced per-connection with a remote-addr annotated child logger.
@@ -161,7 +156,7 @@ func (s *Service) Start() error {
 			hooks.Logger = connLogger
 			hooks.IdleTimeout = idleTimeout
 			return conn, &gortmp.ConnConfig{
-				Handler: NewHandler(hooks, s.params.Verifier, s.params.AllowAnonymous),
+				Handler: NewHandler(hooks, s.params.Verifier),
 				// Logger defaults to ioutil.Discard inside go-rtmp
 				// when left nil — matching our preference to keep the
 				// noisy library-internal logs out of stderr.

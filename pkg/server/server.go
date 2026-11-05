@@ -214,11 +214,10 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	// handles classic and Enhanced RTMP (H.264 + Opus) transparently.
 	if cfg.Rtmp.Listen != "" {
 		n.rtmpSvc = rtmpingest.NewService(rtmpingest.ServiceParams{
-			Listen:         cfg.Rtmp.Listen,
-			Verifier:       verifier,
-			AllowAnonymous: cfg.Auth.AllowAnonymous,
-			Hooks:          httpAPI.buildRTMPHooks(),
-			Logger:         slog.Default().With("component", "rtmp.Service"),
+			Listen:   cfg.Rtmp.Listen,
+			Verifier: verifier,
+			Hooks:    httpAPI.buildRTMPHooks(),
+			Logger:   slog.Default().With("component", "rtmp.Service"),
 		})
 	}
 

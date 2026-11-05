@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -26,16 +25,15 @@ const (
 // remove participant paths without spinning up mediasoup workers. It
 // wires the shared KV used by rtc.RoomManager so tests can pre-populate
 // the source room and then observe the destination room after a call.
-func newTestServer(t *testing.T, allowAnonymous bool) (*HTTPServer, store.Store) {
+func newTestServer(t *testing.T) (*HTTPServer, store.Store) {
 	t.Helper()
 	kv := store.NewMemoryStore(0)
 	t.Cleanup(func() { kv.Close() })
 
 	cfg := &config.Config{
 		Auth: config.AuthConfig{
-			APIKey:         testAPIKey,
-			APISecret:      testAPISecret,
-			AllowAnonymous: allowAnonymous,
+			APIKey:    testAPIKey,
+			APISecret: testAPISecret,
 		},
 		Room: config.RoomConfig{
 			EmptyTimeout:     5 * time.Minute,
@@ -102,68 +100,53 @@ func doJSON(s *HTTPServer, method, path string, body any, token string, handler 
 
 // -------------------- authorizeAdmin --------------------
 
-func TestAuthorizeAdmin_AnonymousWhenAllowed(t *testing.T) {
-	s, _ := newTestServer(t, true)
+func TestAuthorizeAdmin_MissingToken(t *testing.T) {
+	s, _ := newTestServer(t)
 	req := httptest.NewRequest(http.MethodPost, "/", http.NoBody)
-	claims, werr := s.authorizeAdmin(req, "room-a", "anon_")
-	if werr != nil {
-		t.Fatalf("expected nil whipErr, got %+v", werr)
-	}
-	if claims == nil || claims.Sub == "" {
-		t.Fatalf("expected anonymous claims, got %+v", claims)
-	}
-	if !strings.HasPrefix(claims.Sub, "anon_") {
-		t.Fatalf("expected anonymous identity prefixed with 'anon_', got %q", claims.Sub)
-	}
-}
-
-func TestAuthorizeAdmin_MissingTokenWhenAnonymousDisabled(t *testing.T) {
-	s, _ := newTestServer(t, false)
-	req := httptest.NewRequest(http.MethodPost, "/", http.NoBody)
-	_, werr := s.authorizeAdmin(req, "room-a", "anon_")
+	_, werr := s.authorizeAdmin(req, "room-a")
 	if werr == nil || werr.status != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %+v", werr)
 	}
 }
 
 func TestAuthorizeAdmin_InvalidToken(t *testing.T) {
-	s, _ := newTestServer(t, false)
+	s, _ := newTestServer(t)
 	req := httptest.NewRequest(http.MethodPost, "/", http.NoBody)
 	req.Header.Set("Authorization", "Bearer not-a-real-jwt")
-	_, werr := s.authorizeAdmin(req, "room-a", "anon_")
+	_, werr := s.authorizeAdmin(req, "room-a")
 	if werr == nil || werr.status != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %+v", werr)
 	}
 }
 
 func TestAuthorizeAdmin_MissingAdminGrant(t *testing.T) {
-	s, _ := newTestServer(t, false)
+	s, _ := newTestServer(t)
 	tok := adminToken(t, "room-a", false) // Admin=false
 	req := httptest.NewRequest(http.MethodPost, "/", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+tok)
-	_, werr := s.authorizeAdmin(req, "room-a", "anon_")
+	_, werr := s.authorizeAdmin(req, "room-a")
 	if werr == nil || werr.status != http.StatusForbidden {
 		t.Fatalf("expected 403 room-admin-required, got %+v", werr)
 	}
 }
 
 func TestAuthorizeAdmin_RoomScopeMismatch(t *testing.T) {
-	s, _ := newTestServer(t, false)
+	s, _ := newTestServer(t)
 	tok := adminToken(t, "room-a", true)
 	req := httptest.NewRequest(http.MethodPost, "/", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+tok)
-	_, werr := s.authorizeAdmin(req, "room-b", "anon_")
+	_, werr := s.authorizeAdmin(req, "room-b")
 	if werr == nil || werr.status != http.StatusForbidden {
 		t.Fatalf("expected 403 scope mismatch, got %+v", werr)
 	}
 }
 
 func TestAuthorizeAdmin_RoomScopeMatch(t *testing.T) {
-	s, _ := newTestServer(t, false)
+	s, _ := newTestServer(t)
 	tok := adminToken(t, "room-a", true)
 	req := httptest.NewRequest(http.MethodPost, "/", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+tok)
-	claims, werr := s.authorizeAdmin(req, "room-a", "anon_")
+	claims, werr := s.authorizeAdmin(req, "room-a")
 	if werr != nil {
 		t.Fatalf("expected success, got %+v", werr)
 	}
@@ -173,37 +156,23 @@ func TestAuthorizeAdmin_RoomScopeMatch(t *testing.T) {
 }
 
 func TestAuthorizeAdmin_UnscopedGrantAllowsAnyRoom(t *testing.T) {
-	s, _ := newTestServer(t, false)
+	s, _ := newTestServer(t)
 	tok := adminToken(t, "", true) // grant.Name == ""
 	req := httptest.NewRequest(http.MethodPost, "/", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+tok)
-	if _, werr := s.authorizeAdmin(req, "any-room", "anon_"); werr != nil {
+	if _, werr := s.authorizeAdmin(req, "any-room"); werr != nil {
 		t.Fatalf("expected success for unscoped admin, got %+v", werr)
 	}
 }
 
 func TestAuthorizeAdmin_EmptyRoomArgIgnoresScope(t *testing.T) {
-	s, _ := newTestServer(t, false)
+	s, _ := newTestServer(t)
 	tok := adminToken(t, "room-a", true)
 	req := httptest.NewRequest(http.MethodPost, "/", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+tok)
 	// Caller passes "" when the operation isn't room-specific — still valid.
-	if _, werr := s.authorizeAdmin(req, "", "anon_"); werr != nil {
+	if _, werr := s.authorizeAdmin(req, ""); werr != nil {
 		t.Fatalf("expected success when roomName is empty, got %+v", werr)
-	}
-}
-
-func TestAuthorizeAdmin_WHIPPrefix(t *testing.T) {
-	// WHIP/WHEP surfaces pass "whip_" so room logs show the ingest
-	// entry point. The prefix must flow through to the minted claim.
-	s, _ := newTestServer(t, true)
-	req := httptest.NewRequest(http.MethodPost, "/", http.NoBody)
-	claims, werr := s.authorizeAdmin(req, "room-a", "whip_")
-	if werr != nil {
-		t.Fatalf("expected success, got %+v", werr)
-	}
-	if !strings.HasPrefix(claims.Sub, "whip_") {
-		t.Fatalf("expected anonymous identity prefixed with 'whip_', got %q", claims.Sub)
 	}
 }
 
@@ -240,13 +209,14 @@ func (e errString) Error() string { return string(e) }
 // -------------------- handleForwardParticipant --------------------
 
 func TestHandleForwardParticipant_Success(t *testing.T) {
-	s, kv := newTestServer(t, true)
+	s, kv := newTestServer(t)
 	seedParticipantKV(t, kv, "room-src", "pa_alice", "alice")
 
+	tok := adminToken(t, "room-src", true)
 	body := ForwardParticipantRequest{
 		SrcRoom: "room-src", SrcIdentity: "alice", DstRoom: "room-dst",
 	}
-	rec := doJSON(s, http.MethodPost, "/rtc/forward-participant", body, "", s.handleForwardParticipant)
+	rec := doJSON(s, http.MethodPost, "/rtc/forward-participant", body, tok, s.handleForwardParticipant)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -263,7 +233,7 @@ func TestHandleForwardParticipant_Success(t *testing.T) {
 }
 
 func TestHandleForwardParticipant_BadBody(t *testing.T) {
-	s, _ := newTestServer(t, true)
+	s, _ := newTestServer(t)
 	req := httptest.NewRequest(http.MethodPost, "/rtc/forward-participant",
 		bytes.NewReader([]byte("not-json")))
 	req.Header.Set("Content-Type", "application/json")
@@ -275,25 +245,27 @@ func TestHandleForwardParticipant_BadBody(t *testing.T) {
 }
 
 func TestHandleForwardParticipant_ValidationError(t *testing.T) {
-	s, _ := newTestServer(t, true)
+	s, _ := newTestServer(t)
+	tok := adminToken(t, "same", true)
 	body := ForwardParticipantRequest{SrcRoom: "same", SrcIdentity: "alice", DstRoom: "same"}
-	rec := doJSON(s, http.MethodPost, "/rtc/forward-participant", body, "", s.handleForwardParticipant)
+	rec := doJSON(s, http.MethodPost, "/rtc/forward-participant", body, tok, s.handleForwardParticipant)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for same src/dst, got %d (%s)", rec.Code, rec.Body.String())
 	}
 }
 
 func TestHandleForwardParticipant_NotFound(t *testing.T) {
-	s, _ := newTestServer(t, true)
+	s, _ := newTestServer(t)
+	tok := adminToken(t, "room-src", true)
 	body := ForwardParticipantRequest{SrcRoom: "room-src", SrcIdentity: "ghost", DstRoom: "room-dst"}
-	rec := doJSON(s, http.MethodPost, "/rtc/forward-participant", body, "", s.handleForwardParticipant)
+	rec := doJSON(s, http.MethodPost, "/rtc/forward-participant", body, tok, s.handleForwardParticipant)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for missing participant, got %d (%s)", rec.Code, rec.Body.String())
 	}
 }
 
 func TestHandleForwardParticipant_Unauthorized(t *testing.T) {
-	s, _ := newTestServer(t, false) // no anonymous
+	s, _ := newTestServer(t)
 	body := ForwardParticipantRequest{SrcRoom: "room-src", SrcIdentity: "alice", DstRoom: "room-dst"}
 	rec := doJSON(s, http.MethodPost, "/rtc/forward-participant", body, "", s.handleForwardParticipant)
 	if rec.Code != http.StatusUnauthorized {
@@ -302,7 +274,7 @@ func TestHandleForwardParticipant_Unauthorized(t *testing.T) {
 }
 
 func TestHandleForwardParticipant_ForbiddenForNonAdmin(t *testing.T) {
-	s, kv := newTestServer(t, false)
+	s, kv := newTestServer(t)
 	seedParticipantKV(t, kv, "room-src", "pa_alice", "alice")
 	tok := adminToken(t, "room-src", false) // Admin=false
 	body := ForwardParticipantRequest{SrcRoom: "room-src", SrcIdentity: "alice", DstRoom: "room-dst"}
@@ -315,11 +287,12 @@ func TestHandleForwardParticipant_ForbiddenForNonAdmin(t *testing.T) {
 // -------------------- handleRemoveParticipant --------------------
 
 func TestHandleRemoveParticipant_WritesDisconnected(t *testing.T) {
-	s, kv := newTestServer(t, true)
+	s, kv := newTestServer(t)
 	seedParticipantKV(t, kv, "room-a", "pa_alice", "alice")
 
+	tok := adminToken(t, "room-a", true)
 	body := RemoveParticipantRequest{Room: "room-a", Identity: "alice"}
-	rec := doJSON(s, http.MethodPost, "/rtc/remove-participant", body, "", s.handleRemoveParticipant)
+	rec := doJSON(s, http.MethodPost, "/rtc/remove-participant", body, tok, s.handleRemoveParticipant)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d (%s)", rec.Code, rec.Body.String())
 	}
@@ -338,16 +311,17 @@ func TestHandleRemoveParticipant_WritesDisconnected(t *testing.T) {
 }
 
 func TestHandleRemoveParticipant_UnknownIsOK(t *testing.T) {
-	s, _ := newTestServer(t, true)
+	s, _ := newTestServer(t)
+	tok := adminToken(t, "room-a", true)
 	body := RemoveParticipantRequest{Room: "room-a", Identity: "ghost"}
-	rec := doJSON(s, http.MethodPost, "/rtc/remove-participant", body, "", s.handleRemoveParticipant)
+	rec := doJSON(s, http.MethodPost, "/rtc/remove-participant", body, tok, s.handleRemoveParticipant)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 for unknown identity, got %d (%s)", rec.Code, rec.Body.String())
 	}
 }
 
 func TestHandleRemoveParticipant_BadBody(t *testing.T) {
-	s, _ := newTestServer(t, true)
+	s, _ := newTestServer(t)
 	req := httptest.NewRequest(http.MethodPost, "/rtc/remove-participant",
 		bytes.NewReader([]byte("not-json")))
 	req.Header.Set("Content-Type", "application/json")
@@ -359,16 +333,17 @@ func TestHandleRemoveParticipant_BadBody(t *testing.T) {
 }
 
 func TestHandleRemoveParticipant_ValidationError(t *testing.T) {
-	s, _ := newTestServer(t, true)
+	s, _ := newTestServer(t)
+	tok := adminToken(t, "room-a", true)
 	body := RemoveParticipantRequest{Room: "room-a", Identity: ""}
-	rec := doJSON(s, http.MethodPost, "/rtc/remove-participant", body, "", s.handleRemoveParticipant)
+	rec := doJSON(s, http.MethodPost, "/rtc/remove-participant", body, tok, s.handleRemoveParticipant)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for empty identity, got %d (%s)", rec.Code, rec.Body.String())
 	}
 }
 
 func TestHandleRemoveParticipant_Unauthorized(t *testing.T) {
-	s, _ := newTestServer(t, false)
+	s, _ := newTestServer(t)
 	body := RemoveParticipantRequest{Room: "room-a", Identity: "alice"}
 	rec := doJSON(s, http.MethodPost, "/rtc/remove-participant", body, "", s.handleRemoveParticipant)
 	if rec.Code != http.StatusUnauthorized {

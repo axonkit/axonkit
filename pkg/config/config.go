@@ -115,7 +115,9 @@ type AuthConfig struct {
 	APISecret       string        `json:"apiSecret"`
 	TokenTTL        time.Duration `json:"tokenTtl"`
 	RefreshTokenTTL time.Duration `json:"refreshTokenTtl"`
-	AllowAnonymous  bool          `json:"allowAnonymous"`
+	// DevMode enables development-only conveniences such as the
+	// GET /dev/token endpoint. Set by the -dev CLI flag; never in production.
+	DevMode bool `json:"-"`
 }
 
 type NatsConfig struct {

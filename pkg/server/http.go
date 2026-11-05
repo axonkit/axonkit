@@ -290,14 +290,76 @@ func (s *HTTPServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("OPTIONS /rtc/remove-participant", func(w http.ResponseWriter, r *http.Request) {})
 	s.registerWHIPRoutes(mux)
 	s.registerBroadcastRoutes(mux)
+
+	// Dev-only: lets the bundled demo obtain a token without running a
+	// separate signing backend. Never registered outside -dev.
+	if s.cfg.Auth.DevMode {
+		mux.HandleFunc("GET /dev/token", s.handleDevToken)
+	}
+}
+
+// handleDevToken mints a room-scoped token with the node's own credentials.
+// The browser never sees the api-secret; production deployments are expected
+// to expose an equivalent endpoint from their own backend instead.
+func (s *HTTPServer) handleDevToken(w http.ResponseWriter, r *http.Request) {
+	roomName := r.URL.Query().Get("room")
+	if roomName == "" {
+		roomName = "test"
+	}
+	if err := rtc.ValidateRoomName(roomName); err != nil {
+		writeJSON(w, http.StatusBadRequest, proto.ErrorResponse{
+			Code: proto.ErrCodeInvalidRequest, Error: err.Error()})
+		return
+	}
+
+	identity := r.URL.Query().Get("identity")
+	if identity == "" {
+		identity = "dev_" + xid.New().String()
+	}
+
+	ttl := s.cfg.Auth.TokenTTL
+	if raw := r.URL.Query().Get("ttl"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil || parsed <= 0 {
+			writeJSON(w, http.StatusBadRequest, proto.ErrorResponse{
+				Code:  proto.ErrCodeInvalidRequest,
+				Error: "ttl must be a positive duration, e.g. 30m or 6h",
+			})
+			return
+		}
+		ttl = parsed
+	}
+
+	mediaGrant := &proto.MediaGrant{}
+	mediaGrant.SetCanPublish(true)
+	mediaGrant.SetCanSubscribe(true)
+	mediaGrant.SetCanPublishData(true)
+
+	token, err := auth.NewAccessToken(s.cfg.Auth.APIKey, s.cfg.Auth.APISecret).
+		SetIdentity(identity).
+		SetName(identity).
+		SetRoomGrant(&proto.RoomGrant{Name: roomName, Join: true, Admin: true}).
+		SetMediaGrant(mediaGrant).
+		SetTTL(ttl).
+		Sign()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, proto.ErrorResponse{
+			Code: proto.ErrCodeInternal, Error: err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"token":     token,
+		"identity":  identity,
+		"room":      roomName,
+		"expiresIn": int(ttl.Seconds()),
+	})
 }
 
 // authorizeAdmin verifies the Bearer token and checks that the caller
-// holds a RoomGrant.Admin. When AllowAnonymous is set and no token is
-// presented, the request is accepted (useful for local dev and tests).
-// Otherwise:
+// holds a RoomGrant.Admin:
 //
-//   - the token must verify;
+//   - the token must be present and verify;
 //   - RoomGrant.Admin must be true; and
 //   - when roomName != "", the grant must be unscoped (Name == "") OR
 //     match roomName so a tenant cannot act on other tenants' rooms.
@@ -305,16 +367,8 @@ func (s *HTTPServer) RegisterRoutes(mux *http.ServeMux) {
 // roomName may be empty when the operation does not target a specific
 // room (for example, "find-by-identity" style APIs that accept the room
 // name in the body and want to authorize strictly on Admin).
-//
-// anonPrefix is the identity prefix used when minting anonymous claims
-// (AllowAnonymous path). Callers supply "whip_" for WHIP/WHEP surfaces
-// and "anon_" for plain HTTP admin APIs; this lets room logs show which
-// entry point the caller came in through.
-func (s *HTTPServer) authorizeAdmin(r *http.Request, roomName, anonPrefix string) (*auth.Claims, *whipErr) {
+func (s *HTTPServer) authorizeAdmin(r *http.Request, roomName string) (*auth.Claims, *whipErr) {
 	token := extractBearerToken(r)
-	if token == "" && s.cfg.Auth.AllowAnonymous {
-		return auth.AnonymousClaims(anonPrefix+xid.New().String(), roomName), nil
-	}
 	if token == "" {
 		return nil, &whipErr{status: http.StatusUnauthorized, body: "missing Authorization: Bearer <token>"}
 	}
@@ -384,49 +438,23 @@ func (s *HTTPServer) handleJoin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *HTTPServer) handleJoinLocal(w http.ResponseWriter, req *proto.JoinRequest, logId string) {
-	var claims *auth.Claims
 	participantSid := "pa_" + xid.New().String()
 
-	switch {
-	case req.Token != "":
-		var err error
-		claims, err = s.verifier.Verify(req.Token)
-		if err != nil {
-			writeJSON(w, http.StatusUnauthorized, proto.ErrorResponse{
-				Code: proto.ErrCodeInvalidToken, Error: err.Error()})
-			return
-		}
-	case s.cfg.Auth.AllowAnonymous:
-		roomName := ""
-		if req.Room != nil {
-			roomName = req.Room.Name
-		}
-		boolTrue := true
-		anonIdentity := participantSid
-		claims = &auth.Claims{
-			Sub:  anonIdentity,
-			Name: anonIdentity,
-			Grants: &proto.ClaimGrants{
-				Identity: anonIdentity,
-				Room: &proto.RoomGrant{
-					Name: roomName,
-					Join: true,
-				},
-				Media: &proto.MediaGrant{
-					CanPublish:   &boolTrue,
-					CanSubscribe: &boolTrue,
-				},
-			},
-		}
-	default:
+	if req.Token == "" {
 		writeJSON(w, http.StatusUnauthorized, proto.ErrorResponse{
 			Code: proto.ErrCodeInvalidToken, Error: "token required"})
+		return
+	}
+	claims, err := s.verifier.Verify(req.Token)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, proto.ErrorResponse{
+			Code: proto.ErrCodeInvalidToken, Error: err.Error()})
 		return
 	}
 
 	// The room name in the request is authoritative. When omitted, fall
 	// back to the room grant in the verified token so tokens stay
-	// self-contained. Anonymous joins must still pass an explicit name.
+	// self-contained.
 	if req.Room == nil {
 		req.Room = &proto.CreateRoomRequest{}
 	}
@@ -572,17 +600,6 @@ func (s *HTTPServer) handleJoinLocal(w http.ResponseWriter, req *proto.JoinReque
 			participant.SetRefreshToken(rt)
 		} else {
 			slog.Warn("Failed to generate refresh token", "error", err)
-		}
-	} else if s.verifier != nil && claims != nil {
-		// Anonymous or debug mode: generate a fresh token from constructed claims.
-		at := auth.NewAccessToken(s.cfg.Auth.APIKey, s.cfg.Auth.APISecret)
-		at.SetIdentity(claims.Sub).SetName(claims.Name).SetGrants(claims.Grants).SetTTL(ttl)
-		rt, err := at.Sign()
-		if err == nil {
-			refreshTokenStr = rt
-			participant.SetRefreshToken(rt)
-		} else {
-			slog.Warn("Failed to generate refresh token for anonymous user", "error", err)
 		}
 	}
 
@@ -826,12 +843,11 @@ func (s *HTTPServer) handleReconnect(w http.ResponseWriter, req *proto.JoinReque
 
 func (s *HTTPServer) handleReconnectLocal(w http.ResponseWriter, req *proto.JoinRequest, logId string) {
 	// Validate reconnect credentials: prefer refreshToken, fall back to original token.
-	// Anonymous users always have a refreshToken from their initial join.
 	tokenToVerify := req.RefreshToken
 	if tokenToVerify == "" {
 		tokenToVerify = req.Token
 	}
-	if tokenToVerify == "" && !s.cfg.Auth.AllowAnonymous {
+	if tokenToVerify == "" {
 		writeJSON(w, http.StatusUnauthorized, proto.ErrorResponse{
 			Code: proto.ErrCodeInvalidToken, Error: "refresh token or token required for reconnect"})
 		return

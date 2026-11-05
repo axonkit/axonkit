@@ -19,9 +19,7 @@ import (
 //	PATCH  /rtc/broadcast/{id}/whip ICE restart / trickle on mix ingest
 //	DELETE /rtc/broadcast/{id}/whip drop mix ingest, flip back to live
 //
-// Authentication reuses authorizeAdmin (RoomGrant.Admin). Anonymous
-// mode falls back to the "broadcast_" identity prefix so logs make the
-// entry point visible (same convention as "whip_" / "rtmp_").
+// Authentication reuses authorizeAdmin (RoomGrant.Admin).
 func (s *HTTPServer) registerBroadcastRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /rtc/broadcast", s.handleBroadcastPost)
 	mux.HandleFunc("GET /rtc/broadcast/{id}", s.handleBroadcastGet)
@@ -43,7 +41,7 @@ func (s *HTTPServer) handleBroadcastPost(w http.ResponseWriter, r *http.Request)
 		})
 		return
 	}
-	if _, errResp := s.authorizeAdmin(r, req.Room, "broadcast_"); errResp != nil {
+	if _, errResp := s.authorizeAdmin(r, req.Room); errResp != nil {
 		errResp.write(w)
 		return
 	}
@@ -62,7 +60,7 @@ func (s *HTTPServer) handleBroadcastPost(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *HTTPServer) handleBroadcastGet(w http.ResponseWriter, r *http.Request) {
-	if _, errResp := s.authorizeAdmin(r, "", "broadcast_"); errResp != nil {
+	if _, errResp := s.authorizeAdmin(r, ""); errResp != nil {
 		errResp.write(w)
 		return
 	}
@@ -75,7 +73,7 @@ func (s *HTTPServer) handleBroadcastGet(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *HTTPServer) handleBroadcastDelete(w http.ResponseWriter, r *http.Request) {
-	if _, errResp := s.authorizeAdmin(r, "", "broadcast_"); errResp != nil {
+	if _, errResp := s.authorizeAdmin(r, ""); errResp != nil {
 		errResp.write(w)
 		return
 	}
@@ -92,7 +90,7 @@ func (s *HTTPServer) handleBroadcastDelete(w http.ResponseWriter, r *http.Reques
 // producers as a room participant — they feed the switcher directly.
 
 func (s *HTTPServer) handleBroadcastMixPost(w http.ResponseWriter, r *http.Request) {
-	if _, errResp := s.authorizeAdmin(r, "", "broadcast_"); errResp != nil {
+	if _, errResp := s.authorizeAdmin(r, ""); errResp != nil {
 		errResp.write(w)
 		return
 	}
@@ -128,7 +126,7 @@ func (s *HTTPServer) handleBroadcastMixPost(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *HTTPServer) handleBroadcastMixPatch(w http.ResponseWriter, r *http.Request) {
-	if _, errResp := s.authorizeAdmin(r, "", "broadcast_"); errResp != nil {
+	if _, errResp := s.authorizeAdmin(r, ""); errResp != nil {
 		errResp.write(w)
 		return
 	}
@@ -152,7 +150,7 @@ func (s *HTTPServer) handleBroadcastMixPatch(w http.ResponseWriter, r *http.Requ
 }
 
 func (s *HTTPServer) handleBroadcastMixDelete(w http.ResponseWriter, r *http.Request) {
-	if _, errResp := s.authorizeAdmin(r, "", "broadcast_"); errResp != nil {
+	if _, errResp := s.authorizeAdmin(r, ""); errResp != nil {
 		errResp.write(w)
 		return
 	}

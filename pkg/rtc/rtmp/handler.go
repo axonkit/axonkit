@@ -64,9 +64,8 @@ type PublishInfo struct {
 // ParseStreamKey splits the RTMP publishing name into (room, token).
 //
 // The canonical form is "<room>?token=<jwt>" (e.g. publishers point at
-// rtmp://host/<app>/<room>?token=<jwt>). A bare "<room>" is accepted as
-// an anonymous publish and only succeeds when the operator enabled
-// AllowAnonymous.
+// rtmp://host/<app>/<room>?token=<jwt>). A bare "<room>" is parsed with
+// an empty token and is rejected later by authorize.
 //
 // Trailing path components after the token are tolerated: some mobile
 // clients stuff extra diagnostics into the stream key. Anything that
@@ -95,8 +94,7 @@ type handler struct {
 
 	cfg PublishHooks
 
-	verifier       *auth.TokenVerifier
-	allowAnonymous bool
+	verifier *auth.TokenVerifier
 
 	connLogger *slog.Logger
 	streamID   uint32
@@ -124,7 +122,7 @@ type handler struct {
 // NewHandler returns a go-rtmp.Handler bound to hooks + auth. The returned
 // value is per-connection; go-rtmp allocates one for each inbound TCP
 // connection and drives its callbacks serially.
-func NewHandler(hooks PublishHooks, verifier *auth.TokenVerifier, allowAnonymous bool) gortmp.Handler {
+func NewHandler(hooks PublishHooks, verifier *auth.TokenVerifier) gortmp.Handler {
 	logger := hooks.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -133,7 +131,6 @@ func NewHandler(hooks PublishHooks, verifier *auth.TokenVerifier, allowAnonymous
 	return &handler{
 		cfg:              hooks,
 		verifier:         verifier,
-		allowAnonymous:   allowAnonymous,
 		connLogger:       logger,
 		connCtx:          ctx,
 		cancelConn:       cancel,
@@ -281,33 +278,25 @@ func firstSeen(seen map[string]struct{}, key string) bool {
 	return true
 }
 
-// authorize turns the stream-key token into a Claims payload. When the
-// verifier is nil and anonymous is allowed we mint a permissive claim
-// scoped to the room — this matches the HTTP AllowAnonymous behavior.
-//
-// Anonymous RTMP identities are prefixed "rtmp_" (matching the WHIP
-// "whip_" / admin-API "anon_" convention) so room logs make clear which
-// ingest surface the publisher came in through.
+// authorize turns the stream-key token into a Claims payload. A token is
+// mandatory: the stream key must carry ?token=<jwt>.
 func (h *handler) authorize(room, token string, hasToken bool) (*auth.Claims, error) {
-	if hasToken && token != "" && h.verifier != nil {
-		claims, err := h.verifier.Verify(token)
-		if err != nil {
-			return nil, fmt.Errorf("verify token: %w", err)
-		}
-		if claims.Grants == nil || claims.Grants.Room == nil {
-			return nil, fmt.Errorf("token has no room grant")
-		}
-		rg := claims.Grants.Room
-		if rg.Name != "" && rg.Name != room {
-			return nil, fmt.Errorf("token scoped to room %q, publish targets %q", rg.Name, room)
-		}
-		if claims.Grants.Media == nil || claims.Grants.Media.CanPublish == nil || !*claims.Grants.Media.CanPublish {
-			return nil, fmt.Errorf("token does not grant publish permission")
-		}
-		return claims, nil
-	}
-	if !h.allowAnonymous {
+	if !hasToken || token == "" || h.verifier == nil {
 		return nil, fmt.Errorf("authentication required: add ?token=<jwt> to the stream key")
 	}
-	return auth.AnonymousClaims("rtmp_"+randomCName(), room), nil
+	claims, err := h.verifier.Verify(token)
+	if err != nil {
+		return nil, fmt.Errorf("verify token: %w", err)
+	}
+	if claims.Grants == nil || claims.Grants.Room == nil {
+		return nil, fmt.Errorf("token has no room grant")
+	}
+	rg := claims.Grants.Room
+	if rg.Name != "" && rg.Name != room {
+		return nil, fmt.Errorf("token scoped to room %q, publish targets %q", rg.Name, room)
+	}
+	if claims.Grants.Media == nil || claims.Grants.Media.CanPublish == nil || !*claims.Grants.Media.CanPublish {
+		return nil, fmt.Errorf("token does not grant publish permission")
+	}
+	return claims, nil
 }
