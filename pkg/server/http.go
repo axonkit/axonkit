@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/axonkit/axonkit/pkg/auth"
@@ -85,15 +86,64 @@ func WithLogging(next http.Handler) http.Handler {
 			"method", r.Method, "path", r.URL.Path,
 			"status", lrw.status, "bytes", lrw.bytes,
 			"logId", logId, "duration_ms", time.Since(start).Milliseconds(),
-			"reqBody", reqBodyBuf.String(),
-			"respBody", lrw.body.String(),
 		}
 		if lrw.status >= 500 {
+			// Bodies are only captured for failures; redact credentials so a
+			// join request/response containing a JWT never leaks into logs.
+			attrs = append(attrs,
+				"reqBody", redactCredentials(reqBodyBuf.String()),
+				"respBody", redactCredentials(lrw.body.String()),
+			)
 			slog.Error("HTTP request", attrs...)
 			return
 		}
 		slog.Info("HTTP request", attrs...)
 	})
+}
+
+// redactCredentials masks credential-bearing fields in a JSON body so that
+// tokens/secrets written to logs cannot be replayed or forged. Falls back to
+// returning the input unchanged when it is not valid JSON.
+func redactCredentials(body string) string {
+	trimmed := strings.TrimSpace(body)
+	if trimmed == "" || trimmed[0] != '{' {
+		return body
+	}
+
+	var m map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &m); err != nil {
+		return body
+	}
+	redactJSON(m)
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return string(out)
+}
+
+// redactJSON walks a decoded JSON object and replaces values of any key that
+// looks like a credential (token, refresh token, api secret/key) with "***".
+func redactJSON(m map[string]any) {
+	for k, v := range m {
+		lk := strings.ToLower(k)
+		if strings.Contains(lk, "token") || strings.Contains(lk, "secret") ||
+			strings.Contains(lk, "apikey") || strings.Contains(lk, "api_key") ||
+			strings.Contains(lk, "password") {
+			m[k] = "***"
+			continue
+		}
+		switch child := v.(type) {
+		case map[string]any:
+			redactJSON(child)
+		case []any:
+			for _, item := range child {
+				if obj, ok := item.(map[string]any); ok {
+					redactJSON(obj)
+				}
+			}
+		}
+	}
 }
 
 // limitedBuffer appends to buf only until limit bytes have been stored.

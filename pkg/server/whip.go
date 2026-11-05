@@ -541,6 +541,13 @@ func (s *HTTPServer) resolveWHEPNode(resourceID string) string {
 		return resourceID[:idx]
 	}
 
+	// whepLocKV is only provisioned for the "kv" scheme; under the default
+	// "prefix" scheme it is nil. Calling Get on a nil store.Store interface
+	// would panic, so bail out and let the caller fall back to local handling.
+	if s.whepLocKV == nil {
+		return ""
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	entry, err := s.whepLocKV.Get(ctx, resourceID)

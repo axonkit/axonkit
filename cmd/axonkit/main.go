@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -24,6 +27,7 @@ var (
 	apiKey            = flag.String("api-key", cfg.Auth.APIKey, "API key for token verification")
 	apiSecret         = flag.String("api-secret", cfg.Auth.APISecret, "API secret for token signing")
 	allowAnonymous    = flag.Bool("allow-anonymous", cfg.Auth.AllowAnonymous, "Allow joining without a token (auto-generate identity)")
+	dev               = flag.Bool("dev", false, "Development mode: auto-generate a temporary API key/secret when none are set")
 	rtmpListen        = flag.String("rtmp-listen", cfg.Rtmp.Listen, "RTMP TCP bind address (e.g. ':1935'); empty disables RTMP ingest")
 	webrtcListenIP    = flag.String("webrtc-listen-ip", cfg.Media.WebRtc.ListenIP, "WebRTC listen IP for ICE candidates")
 	webrtcAnnouncedIP = flag.String("webrtc-announced-ip", cfg.Media.WebRtc.AnnouncedIP, "WebRTC announced IP advertised to peers (override for local testing)")
@@ -45,8 +49,6 @@ func main() {
 	cfg.Media.WorkerBin = *workerBin
 	cfg.Nats.URL = *natsURL
 	cfg.Nats.StoreDir = *natsStoreDir
-	cfg.Auth.APIKey = *apiKey
-	cfg.Auth.APISecret = *apiSecret
 	cfg.Auth.AllowAnonymous = *allowAnonymous
 	cfg.Rtmp.Listen = *rtmpListen
 	cfg.Media.WebRtc.ListenIP = *webrtcListenIP
@@ -54,9 +56,17 @@ func main() {
 	cfg.Media.WebRtc.MinPort = uint16(*webrtcMinPort)
 	cfg.Media.WebRtc.MaxPort = uint16(*webrtcMaxPort)
 
+	key, secret, err := resolveAuth(*dev, *allowAnonymous, *apiKey, *apiSecret)
+	if err != nil {
+		slog.Error("Invalid auth configuration", "error", err)
+		os.Exit(1)
+	}
+	cfg.Auth.APIKey = key
+	cfg.Auth.APISecret = secret
+
 	slog.Info("Starting axonkit Node",
 		"id", cfg.Node.ID, "region", cfg.Node.Region, "cluster", cfg.Node.Cluster,
-		"allowAnonymous", cfg.Auth.AllowAnonymous, "rtmpListen", cfg.Rtmp.Listen)
+		"allowAnonymous", cfg.Auth.AllowAnonymous, "dev", *dev, "rtmpListen", cfg.Rtmp.Listen)
 
 	n, err := server.NewServer(cfg)
 	if err != nil {
@@ -77,4 +87,50 @@ func main() {
 		slog.Error("Stop error", "error", err)
 	}
 	slog.Info("Bye!")
+}
+
+// resolveAuth decides the API key/secret the node runs with.
+//
+//   - When both are provided, they are used as-is.
+//   - When either is missing and -dev is set, a temporary random pair is
+//     generated and printed so local demos can mint tokens without a secret
+//     ever living in the repo or a config file.
+//   - When either is missing and -allow-anonymous is set, the node starts in
+//     anonymous mode (tokens are optional).
+//   - Otherwise it fails fast: an empty secret would let anyone forge an
+//     admin JWT, silently disabling authentication.
+func resolveAuth(dev, allowAnonymous bool, apiKey, apiSecret string) (string, string, error) {
+	if apiKey != "" && apiSecret != "" {
+		return apiKey, apiSecret, nil
+	}
+
+	if dev {
+		key, err := randomHex(16)
+		if err != nil {
+			return "", "", fmt.Errorf("generate dev api key: %w", err)
+		}
+		secret, err := randomHex(32)
+		if err != nil {
+			return "", "", fmt.Errorf("generate dev api secret: %w", err)
+		}
+		slog.Warn("DEV MODE: generated temporary API credentials (valid for this process only)",
+			"apiKey", key, "apiSecret", secret)
+		return key, secret, nil
+	}
+
+	if allowAnonymous {
+		slog.Warn("Starting with empty API key/secret in anonymous mode; token verification is disabled")
+		return apiKey, apiSecret, nil
+	}
+
+	return "", "", fmt.Errorf(
+		"api-key and api-secret must both be set, or start with -dev to generate temporary credentials, or -allow-anonymous to allow tokenless joins")
+}
+
+func randomHex(nBytes int) (string, error) {
+	b := make([]byte, nBytes)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
