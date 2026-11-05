@@ -238,7 +238,7 @@ func TestLinger(t *testing.T) {
 		return &types.RouteKVValue{Node: "MockUpstream", BaseCost: 0, PathVector: []types.NodeID{"MockUpstream"}}, nil
 	})
 
-	// Unsubscribe6sese6erv6refe热形成的珊珊深色的婷婷也一样          测试下c CDv f c f v f g v f v
+	// Unsubscribe
 	node.FIB.Unsubscribe(streamID)
 
 	// Should be in lingering state

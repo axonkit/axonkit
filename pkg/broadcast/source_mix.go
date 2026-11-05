@@ -14,8 +14,8 @@ import (
 // mixIceDisconnectGrace is how long we let a disconnected mix ingest
 // try to recover before we fall back to live. livekit's default ICE
 // watchdog is a bit longer (30 s), but for broadcast the viewer is
-// already seeing a static mix frame; a shorter window keeps the "连麦
-// → 直播" fall-back snappy without being twitchy on a transient
+// already seeing a static mix frame; a shorter window keeps the "mix
+// → live" fall-back snappy without being twitchy on a transient
 // hiccup.
 const mixIceDisconnectGrace = 5 * time.Second
 

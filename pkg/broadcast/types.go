@@ -1,4 +1,4 @@
-// Package broadcast implements "live-broadcast / 连麦切换":
+// Package broadcast implements "live-broadcast / co-stream switching":
 // a single broadcast pushes one room participant's encoded tracks
 // (passthrough, no transcode) to up to three external RTMP/WHIP
 // destinations, while exposing a broadcast-scoped WHIP ingest endpoint
@@ -112,7 +112,8 @@ const (
 )
 
 // MaxDestinations caps the number of outbound pushes a single
-// broadcast may fan out to. Requirement from the spec: 最多同时推 3 个地址。
+// broadcast may fan out to. Requirement from the spec: push to at most
+// 3 destinations concurrently.
 const MaxDestinations = 3
 
 // Validate performs the static, request-time checks a POST /rtc/broadcast

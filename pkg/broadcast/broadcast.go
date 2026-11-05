@@ -761,7 +761,7 @@ func (b *Broadcast) handleMixReady() {
 }
 
 // handleMixGone runs when the mix ICE watchdog expires or producers
-// close. Performs the "连麦 → 直播" fallback and tears down the mix
+// close. Performs the "mix → live" fallback and tears down the mix
 // source. Idempotent with DetachMix (the mixSource fires OnGone at
 // most once).
 func (b *Broadcast) handleMixGone(reason string) {
