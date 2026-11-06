@@ -10,7 +10,7 @@ build:
 	go build -o bin/$(BINARY) $(CMD_DIR)
 
 run: build
-	./bin/$(BINARY) -debug
+	./bin/$(BINARY) -dev
 
 test:
 	go test ./... -race -count=1

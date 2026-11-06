@@ -10,7 +10,7 @@ AxonKit is a distributed real-time communication server built on [mediasoup](htt
 
 ### Media & Signaling
 - **mediasoup-based SFU**: WebRTC media processing via mediasoup workers, with WebRtcServer for efficient port multiplexing.
-- **DataChannel RPC**: Custom text-based protocol (OMNI/1.0) over DataChannel for low-latency bidirectional signaling, inspired by NATS wire protocol.
+- **DataChannel RPC**: Custom text-based protocol (AXON/1.0) over DataChannel for low-latency bidirectional signaling, inspired by NATS wire protocol.
 - **Auto-Subscribe**: Server-side subscription management — consumers are created paused, delivered to the client, then resumed to avoid media loss.
 - **Dynacast**: Dynamically pauses video encodings not consumed by any subscriber, saving publisher CPU and bandwidth. Supports both simulcast layer control and track-level pause/resume (for SVC codecs).
 - **AdaptiveStream**: Client-driven subscription optimization based on UI visibility and element size.
@@ -36,7 +36,7 @@ Client (mediasoup-client)
   ├── HTTP POST /rtc/join ──────► AxonKit Node
   │                                  ├── mediasoup Worker/Router/WebRtcServer
   │                                  ├── SendTransport + RecvTransport + DirectTransport
-  │                                  └── DataChannel (OMNI/1.0 RPC)
+  │                                  └── DataChannel (AXON/1.0 RPC)
   │                                        ├── Client→Server: publish, subscribe, mute, ...
   │                                        └── Server→Client: subscription.create, notifications, ...
   │
@@ -63,8 +63,9 @@ Client (mediasoup-client)
 ### Prerequisites
 
 - Go 1.25+
-- NATS Server with JetStream enabled
 - mediasoup system dependencies (C++ build tools for mediasoup worker)
+
+A NATS server is optional: when `-nats` is unset each node starts an embedded in-process NATS server with JetStream.
 
 ### Build & Run
 
@@ -78,16 +79,18 @@ go mod tidy
 # Build
 make build
 
-# Run in debug mode (no token verification)
+# Run in dev mode (generates temporary API credentials and enables GET /dev/token)
 make run
 
-# Or with full options
+# Or with full options; -api-key/-api-secret are required outside -dev
+# (otherwise the node fails fast at startup)
 ./bin/axonkit \
-  -config config.yaml \
   -node node-bj-1 \
   -cluster Beijing \
   -region CN \
   -port 7880 \
+  -api-key my-api-key \
+  -api-secret my-api-secret \
   -nats nats://localhost:4222
 ```
 
@@ -117,13 +120,13 @@ make all
 4. Client sends `ready` RPC over DataChannel with RTP capabilities
 5. Server responds with other participants and begins auto-subscribing tracks
 
-### RPC Wire Format (OMNI/1.0)
+### RPC Wire Format (AXON/1.0)
 
 ```
 REQ <method> <logId>\r\n     -- request
 RES <logId> <status>\r\n     -- response
 MSG <method> [<logId>]\r\n   -- notification (logId optional)
-[OMNI/1.0\r\n                -- optional headers block
+[AXON/1.0\r\n                -- optional headers block
 Key: Value\r\n
 \r\n]
 <body bytes>                 -- JSON or binary payload
