@@ -25,6 +25,12 @@ go.work
 .vscode/
 *.log
 
+# mediasoup-worker fetched by `make worker` (cmd/fetch-worker) plus its
+# version marker used to invalidate the cached download on go.mod upgrades.
+/mediasoup-worker
+/mediasoup-worker.exe
+/.mediasoup-version
+
 # Broadcast verify script artefacts: per-run MP4 + frame PNGs +
 # frames.txt land in test/broadcast/out/<variant>-<timestamp>/.
 /test/broadcast/out/

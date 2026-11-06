@@ -559,7 +559,10 @@ func TestManager_WorkerRestart(t *testing.T) {
 	old := m.workers[0]
 	old.Close()
 	waitUntil(t, func() bool {
-		return m.workers[0] != nil && m.workers[0] != old
+		m.workerMu.Lock()
+		defer m.workerMu.Unlock()
+		w := m.workers[0]
+		return w != nil && w != old
 	})
 	m.Close()
 }

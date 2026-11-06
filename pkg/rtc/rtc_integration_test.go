@@ -495,24 +495,23 @@ func TestIntegration_ReadyFlushesQueuedNotifications(t *testing.T) {
 
 	p.dispatchRPC(makeRequest(proto.MethodReady, "log-ready-flush", &proto.ReadyRequest{}))
 
-	var methods []string
+	var msgs []*proto.Message
 	for range 2 {
 		select {
 		case msg := <-received:
-			methods = append(methods, msg.Method)
+			msgs = append(msgs, msg)
 		case <-time.After(time.Second):
-			t.Fatalf("timed out waiting for ready flush messages, got %v", methods)
+			t.Fatalf("timed out waiting for ready flush messages, got %d", len(msgs))
 		}
 	}
 
-	if len(methods) != 2 {
-		t.Fatalf("expected 2 messages, got %v", methods)
+	// The ready reply is a RES frame (LogId only, no Method) and must
+	// precede the notification queued before ready.
+	if msgs[0].Type != proto.TypeResponse || msgs[0].LogId != "log-ready-flush" || msgs[0].Status != proto.StatusOK {
+		t.Fatalf("expected ready response first, got type=%d logId=%q status=%d", msgs[0].Type, msgs[0].LogId, msgs[0].Status)
 	}
-	if methods[0] != proto.MethodReady {
-		t.Fatalf("expected ready response first, got %s", methods[0])
-	}
-	if methods[1] != "queued.event" {
-		t.Fatalf("expected queued notification second, got %s", methods[1])
+	if msgs[1].Method != "queued.event" {
+		t.Fatalf("expected queued notification second, got %q", msgs[1].Method)
 	}
 }
 

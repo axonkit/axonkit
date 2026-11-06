@@ -48,7 +48,7 @@ Client (mediasoup-client)
 ### Prerequisites
 
 - Go 1.25+
-- `mediasoup-worker` v3.32.2 binary — download a prebuilt worker from the [mediasoup releases](https://github.com/versatica/mediasoup/releases); no C++ build environment is required.
+- `mediasoup-worker` binary — fetched automatically by `make run` / `make test` (version-locked to mediasoup-go), or download a prebuilt worker manually from the [mediasoup releases](https://github.com/versatica/mediasoup/releases). No C++ build environment is required.
 
 A NATS server is optional: when `-nats` is unset each node starts an embedded in-process NATS server with JetStream.
 
@@ -85,7 +85,12 @@ make run
 AxonKit spawns the `mediasoup-worker` binary to run its media workers.
 The path is resolved via the `-worker` flag and defaults to
 `./mediasoup-worker` (a worker binary sitting next to where you launch
-the node). Point `-worker` at any downloaded/unpacked binary, e.g.:
+the node).
+
+`make run` and `make test` populate `./mediasoup-worker` automatically:
+`cmd/fetch-worker` reads the worker version from the mediasoup-go
+dependency and downloads the matching prebuilt release (skipped when the
+binary is already up to date). For a custom location, download manually:
 
 ```bash
 # Download a prebuilt worker from https://github.com/versatica/mediasoup/releases
@@ -97,7 +102,8 @@ chmod +x mediasoup-worker
 ./bin/axonkit -worker /usr/local/bin/mediasoup-worker ...
 ```
 
-Integration tests read the same setting from `MEDIASOUP_WORKER_BIN`.
+Integration tests read the same setting from `MEDIASOUP_WORKER_BIN`
+(`make test` sets it to the auto-downloaded binary).
 
 ### Development
 

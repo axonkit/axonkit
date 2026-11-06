@@ -2,17 +2,27 @@ MODULE   := github.com/axonkit/axonkit
 BINARY   := axonkit
 CMD_DIR  := ./cmd/axonkit
 
-.PHONY: all build run test lint fmt vet tidy clean verify-broadcast verify-broadcast-avflow verify-broadcast-rtmp
+# Worker binary for integration tests. Defaults to the binary fetched by the
+# worker target below; an existing MEDIASOUP_WORKER_BIN takes precedence.
+export MEDIASOUP_WORKER_BIN ?= $(CURDIR)/mediasoup-worker
+
+.PHONY: all build run test lint fmt vet tidy clean worker verify-broadcast verify-broadcast-rtmp
 
 all: fmt lint build
 
 build:
 	go build -o bin/$(BINARY) $(CMD_DIR)
 
-run: build
+# worker downloads the prebuilt mediasoup-worker binary that matches the
+# mediasoup-go version in go.mod (see cmd/fetch-worker). run and test depend
+# on it so a fresh checkout is runnable without manual setup.
+worker:
+	go run ./cmd/fetch-worker
+
+run: worker build
 	./bin/$(BINARY) -dev
 
-test:
+test: worker
 	go test ./... -race -count=1
 
 lint:
@@ -42,14 +52,6 @@ clean:
 # test/broadcast/README.md for the full env var reference.
 verify-broadcast:
 	./test/broadcast/verify.sh
-
-# verify-broadcast-avflow runs the same pipeline but drives the mix leg
-# through a real avflow (headless Chrome + WHIP) stack instead of an
-# ffmpeg publisher. Requires an avflow checkout next to axonkit (or
-# AVFLOW_REPO=...) with its web bundle built. Artefacts land in
-# test/broadcast/out/avflow-<timestamp>/.
-verify-broadcast-avflow:
-	./test/broadcast/verify-avflow.sh
 
 # verify-broadcast-rtmp pushes an H.264-with-B-frames + Opus stream to
 # axonkit over RTMP, fans it out through /rtc/broadcast to a local
