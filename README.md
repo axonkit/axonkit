@@ -43,21 +43,6 @@ Client (mediasoup-client)
   └── (Reconnect / Connect) ───► Same or forwarded node via NATS
 ```
 
-### Core Components
-
-| Package | Description |
-|---------|-------------|
-| `pkg/server` | HTTP API endpoints (`/rtc/join`, `/rtc/connect`) and NATS RPC handler |
-| `pkg/rtc` | Room and participant lifecycle, signal message handling, dynacast |
-| `pkg/media` | mediasoup worker/router/WebRtcServer management, pipe transport |
-| `pkg/proto` | Protocol definitions — RPC wire format, request/response types, models |
-| `pkg/routing` | RIB, FIB, and LinkDB for distributed stream routing |
-| `pkg/discovery` | Node registry and stream finder via NATS KV |
-| `pkg/auth` | JWT token generation and verification |
-| `pkg/config` | Configuration management |
-| `pkg/store` | Abstraction layer for NATS KV and in-memory stores |
-| `cmd/axonkit` | Main application entry point |
-
 ## Getting Started
 
 ### Prerequisites
@@ -86,8 +71,8 @@ make run
 # (otherwise the node fails fast at startup)
 ./bin/axonkit \
   -node node-bj-1 \
-  -cluster Beijing \
-  -region CN \
+  -cluster NewYork \
+  -region US \
   -port 7880 \
   -api-key my-api-key \
   -api-secret my-api-secret \
@@ -135,11 +120,11 @@ Key: Value\r\n
 ### Multi-Node Routing
 
 ```
-Publisher Node (Beijing)              Subscriber Node (San Francisco)
+Publisher Node (New York)              Subscriber Node (San Francisco)
   ┌──────────┐                          ┌──────────┐
-  │ Producer  │ ── RIB Advertise ──►    │   FIB    │
-  │          │                          │ Subscribe │
-  │  Router  │ ◄── Pipe Transport ──── │  Router  │
+  │ Producer │ ── RIB Advertise ──►     │   FIB    │
+  │          │                          │ Subscribe│
+  │  Router  │ ◄── Pipe Transport ────  │  Router  │
   │          │       (media)            │          │
   └──────────┘                          └──────────┘
        │                                      │
