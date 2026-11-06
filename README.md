@@ -48,7 +48,7 @@ Client (mediasoup-client)
 ### Prerequisites
 
 - Go 1.25+
-- mediasoup system dependencies (C++ build tools for mediasoup worker)
+- `mediasoup-worker` v3.32.2 binary — download a prebuilt worker from the [mediasoup releases](https://github.com/versatica/mediasoup/releases); no C++ build environment is required.
 
 A NATS server is optional: when `-nats` is unset each node starts an embedded in-process NATS server with JetStream.
 
@@ -74,10 +74,30 @@ make run
   -cluster NewYork \
   -region US \
   -port 7880 \
+  -worker ./mediasoup-worker \
   -api-key my-api-key \
   -api-secret my-api-secret \
   -nats nats://localhost:4222
 ```
+
+#### Configuring the mediasoup-worker path
+
+AxonKit spawns the `mediasoup-worker` binary to run its media workers.
+The path is resolved via the `-worker` flag and defaults to
+`./mediasoup-worker` (a worker binary sitting next to where you launch
+the node). Point `-worker` at any downloaded/unpacked binary, e.g.:
+
+```bash
+# Download a prebuilt worker from https://github.com/versatica/mediasoup/releases
+curl -LO https://github.com/versatica/mediasoup/releases/download/3.32.2/mediasoup-worker-3.32.2-linux-x64-kernel6.tgz
+tar xzf mediasoup-worker-3.32.2-linux-x64-kernel6.tgz
+chmod +x mediasoup-worker
+
+# Pass the path explicitly
+./bin/axonkit -worker /usr/local/bin/mediasoup-worker ...
+```
+
+Integration tests read the same setting from `MEDIASOUP_WORKER_BIN`.
 
 ### Development
 
