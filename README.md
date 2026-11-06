@@ -6,6 +6,8 @@
 
 AxonKit is a distributed real-time communication server built on [mediasoup](https://mediasoup.org/) and [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream). It combines SFU media processing with intelligent cross-node stream routing, providing a scalable foundation for video conferencing, live streaming, and multi-modal AI applications.
 
+Documentation, guides, and demos are available at [axonkit.io](https://axonkit.io).
+
 ## Features
 
 ### Media & Signaling
